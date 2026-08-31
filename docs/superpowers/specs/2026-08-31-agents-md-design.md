@@ -1,7 +1,7 @@
 # Lawyer Agent `AGENTS.md` Design
 
 - 日期：2026-08-31
-- 状态：待用户审阅
+- 状态：用户已确认
 - 目标文件：仓库根目录 `AGENTS.md`
 
 ## 1. 目的
