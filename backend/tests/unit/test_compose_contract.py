@@ -21,6 +21,19 @@ def test_stateful_services_have_healthchecks_and_volumes() -> None:
         assert "volumes" in services[name]
 
 
+def test_mysql_uses_the_configured_host_port() -> None:
+    mysql = load_compose()["services"]["mysql"]
+    assert mysql["ports"] == ["13306:3306"]
+
+
+def test_opensearch_supplies_its_required_initial_admin_password() -> None:
+    opensearch = load_compose()["services"]["opensearch"]
+    expected_variable = "${" + "OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+    assert opensearch["environment"]["OPENSEARCH_INITIAL_ADMIN_PASSWORD"] == (
+        expected_variable
+    )
+
+
 def test_api_runs_non_privileged_and_read_only() -> None:
     api = load_compose()["services"]["api"]
     assert api["read_only"] is True

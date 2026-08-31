@@ -24,7 +24,7 @@ services:
       MYSQL_USER: lawyer
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}-root
-    ports: ["3306:3306"]
+    ports: ["13306:3306"]
     volumes: ["mysql-data:/var/lib/mysql"]
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u lawyer -p$${MYSQL_PASSWORD}"]
@@ -62,6 +62,7 @@ services:
       discovery.type: single-node
       plugins.security.disabled: "true"
       OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
     ports: ["9200:9200"]
     volumes: ["opensearch-data:/usr/share/opensearch/data"]
     healthcheck:
