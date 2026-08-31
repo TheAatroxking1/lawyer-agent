@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir uv==0.8.15 \
 WORKDIR /app
 COPY backend/pyproject.toml backend/uv.lock ./
 COPY backend/src ./src
+COPY backend/README.md ./
 RUN uv sync --frozen --no-dev
 
 USER 10001
