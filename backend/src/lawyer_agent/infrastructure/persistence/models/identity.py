@@ -48,8 +48,15 @@ class AuthIdentityModel(TimestampMixin, Base):
             name="auth_identity_kind",
         ),
         CheckConstraint("status IN ('active','revoked')", name="auth_identity_status"),
-        UniqueConstraint("kind", "issuer", "subject_blind_index"),
+        UniqueConstraint(
+            "kind",
+            "issuer",
+            "blind_index_key_version",
+            "subject_blind_index",
+            name="uq_auth_identities_subject",
+        ),
         Index("ix_auth_identities_user_id", "user_id"),
+        Index("ix_auth_identities_blind_key_version", "blind_index_key_version"),
     )
 
     id: Mapped[UUID] = mapped_column(UuidBinary(), primary_key=True)
@@ -61,6 +68,7 @@ class AuthIdentityModel(TimestampMixin, Base):
     subject_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     subject_blind_index: Mapped[bytes] = mapped_column(BINARY(32), nullable=False)
     key_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    blind_index_key_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     verified_at: Mapped[datetime] = mapped_column(UTC_DATETIME, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="active")
 

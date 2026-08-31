@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Final
 
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+
+from lawyer_agent.domain.identity import PasswordVerification
 
 MIN_PASSWORD_CHARACTERS: Final = 12
 MAX_PASSWORD_CHARACTERS: Final = 128
@@ -20,16 +21,11 @@ _DUMMY_HASH: Final = (
     "$argon2id$v=19$m=65536,t=3,p=1$N3pQ+Xvo3Fo/d8Dbqwma/g$"
     "g32MhYLZErgb32zGER2vnamXD+F2kRT+2N2urXbpDOA"
 )  # noqa: S105
+_BOUNDED_DUMMY_INPUT: Final = "lawyer-agent-bounded-dummy"  # noqa: S105
 
 
 class InvalidPassword(ValueError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class PasswordVerification:
-    valid: bool
-    needs_rehash: bool
 
 
 class Argon2PasswordHasher:
@@ -71,12 +67,30 @@ class Argon2PasswordHasher:
         )
 
     def verify_dummy(self, password: str) -> None:
-        self.verify(_DUMMY_HASH, password)
+        candidate = (
+            password
+            if self.is_verification_input_within_limits(password)
+            else _BOUNDED_DUMMY_INPUT
+        )
+        self.verify(_DUMMY_HASH, candidate)
+
+    @staticmethod
+    def is_verification_input_within_limits(password: str) -> bool:
+        if len(password) > MAX_PASSWORD_CHARACTERS:
+            return False
+        try:
+            return len(password.encode("utf-8")) <= MAX_PASSWORD_UTF8_BYTES
+        except UnicodeEncodeError:
+            return False
 
     @staticmethod
     def _validate_new_password(password: str) -> None:
         character_count = len(password)
         if not MIN_PASSWORD_CHARACTERS <= character_count <= MAX_PASSWORD_CHARACTERS:
             raise InvalidPassword("password must contain 12 to 128 characters")
-        if len(password.encode("utf-8")) > MAX_PASSWORD_UTF8_BYTES:
+        try:
+            encoded_length = len(password.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidPassword("password must be valid Unicode") from None
+        if encoded_length > MAX_PASSWORD_UTF8_BYTES:
             raise InvalidPassword("password UTF-8 representation exceeds 1024 bytes")

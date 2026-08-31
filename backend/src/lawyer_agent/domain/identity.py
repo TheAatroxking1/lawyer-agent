@@ -24,6 +24,18 @@ class NormalizedIdentity:
     display_value: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class VersionedBlindIndex:
+    key_version: int
+    digest: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordVerification:
+    valid: bool
+    needs_rehash: bool
+
+
 def normalize_username(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).strip().casefold()
     if not normalized:
@@ -35,11 +47,13 @@ def normalize_phone(value: str) -> str:
     try:
         parsed = phonenumbers.parse(value.strip(), "CN")
     except phonenumbers.NumberParseException as exc:
-        raise ValueError("phone number must be valid") from exc
+        raise ValueError("phone number must be a valid mainland China mobile") from exc
     if parsed.country_code != 86:
-        raise ValueError("phone number must be in mainland China")
+        raise ValueError("phone number must be a mainland China mobile")
     if not phonenumbers.is_valid_number_for_region(parsed, "CN"):
-        raise ValueError("phone number must be valid")
+        raise ValueError("phone number must be a valid mainland mobile")
+    if phonenumbers.number_type(parsed) != phonenumbers.PhoneNumberType.MOBILE:
+        raise ValueError("phone number must be an explicit mainland mobile")
     return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
 
 
@@ -79,6 +93,9 @@ def normalize_identifier(
 
     if issuer is None or not issuer.strip():
         raise ValueError("wechat identity requires an issuer")
-    if not value:
-        raise ValueError("wechat subject must not be empty")
-    return NormalizedIdentity(identity_kind, issuer.strip(), value, None)
+    normalized_issuer = issuer.strip()
+    if len(normalized_issuer) > 255 or "\x00" in normalized_issuer:
+        raise ValueError("wechat issuer has an invalid format or length")
+    if not value.strip() or len(value) > 255 or "\x00" in value:
+        raise ValueError("wechat subject has an invalid format or length")
+    return NormalizedIdentity(identity_kind, normalized_issuer, value, None)

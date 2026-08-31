@@ -34,6 +34,24 @@ def test_mainland_phone_is_canonical_e164_and_foreign_numbers_are_rejected() -> 
         normalize_phone("12345")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "01088886666",
+        "4008001234",
+        "8008101234",
+        "110",
+        "+85221234567",
+        "+85328281234",
+        "+886223456789",
+        "+12025550123",
+    ],
+)
+def test_phone_identity_accepts_only_explicit_mainland_mobile_numbers(value: str) -> None:
+    with pytest.raises(ValueError, match="mobile"):
+        normalize_phone(value)
+
+
 def test_email_casefolds_local_part_and_uses_lower_idna_domain() -> None:
     assert normalize_email("  LAWYER@例子.公司  ") == "lawyer@xn--fsqu00a.xn--55qx5d"
 
@@ -52,11 +70,30 @@ def test_wechat_preserves_raw_subject_and_is_issuer_scoped() -> None:
 
 
 @pytest.mark.parametrize(
+    ("issuer", "subject"),
+    [
+        ("wx-app", "   "),
+        ("wx-app", "open\x00id"),
+        ("wx-app", "x" * 256),
+        ("x" * 256, "openid"),
+        ("wx\x00app", "openid"),
+    ],
+)
+def test_wechat_issuer_and_subject_have_bounded_safe_storage(
+    issuer: str,
+    subject: str,
+) -> None:
+    with pytest.raises(ValueError):
+        normalize_identifier(IdentityKind.WECHAT_OPENID, subject, issuer=issuer)
+
+
+@pytest.mark.parametrize(
     "password",
     [
         "short",
         "x" * 129,
         "法" * 342,
+        "\ud800" * 12,
     ],
 )
 def test_password_policy_rejects_invalid_character_or_utf8_lengths(password: str) -> None:
@@ -90,6 +127,27 @@ def test_rehash_is_reported_only_after_successful_verification() -> None:
     assert failed.needs_rehash is False
     assert succeeded.valid is True
     assert succeeded.needs_rehash is True
+
+
+@pytest.mark.parametrize("password", ["x" * 129, "法" * 400, "\ud800"])
+def test_dummy_verification_never_passes_oversized_login_input_to_argon2(
+    monkeypatch: pytest.MonkeyPatch,
+    password: str,
+) -> None:
+    hasher = Argon2PasswordHasher()
+    seen: list[str] = []
+
+    class SpyArgon2:
+        def verify(self, encoded_hash: str, candidate: str) -> bool:
+            del encoded_hash
+            seen.append(candidate)
+            return False
+
+    monkeypatch.setattr(hasher, "_hasher", SpyArgon2())
+
+    hasher.verify_dummy(password)
+
+    assert seen == ["lawyer-agent-bounded-dummy"]
 
 
 def test_cipher_envelope_is_versioned_random_and_aad_bound() -> None:

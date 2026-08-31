@@ -4,6 +4,8 @@ import hmac
 from collections.abc import Mapping
 from hashlib import sha256
 
+from lawyer_agent.domain.identity import VersionedBlindIndex
+
 _VERSION_BYTES = 2
 _DOMAIN = b"lawyer-agent:blind-index:v1\x00"
 
@@ -23,6 +25,10 @@ class BlindIndexService:
     def active_key_version(self) -> int:
         return self._active_key_version
 
+    @property
+    def key_versions(self) -> tuple[int, ...]:
+        return tuple(sorted(self._keys))
+
     def digest(self, purpose: str, value: str, *, key_version: int | None = None) -> bytes:
         version = self._active_key_version if key_version is None else key_version
         key = self._keys.get(version)
@@ -38,6 +44,15 @@ class BlindIndexService:
             + value.encode("utf-8")
         )
         return hmac.digest(key, message, sha256)
+
+    def digests(self, purpose: str, value: str) -> tuple[VersionedBlindIndex, ...]:
+        return tuple(
+            VersionedBlindIndex(
+                key_version=key_version,
+                digest=self.digest(purpose, value, key_version=key_version),
+            )
+            for key_version in self.key_versions
+        )
 
     def matches(
         self,
