@@ -1,0 +1,17 @@
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_NO_CACHE=1
+
+RUN pip install --no-cache-dir uv==0.8.15 \
+    && useradd --create-home --uid 10001 app
+
+WORKDIR /app
+COPY backend/pyproject.toml backend/uv.lock ./
+COPY backend/src ./src
+RUN uv sync --frozen --no-dev
+
+USER 10001
+EXPOSE 8000
+CMD ["uv", "run", "--no-sync", "uvicorn", "lawyer_agent.main:app", "--host", "0.0.0.0", "--port", "8000"]
