@@ -1,0 +1,16 @@
+from uuid import UUID
+
+from sqlalchemy import BINARY
+from sqlalchemy.engine.interfaces import Dialect
+from sqlalchemy.types import TypeDecorator
+
+
+class UuidBinary(TypeDecorator[UUID]):
+    impl = BINARY(16)
+    cache_ok = True
+
+    def process_bind_param(self, value: UUID | None, dialect: Dialect) -> bytes | None:
+        return None if value is None else value.bytes
+
+    def process_result_value(self, value: bytes | None, dialect: Dialect) -> UUID | None:
+        return None if value is None else UUID(bytes=value)

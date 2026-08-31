@@ -5,6 +5,15 @@ description = "Multi-tenant mainland China legal agent backend"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "SQLAlchemy[asyncio]>=2.0.52,<2.1",
+  "alembic>=1.19.1,<2",
+  "asyncmy>=0.2.11,<1",
+  "redis>=8.1,<9",
+  "argon2-cffi>=25.1,<26",
+  "cryptography>=48,<50",
+  "PyJWT[crypto]>=2.13,<3",
+  "email-validator>=2.2,<3",
+  "phonenumbers>=9,<10",
   "fastapi>=0.115,<1",
   "orjson>=3.10,<4",
   "pydantic-settings>=2.6,<3",
