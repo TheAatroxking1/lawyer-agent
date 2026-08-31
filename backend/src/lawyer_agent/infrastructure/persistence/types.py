@@ -1,8 +1,11 @@
 from uuid import UUID
 
 from sqlalchemy import BINARY
+from sqlalchemy.dialects import mysql
 from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.types import TypeDecorator
+
+UTC_DATETIME = mysql.DATETIME(fsp=6)
 
 
 class UuidBinary(TypeDecorator[UUID]):
