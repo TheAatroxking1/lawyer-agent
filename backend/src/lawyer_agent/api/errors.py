@@ -2,7 +2,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
@@ -19,7 +19,7 @@ def error_code(status_code: int) -> str:
 async def http_exception_handler(
     request: Request,
     exc: StarletteHTTPException,
-) -> ORJSONResponse:
+) -> JSONResponse:
     trace_id = request.headers.get("x-request-id") or uuid4().hex
     title = str(exc.detail) if isinstance(exc.detail, str) else "HTTP Error"
     body: dict[str, Any] = {
@@ -29,4 +29,4 @@ async def http_exception_handler(
         "code": error_code(exc.status_code),
         "trace_id": trace_id,
     }
-    return ORJSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
+    return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)
