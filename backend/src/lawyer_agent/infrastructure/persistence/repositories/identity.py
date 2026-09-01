@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, a
 from lawyer_agent.application.identity import (
     AuditEvent,
     AuthenticationRecord,
+    BlindIndexKeyUnavailableError,
     IdentityConflictError,
     NewIdentity,
     NewPasswordCredential,
@@ -48,7 +49,12 @@ class IdentityRepository:
         if not supported:
             return True
         statement = select(
-            exists().where(not_(AuthIdentityModel.blind_index_key_version.in_(supported)))
+            exists().where(
+                or_(
+                    AuthIdentityModel.blind_index_key_version.is_(None),
+                    not_(AuthIdentityModel.blind_index_key_version.in_(supported)),
+                )
+            )
         )
         return bool(await self._session.scalar(statement))
 
@@ -88,18 +94,7 @@ class IdentityRepository:
             statement = statement.with_for_update()
         rows = (await self._session.execute(statement)).all()
         return tuple(
-            AuthenticationRecord(
-                identity_id=identity.id,
-                user_id=user.id,
-                user_status=user.status,
-                identity_status=identity.status,
-                subject_ciphertext=identity.subject_ciphertext,
-                cipher_key_version=identity.key_version,
-                blind_index_key_version=identity.blind_index_key_version,
-                password_hash=credential.password_hash,
-                credential_status=credential.status,
-                locked_until=credential.locked_until,
-            )
+            _authentication_record(identity, user, credential)
             for identity, user, credential in rows
         )
 
@@ -306,4 +301,25 @@ def _is_target_identity_duplicate(exc: IntegrityError) -> bool:
         len(args) >= 2
         and args[0] == _MYSQL_DUPLICATE_ENTRY
         and _IDENTITY_UNIQUE_CONSTRAINT in str(args[1])
+    )
+
+
+def _authentication_record(
+    identity: AuthIdentityModel,
+    user: UserModel,
+    credential: PasswordCredentialModel,
+) -> AuthenticationRecord:
+    if identity.blind_index_key_version is None:
+        raise BlindIndexKeyUnavailableError
+    return AuthenticationRecord(
+        identity_id=identity.id,
+        user_id=user.id,
+        user_status=user.status,
+        identity_status=identity.status,
+        subject_ciphertext=identity.subject_ciphertext,
+        cipher_key_version=identity.key_version,
+        blind_index_key_version=identity.blind_index_key_version,
+        password_hash=credential.password_hash,
+        credential_status=credential.status,
+        locked_until=credential.locked_until,
     )

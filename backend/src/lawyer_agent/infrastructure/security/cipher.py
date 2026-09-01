@@ -9,14 +9,26 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from lawyer_agent.domain.identity import CiphertextAuthenticationError
 
 _VERSION_BYTES = 2
+_MYSQL_SIGNED_SMALLINT_MAX = 32767
 _NONCE_BYTES = 12
 _TAG_BYTES = 16
 
 
 class SensitiveValueCipher:
     def __init__(self, keys: Mapping[int, bytes], *, active_key_version: int) -> None:
-        if not 0 <= active_key_version < 1 << (_VERSION_BYTES * 8):
-            raise ValueError("active key version is out of range")
+        if any(
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or not 1 <= version <= _MYSQL_SIGNED_SMALLINT_MAX
+            for version in keys
+        ):
+            raise ValueError("cipher key versions must be integers from 1 to 32767")
+        if (
+            isinstance(active_key_version, bool)
+            or not isinstance(active_key_version, int)
+            or not 1 <= active_key_version <= _MYSQL_SIGNED_SMALLINT_MAX
+        ):
+            raise ValueError("cipher key versions must be integers from 1 to 32767")
         if active_key_version not in keys:
             raise ValueError("active key version is missing")
         if any(len(key) != 32 for key in keys.values()):

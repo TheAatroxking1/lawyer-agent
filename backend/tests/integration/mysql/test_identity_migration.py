@@ -10,10 +10,18 @@ import pytest
 from alembic.config import Config
 from sqlalchemy import column, delete, inspect, select, table, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from alembic import command
-from lawyer_agent.application.identity import AuditContext, IdentityService, LoginIdentifier
+from lawyer_agent.application.identity import (
+    AuditContext,
+    BlindIndexKeyUnavailableError,
+    IdentityConflictError,
+    IdentityService,
+    LoginIdentifier,
+    RegisterCommand,
+)
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.identity import IdentityKind, normalize_username
 from lawyer_agent.infrastructure.persistence.repositories.identity import (
@@ -28,7 +36,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.mysql]
 _PASSWORD = "correct horse battery staple"  # noqa: S105
 _AUDIT_CONTEXT = AuditContext("trace-migration", b"i" * 32, b"u" * 32)
 _CIPHER_KEY = b"c" * 32
-_BLIND_KEY_V1 = b"b" * 32
+_BLIND_KEY_V7 = b"b" * 32
+_INSERT_TRIGGER = "trg_auth_identities_bi_version_insert"
+_UPDATE_TRIGGER = "trg_auth_identities_bi_version_update"
 _AUDIT_EVENTS = table("audit_events")
 _PASSWORD_CREDENTIALS = table("password_credentials", column("user_id"))
 _AUTH_IDENTITIES = table(
@@ -57,7 +67,7 @@ async def _insert_legacy_identity(mysql_url: URL, username: str) -> UUID:
     now = datetime.now(UTC).replace(tzinfo=None)
     normalized = normalize_username(username)
     cipher = SensitiveValueCipher({7: _CIPHER_KEY}, active_key_version=7)
-    blind = BlindIndexService({1: _BLIND_KEY_V1}, active_key_version=1)
+    blind = BlindIndexService({7: _BLIND_KEY_V7}, active_key_version=7)
     hasher = Argon2PasswordHasher()
     try:
         async with engine.begin() as connection:
@@ -114,6 +124,9 @@ async def _insert_with_old_binary_shape(mysql_url: URL, username: str) -> UUID:
     identity_id = new_uuid7()
     normalized = normalize_username(username)
     now = datetime.now(UTC).replace(tzinfo=None)
+    cipher = SensitiveValueCipher({7: _CIPHER_KEY}, active_key_version=7)
+    blind = BlindIndexService({7: _BLIND_KEY_V7}, active_key_version=7)
+    hasher = Argon2PasswordHasher()
     try:
         async with engine.begin() as connection:
             await connection.execute(
@@ -135,11 +148,27 @@ async def _insert_with_old_binary_shape(mysql_url: URL, username: str) -> UUID:
                     "id": identity_id.bytes,
                     "user_id": user_id.bytes,
                     "display_value": normalized,
-                    "ciphertext": b"legacy-shape",
-                    "blind_index": BlindIndexService(
-                        {1: _BLIND_KEY_V1}, active_key_version=1
-                    ).digest("identity:username", normalized),
+                    "ciphertext": cipher.encrypt(
+                        normalized,
+                        aad=f"auth_identity:{identity_id}:subject".encode("ascii"),
+                    ),
+                    "blind_index": blind.digest("identity:username", normalized),
                     "verified_at": now,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO password_credentials "
+                    "(user_id, password_hash, algorithm, parameters_json, "
+                    "password_changed_at, status) "
+                    "VALUES (:user_id, :password_hash, 'argon2id', :parameters, "
+                    ":changed_at, 'active')"
+                ),
+                {
+                    "user_id": user_id.bytes,
+                    "password_hash": hasher.hash(_PASSWORD),
+                    "parameters": json.dumps(hasher.parameters),
+                    "changed_at": now,
                 },
             )
     finally:
@@ -173,19 +202,38 @@ async def _migration_state(mysql_url: URL, user_ids: tuple[UUID, ...]) -> dict[s
                     )
                 )
             ).all()
-        return {**schema, "versions": {bytes(row[0]): row[1] for row in versions}}
+            triggers = set(
+                (
+                    await connection.scalars(
+                        text(
+                            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                            "WHERE TRIGGER_SCHEMA = DATABASE() "
+                            "AND EVENT_OBJECT_TABLE = 'auth_identities'"
+                        )
+                    )
+                ).all()
+            )
+        return {
+            **schema,
+            "versions": {bytes(row[0]): row[1] for row in versions},
+            "triggers": triggers,
+        }
     finally:
         await engine.dispose()
 
 
-async def _authenticate_legacy(mysql_url: URL, username: str) -> UUID | None:
+async def _exercise_authentication_and_conflict(
+    mysql_url: URL,
+    username: str,
+    expected_user_id: UUID,
+) -> None:
     engine = create_async_engine(mysql_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     service = IdentityService(
         uow_factory=lambda: SqlAlchemyIdentityUnitOfWork(session_factory),
         password_hasher=Argon2PasswordHasher(),
         cipher=SensitiveValueCipher({7: _CIPHER_KEY}, active_key_version=7),
-        blind_index=BlindIndexService({1: _BLIND_KEY_V1}, active_key_version=1),
+        blind_index=BlindIndexService({7: _BLIND_KEY_V7}, active_key_version=7),
     )
     try:
         authenticated = await service.authenticate(
@@ -193,7 +241,12 @@ async def _authenticate_legacy(mysql_url: URL, username: str) -> UUID | None:
             _PASSWORD,
             audit_context=_AUDIT_CONTEXT,
         )
-        return None if authenticated is None else authenticated.user_id
+        assert authenticated is not None and authenticated.user_id == expected_user_id
+        with pytest.raises(IdentityConflictError):
+            await service.register(
+                RegisterCommand(username.upper(), _PASSWORD, "Must Conflict"),
+                audit_context=_AUDIT_CONTEXT,
+            )
     finally:
         await engine.dispose()
 
@@ -221,19 +274,91 @@ async def _delete_users(mysql_url: URL, user_ids: tuple[UUID, ...]) -> None:
         await engine.dispose()
 
 
-def test_legacy_v1_identity_upgrades_with_online_default_and_authenticates(
+async def _update_blind_version(
+    mysql_url: URL,
+    user_id: UUID,
+    version: int | None,
+) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE auth_identities SET blind_index_key_version = :version "
+                    "WHERE user_id = :user_id"
+                ),
+                {"version": version, "user_id": user_id.bytes},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _update_blind_digest(mysql_url: URL, user_id: UUID) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE auth_identities SET subject_blind_index = :digest "
+                    "WHERE user_id = :user_id"
+                ),
+                {"digest": b"x" * 32, "user_id": user_id.bytes},
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _drop_update_trigger(mysql_url: URL) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DROP TRIGGER `trg_auth_identities_bi_version_update`")
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _schema_shape(mysql_url: URL) -> tuple[set[str], set[str]]:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns("auth_identities")
+                }
+            )
+            triggers = set(
+                (
+                    await connection.scalars(
+                        text(
+                            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                            "WHERE TRIGGER_SCHEMA = DATABASE() "
+                            "AND EVENT_OBJECT_TABLE = 'auth_identities'"
+                        )
+                    )
+                ).all()
+            )
+            return columns, triggers
+    finally:
+        await engine.dispose()
+
+
+def test_legacy_v7_identity_upgrades_with_trigger_compatibility_and_authenticates(
     mysql_url: URL,
 ) -> None:
     config = _alembic_config(mysql_url)
     command.upgrade(config, "head")
     command.downgrade(config, "20260901_01")
     username = f"legacy-{new_uuid7()}"
+    old_binary_username = f"old-binary-{new_uuid7()}"
     legacy_user_id = asyncio.run(_insert_legacy_identity(mysql_url, username))
     old_binary_user_id: UUID | None = None
     try:
         command.upgrade(config, "20260901_02")
         old_binary_user_id = asyncio.run(
-            _insert_with_old_binary_shape(mysql_url, f"old-binary-{new_uuid7()}")
+            _insert_with_old_binary_shape(mysql_url, old_binary_username)
         )
         state = asyncio.run(
             _migration_state(mysql_url, (legacy_user_id, old_binary_user_id))
@@ -250,12 +375,13 @@ def test_legacy_v1_identity_upgrades_with_online_default_and_authenticates(
             tuple(item["column_names"]): item["name"] for item in state["indexes"]
         }
 
-        assert version_column["nullable"] is False
-        assert str(version_column["default"]).strip("'") == "1"
+        assert version_column["nullable"] is True
+        assert version_column["default"] is None
         assert state["versions"] == {
-            legacy_user_id.bytes: 1,
-            old_binary_user_id.bytes: 1,
+            legacy_user_id.bytes: 7,
+            old_binary_user_id.bytes: 7,
         }
+        assert state["triggers"] == {_INSERT_TRIGGER, _UPDATE_TRIGGER}
         assert unique_columns[
             ("kind", "issuer", "blind_index_key_version", "subject_blind_index")
         ] == "uq_auth_identities_subject"
@@ -267,8 +393,61 @@ def test_legacy_v1_identity_upgrades_with_online_default_and_authenticates(
             and "32767" in str(check["sqltext"])
             for check in state["checks"]
         )
-        assert asyncio.run(_authenticate_legacy(mysql_url, username)) == legacy_user_id
+        assert any(
+            "key_version" in str(check["sqltext"])
+            and "blind_index_key_version" not in str(check["sqltext"])
+            and "32767" in str(check["sqltext"])
+            for check in state["checks"]
+        )
+        asyncio.run(
+            _exercise_authentication_and_conflict(mysql_url, username, legacy_user_id)
+        )
+        asyncio.run(
+            _exercise_authentication_and_conflict(
+                mysql_url,
+                old_binary_username,
+                old_binary_user_id,
+            )
+        )
+
+        with pytest.raises(DBAPIError, match="blind_index_key_version"):
+            asyncio.run(_update_blind_version(mysql_url, legacy_user_id, None))
+        with pytest.raises(DBAPIError, match="blind-index digest"):
+            asyncio.run(_update_blind_version(mysql_url, legacy_user_id, 8))
+        with pytest.raises(DBAPIError, match="blind-index digest"):
+            asyncio.run(_update_blind_digest(mysql_url, legacy_user_id))
+
+        asyncio.run(_drop_update_trigger(mysql_url))
+        asyncio.run(_update_blind_version(mysql_url, legacy_user_id, None))
+        with pytest.raises(BlindIndexKeyUnavailableError):
+            asyncio.run(
+                _exercise_authentication_and_conflict(
+                    mysql_url,
+                    username,
+                    legacy_user_id,
+                )
+            )
+        asyncio.run(_update_blind_version(mysql_url, legacy_user_id, 7))
+
         command.downgrade(config, "20260901_01")
+        columns, triggers = asyncio.run(_schema_shape(mysql_url))
+        assert "blind_index_key_version" not in columns
+        assert triggers == set()
+
+        command.upgrade(config, "20260901_02")
+        columns, triggers = asyncio.run(_schema_shape(mysql_url))
+        assert "blind_index_key_version" in columns
+        assert triggers == {_INSERT_TRIGGER, _UPDATE_TRIGGER}
+        upgraded_again = asyncio.run(
+            _migration_state(mysql_url, (legacy_user_id, old_binary_user_id))
+        )
+        assert upgraded_again["versions"] == {
+            legacy_user_id.bytes: 7,
+            old_binary_user_id.bytes: 7,
+        }
+        asyncio.run(
+            _exercise_authentication_and_conflict(mysql_url, username, legacy_user_id)
+        )
     finally:
         cleanup_ids = (
             (legacy_user_id,)
@@ -313,13 +492,17 @@ async def _insert_v2_identity(mysql_url: URL) -> UUID:
     return user_id
 
 
-def test_downgrade_refuses_non_v1_blind_index_rows(mysql_url: URL) -> None:
+def test_downgrade_refuses_decoupled_blind_index_rows_without_dropping_triggers(
+    mysql_url: URL,
+) -> None:
     config = _alembic_config(mysql_url)
     command.upgrade(config, "20260901_02")
     user_id = asyncio.run(_insert_v2_identity(mysql_url))
     try:
-        with pytest.raises(RuntimeError, match="non-v1 blind-index rows"):
+        with pytest.raises(RuntimeError, match="decoupled blind-index rows"):
             command.downgrade(config, "20260901_01")
+        _, triggers = asyncio.run(_schema_shape(mysql_url))
+        assert triggers == {_INSERT_TRIGGER, _UPDATE_TRIGGER}
     finally:
         asyncio.run(_delete_users(mysql_url, (user_id,)))
         command.upgrade(config, "head")

@@ -175,6 +175,32 @@ def test_cipher_rejects_invalid_key_material_and_unknown_versions() -> None:
         cipher.decrypt(envelope, aad=b"row")
 
 
+def test_cipher_versions_match_mysql_signed_smallint_boundaries() -> None:
+    cipher = SensitiveValueCipher(
+        {1: b"a" * 32, 32767: b"b" * 32},
+        active_key_version=32767,
+    )
+
+    assert cipher.active_key_version == 32767
+
+
+@pytest.mark.parametrize(
+    ("keys", "active_version"),
+    [
+        ({0: b"a" * 32}, 0),
+        ({-1: b"a" * 32, 1: b"b" * 32}, 1),
+        ({1: b"a" * 32, 32768: b"b" * 32}, 1),
+        ({True: b"a" * 32}, True),
+    ],
+)
+def test_cipher_rejects_invalid_active_or_inactive_key_versions(
+    keys: dict[int, bytes],
+    active_version: int,
+) -> None:
+    with pytest.raises(ValueError, match="1 to 32767"):
+        SensitiveValueCipher(keys, active_key_version=active_version)
+
+
 def test_blind_indexes_are_purpose_and_key_version_isolated() -> None:
     blind = BlindIndexService({1: b"b" * 32, 2: b"c" * 32}, active_key_version=2)
 

@@ -52,6 +52,10 @@ class AuthIdentityModel(TimestampMixin, Base):
             "blind_index_key_version BETWEEN 1 AND 32767",
             name="auth_identity_blind_key_version",
         ),
+        CheckConstraint(
+            "key_version BETWEEN 1 AND 32767",
+            name="auth_identity_cipher_key_version",
+        ),
         UniqueConstraint(
             "kind",
             "issuer",
@@ -72,10 +76,9 @@ class AuthIdentityModel(TimestampMixin, Base):
     subject_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     subject_blind_index: Mapped[bytes] = mapped_column(BINARY(32), nullable=False)
     key_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    blind_index_key_version: Mapped[int] = mapped_column(
+    blind_index_key_version: Mapped[int | None] = mapped_column(
         SmallInteger,
-        nullable=False,
-        server_default=text("1"),
+        nullable=True,
     )
     verified_at: Mapped[datetime] = mapped_column(UTC_DATETIME, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="active")
