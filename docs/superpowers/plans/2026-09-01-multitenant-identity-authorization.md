@@ -470,7 +470,7 @@ Expected: Redis adapters 不存在。
 
 - [ ] **Step 3: 实现 Lua Token Bucket 和故障分类**
 
-限流 Key 的各维度先 HMAC，规则固定为 register IP 5/h；login IP 20/15m + identity 5/15m；refresh session 30/15m；reauth session 5/15m；switch session 10/15m。Lua 在单命令中 refill、扣减、设置 TTL 并返回剩余数与 Retry-After。Redis connection/timeout 在认证、安全写和 Step-up 路径映射为 503；普通 Bearer 读授权缓存故障回源 MySQL。
+限流 Key 的各维度先 HMAC，规则固定为 register IP 5/h；login IP 20/15m + identity 5/15m；refresh session 30/15m；reauth session 5/15m；switch session 10/15m。Lua 在单命令中 refill、扣减、设置 TTL 并返回剩余数与 Retry-After。Redis connection/timeout 在认证、安全写和 Step-up 路径映射为 503；普通 Bearer 读授权缓存故障回源 MySQL。安全控制 Redis 通过强类型 `SecurityRedisTopology` 在 Settings 与 Adapter 创建前门禁，只允许单一主 Key 空间的 Standalone 或 Sentinel/HA Primary；Staging/Production 必须显式配置，Cluster/Sharded 与未知值 Fail Closed。当前 login 的 IP Bucket 必须跨 Identity 共享、Identity Bucket 必须跨 IP 共享，因此不以改变 Hash Tag 语义规避 CROSSSLOT；未来若支持 Redis Cluster，需重新批准并设计组合限流原子协议。
 
 - [ ] **Step 4: 实现一次性 Step-up 和版本化授权缓存**
 

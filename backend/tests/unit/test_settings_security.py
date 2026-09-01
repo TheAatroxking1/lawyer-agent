@@ -12,6 +12,7 @@ from lawyer_agent.config import (
     DEVELOPMENT_REFRESH_TOKEN_KEY_B64,
     Settings,
 )
+from lawyer_agent.infrastructure.redis.client import SecurityRedisTopology
 
 
 def encoded_key(byte: int) -> str:
@@ -24,6 +25,7 @@ def deployment_settings(environment: str = "production", **overrides: object) ->
         "secret_key": "p" * 32,
         "database_url": "mysql+asyncmy://app:password@mysql.example.cn:3306/lawyer_agent",
         "redis_url": "redis://redis.example.cn:6379/0",
+        "redis_security_topology": "standalone",
         "data_encryption_key_b64": encoded_key(11),
         "blind_index_key_b64": encoded_key(12),
         "blind_index_rollout_phase": "legacy-compatible",
@@ -88,11 +90,37 @@ def test_rotation_ready_requires_explicit_legacy_writer_drain_ack() -> None:
 
 
 def test_local_rollout_defaults_are_safe_and_strongly_typed() -> None:
-    policy = Settings(environment="test").identity_rollout_policy()
+    settings = Settings(environment="test")
+    policy = settings.identity_rollout_policy()
 
     assert policy.phase is BlindIndexRolloutPhase.LEGACY_COMPATIBLE
     assert policy.legacy_key_version == 1
     assert policy.legacy_writers_drained is False
+    assert settings.redis_security_topology is SecurityRedisTopology.STANDALONE
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_deployment_requires_explicit_security_redis_topology(
+    environment: str,
+) -> None:
+    with pytest.raises(ValidationError, match="Redis topology"):
+        deployment_settings(environment, redis_security_topology=None)
+
+
+@pytest.mark.parametrize(
+    "raw_topology", ["cluster", "sharded", "unknown", True, ["cluster"]]
+)
+def test_security_redis_topology_rejects_cluster_and_unknown_raw_values(
+    raw_topology: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(environment="development", redis_security_topology=raw_topology)
+
+
+def test_production_accepts_explicit_sentinel_primary_topology() -> None:
+    settings = deployment_settings(redis_security_topology="sentinel-primary")
+
+    assert settings.redis_security_topology is SecurityRedisTopology.SENTINEL_PRIMARY
 
 
 @pytest.mark.parametrize("environment", ["staging", "production"])

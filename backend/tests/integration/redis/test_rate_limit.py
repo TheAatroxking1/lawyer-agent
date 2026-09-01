@@ -92,6 +92,29 @@ async def test_login_composite_denial_does_not_consume_the_other_bucket(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_login_identity_bucket_is_shared_across_different_ips(redis_scope) -> None:
+    redis, _, _ = redis_scope
+    limiter = RateLimiter(redis=redis, hmac_key=b"r" * 32)
+    identity = normalize_identifier(IdentityKind.EMAIL, "shared@example.cn")
+
+    decisions = []
+    for offset in range(6):
+        decisions.append(
+            await limiter.consume(
+                RateLimitRule.LOGIN,
+                {
+                    "ip": ip_address(f"203.0.113.{20 + offset}"),
+                    "identity": identity,
+                },
+            )
+        )
+
+    assert all(decision.allowed for decision in decisions[:5])
+    assert decisions[5].allowed is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("rule", "count", "allowed"),
     [

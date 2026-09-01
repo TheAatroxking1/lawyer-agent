@@ -422,7 +422,9 @@ Pod 使用非 root、只读根文件系统、资源 requests/limits、NetworkPol
 ### 10.3 有状态服务
 
 - MySQL：三节点高可用、连接代理、只读副本、自动备份和时间点恢复；
-- Redis：主从/集群与故障转移，缓存、配额和 SSE Streams 分命名空间；
+- Redis：安全控制命名空间仅支持保持单一主 Key 空间的 Standalone 或 Sentinel/HA Primary，
+  禁止使用分片 Redis Cluster；缓存、配额和 SSE Streams 分命名空间。若未来需要让认证组合限流运行在
+  Redis Cluster，必须先重新设计多维 Bucket 的同槽与原子扣减协议，不能直接沿用当前多 Key Lua；
 - RabbitMQ：三节点 Quorum Queue，按在线、合同、文档和批处理分队列；
 - OpenSearch：专用主节点和可扩展数据节点，副本、快照和索引生命周期；
 - MinIO：分布式纠删码、对象版本和跨故障域副本；

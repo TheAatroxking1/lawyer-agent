@@ -21,6 +21,13 @@ class RedisFailureKind(StrEnum):
     SERVER = "server"
 
 
+class SecurityRedisTopology(StrEnum):
+    """Non-sharded Redis topologies that preserve multi-key Lua atomicity."""
+
+    STANDALONE = "standalone"
+    SENTINEL_PRIMARY = "sentinel-primary"
+
+
 class RedisDependencyError(Exception):
     code = "security_dependency_unavailable"
 
@@ -88,11 +95,19 @@ class _RedisSdkPort(Protocol):
 class RedisAsyncioAdapter:
     """The only redis-py boundary used by security services."""
 
-    def __init__(self, client: _RedisSdkPort, *, key_prefix: str = "") -> None:
+    def __init__(
+        self,
+        client: _RedisSdkPort,
+        *,
+        key_prefix: str = "",
+        topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE,
+    ) -> None:
         if not _PREFIX_PATTERN.fullmatch(key_prefix):
             raise ValueError("Redis key prefix contains unsupported characters")
+        _require_security_topology(topology)
         self._client = client
         self._key_prefix = key_prefix
+        self.topology = topology
 
     @classmethod
     def from_url(
@@ -100,9 +115,11 @@ class RedisAsyncioAdapter:
         url: str,
         *,
         key_prefix: str = "",
+        topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE,
         connect_timeout_seconds: float = 1.0,
         socket_timeout_seconds: float = 1.0,
     ) -> Self:
+        _require_security_topology(topology)
         if connect_timeout_seconds <= 0 or socket_timeout_seconds <= 0:
             raise ValueError("Redis timeouts must be positive")
         client = Redis.from_url(
@@ -112,7 +129,11 @@ class RedisAsyncioAdapter:
             socket_timeout=socket_timeout_seconds,
             retry_on_timeout=False,
         )
-        return cls(cast(_RedisSdkPort, client), key_prefix=key_prefix)
+        return cls(
+            cast(_RedisSdkPort, client),
+            key_prefix=key_prefix,
+            topology=topology,
+        )
 
     async def eval(
         self,
@@ -126,16 +147,23 @@ class RedisAsyncioAdapter:
             self._key(value) if index < numkeys else value
             for index, value in enumerate(keys_and_args)
         )
+        translated_error: RedisDependencyError | None = None
         try:
-            return await self._client.eval(script, numkeys, *prefixed)
+            result = await self._client.eval(script, numkeys, *prefixed)
         except RedisError as exc:
-            raise _translate_sdk_error(exc) from None
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
+        return result
 
     async def get(self, key: str) -> bytes | None:
+        translated_error: RedisDependencyError | None = None
         try:
             result = await self._client.get(self._key(key))
         except RedisError as exc:
-            raise _translate_sdk_error(exc) from None
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
         if result is None:
             return None
         if isinstance(result, bytes):
@@ -150,10 +178,13 @@ class RedisAsyncioAdapter:
         ex: int | None = None,
         nx: bool = False,
     ) -> bool:
+        translated_error: RedisDependencyError | None = None
         try:
             result = await self._client.set(self._key(key), value, ex=ex, nx=nx)
         except RedisError as exc:
-            raise _translate_sdk_error(exc) from None
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
         if result is True:
             return True
         if result is False or result is None:
@@ -165,19 +196,25 @@ class RedisAsyncioAdapter:
     async def delete(self, *keys: str) -> int:
         if not keys:
             return 0
+        translated_error: RedisDependencyError | None = None
         try:
             result = await self._client.delete(*(self._key(key) for key in keys))
         except RedisError as exc:
-            raise _translate_sdk_error(exc) from None
-        if isinstance(result, bool) or not isinstance(result, int):
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
+        if type(result) is not int or not 0 <= result <= len(keys):
             raise RedisDependencyInvalidResponse
         return result
 
     async def aclose(self) -> None:
+        translated_error: RedisDependencyError | None = None
         try:
             await self._client.aclose()
         except RedisError as exc:
-            raise _translate_sdk_error(exc) from None
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
 
     def _key(self, value: RedisValue) -> str:
         if not isinstance(value, str) or not value or "\x00" in value:
@@ -193,3 +230,8 @@ def _translate_sdk_error(error: RedisError) -> RedisDependencyError:
     if isinstance(error, (RedisReadOnlyError, RedisOutOfMemoryError)):
         return RedisDependencyUnavailable(RedisFailureKind.SERVER)
     return RedisDependencyInvalidResponse()
+
+
+def _require_security_topology(topology: object) -> None:
+    if not isinstance(topology, SecurityRedisTopology):
+        raise ValueError("security Redis topology must be strongly typed")

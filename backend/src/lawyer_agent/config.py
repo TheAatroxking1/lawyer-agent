@@ -12,6 +12,7 @@ from lawyer_agent.application.identity import (
     BlindIndexRolloutPolicy,
 )
 from lawyer_agent.domain.origins import HttpOrigin
+from lawyer_agent.infrastructure.redis.client import SecurityRedisTopology
 
 DEVELOPMENT_SECRET = "development-only-change-before-exposure"  # noqa: S105
 DEVELOPMENT_DATA_ENCRYPTION_KEY_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
@@ -44,6 +45,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = DEVELOPMENT_DATABASE_URL
     redis_url: str = DEVELOPMENT_REDIS_URL
+    redis_security_topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE
     database_pool_size: int = Field(default=10, gt=0)
     database_max_overflow: int = Field(default=20, ge=0)
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)
@@ -82,6 +84,18 @@ class Settings(BaseSettings):
             dict.fromkeys(HttpOrigin.parse(origin).value for origin in value)
         )
 
+    @field_validator("redis_security_topology", mode="before")
+    @classmethod
+    def validate_security_redis_topology(cls, value: object) -> object:
+        if value not in (
+            SecurityRedisTopology.STANDALONE,
+            SecurityRedisTopology.SENTINEL_PRIMARY,
+        ):
+            raise ValueError(
+                "Redis topology must be standalone or a Sentinel-resolved primary"
+            )
+        return value
+
     @field_validator("jwt_ed25519_key_ring")
     @classmethod
     def validate_ed25519_key_ring(cls, value: dict[str, str]) -> dict[str, str]:
@@ -104,6 +118,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def reject_development_secret_outside_local_environments(self) -> "Settings":
+        if (
+            self.environment in {"staging", "production"}
+            and "redis_security_topology" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "staging and production require an explicit security Redis topology"
+            )
         if self.environment in {"staging", "production"} and (
             self.blind_index_rollout_phase is None
             or self.blind_index_legacy_key_version is None

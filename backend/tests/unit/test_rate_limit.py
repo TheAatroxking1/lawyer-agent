@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError as RedisOutOfMemoryError
 from redis.exceptions import ReadOnlyError as RedisReadOnlyError
 from redis.exceptions import ResponseError as RedisResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -23,6 +24,7 @@ from lawyer_agent.infrastructure.redis.client import (
     RedisAsyncioAdapter,
     RedisDependencyUnavailable,
     RedisFailureKind,
+    SecurityRedisTopology,
 )
 from lawyer_agent.infrastructure.redis.rate_limit import RateLimiter, RateLimitRule
 from lawyer_agent.infrastructure.redis.step_up import StepUpStore
@@ -272,6 +274,37 @@ async def test_equivalent_ip_identity_and_uuid_objects_use_canonical_keys() -> N
 
 
 @pytest.mark.asyncio
+async def test_login_ip_and_identity_buckets_preserve_cross_dimension_sharing() -> None:
+    redis = RecordingRedis()
+    limiter = RateLimiter(redis=redis, hmac_key=b"r" * 32)
+    first_identity = normalize_identifier(IdentityKind.EMAIL, "first@example.cn")
+    second_identity = normalize_identifier(IdentityKind.EMAIL, "second@example.cn")
+    first_ip = ip_address("203.0.113.31")
+    second_ip = ip_address("203.0.113.32")
+
+    await limiter.consume(
+        RateLimitRule.LOGIN,
+        {"ip": first_ip, "identity": first_identity},
+    )
+    await limiter.consume(
+        RateLimitRule.LOGIN,
+        {"ip": first_ip, "identity": second_identity},
+    )
+    await limiter.consume(
+        RateLimitRule.LOGIN,
+        {"ip": second_ip, "identity": first_identity},
+    )
+
+    first_keys = redis.eval_calls[-3][2][:2]
+    same_ip_keys = redis.eval_calls[-2][2][:2]
+    same_identity_keys = redis.eval_calls[-1][2][:2]
+    assert first_keys[0] == same_ip_keys[0]
+    assert first_keys[1] != same_ip_keys[1]
+    assert first_keys[0] != same_identity_keys[0]
+    assert first_keys[1] == same_identity_keys[1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "session_value",
     [str(SESSION_ID), UUID("00000000-0000-4000-8000-000000000001"), True],
@@ -337,6 +370,11 @@ async def test_redis_adapter_maps_invalid_sdk_response_to_project_error() -> Non
             RedisDependencyUnavailable,
             RedisFailureKind.SERVER,
         ),
+        (
+            RedisOutOfMemoryError("OOM leaked-key leaked-payload secret-grant"),
+            RedisDependencyUnavailable,
+            RedisFailureKind.SERVER,
+        ),
     ],
 )
 async def test_redis_adapter_sanitizes_all_sdk_error_replies(
@@ -363,9 +401,76 @@ async def test_redis_adapter_sanitizes_all_sdk_error_replies(
     assert "secret" not in str(captured.value).lower()
     assert "secret" not in repr(captured.value).lower()
     assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    chain: BaseException | None = captured.value
+    while chain is not None:
+        rendered = f"{chain!s} {chain!r}".lower()
+        assert "secret-grant" not in rendered
+        assert "leaked-key" not in rendered
+        assert "leaked-payload" not in rendered
+        chain = chain.__cause__ or chain.__context__
     if expected_kind is not None:
         assert isinstance(captured.value, RedisDependencyUnavailable)
         assert captured.value.kind is expected_kind
+
+
+@pytest.mark.parametrize("raw_topology", ["cluster", "sentinel", "unknown", True])
+def test_security_redis_adapter_rejects_untyped_or_cluster_topology(
+    raw_topology: object,
+) -> None:
+    with pytest.raises(ValueError, match="topology"):
+        RedisAsyncioAdapter(
+            FailingSdkClient(RuntimeError("unused")),  # type: ignore[arg-type]
+            topology=raw_topology,  # type: ignore[arg-type]
+        )
+
+
+def test_from_url_rejects_cluster_topology_before_constructing_sdk_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk_calls: list[str] = []
+
+    def record_sdk_construction(url: str, **kwargs: object) -> object:
+        del kwargs
+        sdk_calls.append(url)
+        return FailingSdkClient(RuntimeError("unused"))
+
+    monkeypatch.setattr(redis_client.Redis, "from_url", record_sdk_construction)
+
+    with pytest.raises(ValueError, match="topology"):
+        RedisAsyncioAdapter.from_url(
+            "redis://secret-redis.example.cn:6379/0",
+            topology="cluster",  # type: ignore[arg-type]
+        )
+
+    assert sdk_calls == []
+
+
+def test_security_redis_adapter_accepts_supported_non_sharded_topologies() -> None:
+    client = FailingSdkClient(RuntimeError("unused"))
+
+    for topology in SecurityRedisTopology:
+        adapter = RedisAsyncioAdapter(
+            client,  # type: ignore[arg-type]
+            topology=topology,
+        )
+        assert adapter.topology is topology
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [-1, 3, True, 1.0, "1"])
+async def test_redis_adapter_delete_rejects_impossible_sdk_counts(result: object) -> None:
+    class DeleteResultSdkClient(FailingSdkClient):
+        async def delete(self, *keys: str) -> object:
+            del keys
+            return result
+
+    adapter = RedisAsyncioAdapter(
+        DeleteResultSdkClient(RuntimeError("unused")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(redis_client.RedisDependencyInvalidResponse):
+        await adapter.delete("first", "second")
 
 
 @pytest.mark.asyncio

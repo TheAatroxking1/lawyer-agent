@@ -415,6 +415,13 @@ Redis 限流维度至少包括：
 
 认证端点在 Redis 不可用时 Fail Closed 并返回 503；普通已认证读取可回源 MySQL。
 
+认证、限流、Step-up 和授权缓存使用的安全控制 Redis 必须保持单一主 Key 空间，只允许
+Standalone 或由 Sentinel/HA 解析出的 Primary，不支持分片 Redis Cluster。原因是 login 同时扣减
+跨 Identity 共享的 IP Bucket 和跨 IP 共享的 Identity Bucket，两者无法通过固定 Hash Tag 保持业务语义并
+天然落在同一 Cluster Slot；当前多 Key Lua 依赖单一主 Key 空间才能原子执行。Development/Test 安全默认
+Standalone，Staging/Production 必须显式声明拓扑；Cluster、未识别值或非强类型值在创建 Redis Adapter
+之前 Fail Closed。若未来支持 Cluster，必须单独批准并重设计组合限流原子协议。
+
 指标至少包括认证结果、Refresh 重放、Policy 决策原因、数据库延迟、Redis 延迟、邀请状态和租户审核结果。Metric Label 不得包含手机号、邮箱、User ID 原文、Tenant Name、Token 或高基数字段。
 
 ## 13. 迁移与种子数据
