@@ -4,9 +4,9 @@ from base64 import b64encode
 
 import pytest
 from argon2 import PasswordHasher
-from cryptography.exceptions import InvalidTag
 
 from lawyer_agent.domain.identity import (
+    CiphertextAuthenticationError,
     IdentityKind,
     normalize_email,
     normalize_identifier,
@@ -161,7 +161,7 @@ def test_cipher_envelope_is_versioned_random_and_aad_bound() -> None:
     assert len(first) >= 2 + 12 + 16
     assert first != second
     assert cipher.decrypt(first, aad=aad) == "13800138000"
-    with pytest.raises(InvalidTag):
+    with pytest.raises(CiphertextAuthenticationError):
         cipher.decrypt(first, aad=b"auth_identity:id-b:subject")
 
 
@@ -196,6 +196,32 @@ def test_blind_indexes_are_purpose_and_key_version_isolated() -> None:
         "+8613800138000",
         key_version=2,
     )
+
+
+def test_blind_index_versions_match_mysql_signed_smallint_boundaries() -> None:
+    service = BlindIndexService(
+        {1: b"a" * 32, 32767: b"b" * 32},
+        active_key_version=32767,
+    )
+
+    assert service.key_versions == (1, 32767)
+
+
+@pytest.mark.parametrize(
+    ("keys", "active_version"),
+    [
+        ({0: b"a" * 32}, 0),
+        ({-1: b"a" * 32, 1: b"b" * 32}, 1),
+        ({1: b"a" * 32, 32768: b"b" * 32}, 1),
+        ({True: b"a" * 32}, True),
+    ],
+)
+def test_blind_index_rejects_invalid_active_or_inactive_key_versions(
+    keys: dict[int, bytes],
+    active_version: int,
+) -> None:
+    with pytest.raises(ValueError, match="1 to 32767"):
+        BlindIndexService(keys, active_key_version=active_version)
 
 
 def test_security_keys_are_binary_not_base64_text() -> None:

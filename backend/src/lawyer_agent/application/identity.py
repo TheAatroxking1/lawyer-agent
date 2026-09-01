@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -8,16 +9,17 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
-from cryptography.exceptions import InvalidTag
-
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.identity import (
+    CiphertextAuthenticationError,
     IdentityKind,
     NormalizedIdentity,
     PasswordVerification,
     VersionedBlindIndex,
     normalize_identifier,
 )
+
+_TRACE_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}", re.ASCII)
 
 
 class IdentityConflictError(Exception):
@@ -41,8 +43,10 @@ class AuditContext:
     user_agent_hash: bytes | None
 
     def __post_init__(self) -> None:
-        if not self.trace_id.strip() or len(self.trace_id) > 64 or "\x00" in self.trace_id:
-            raise ValueError("trace_id must be a non-empty safe value of at most 64 characters")
+        if _TRACE_ID_PATTERN.fullmatch(self.trace_id) is None:
+            raise ValueError(
+                "trace_id must contain 1 to 64 safe ASCII letters, digits, '.', '_', ':', or '-'"
+            )
         for value in (self.client_ip_hash, self.user_agent_hash):
             if value is not None and len(value) != 32:
                 raise ValueError("client context hashes must be 32-byte values")
@@ -426,7 +430,7 @@ class IdentityService:
                 record.subject_ciphertext,
                 aad=_identity_subject_aad(record.identity_id),
             )
-        except (InvalidTag, UnicodeDecodeError, ValueError):
+        except (CiphertextAuthenticationError, UnicodeDecodeError, ValueError):
             self._password_hasher.verify_dummy(password)
             await self._append_authentication_result(uow, audit_context, None, False)
             return None

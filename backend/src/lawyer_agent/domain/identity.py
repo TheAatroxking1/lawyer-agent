@@ -16,6 +16,10 @@ class IdentityKind(StrEnum):
     WECHAT_OPENID = "wechat_openid"
 
 
+class CiphertextAuthenticationError(ValueError):
+    """Ciphertext failed authenticated decryption without exposing provider details."""
+
+
 @dataclass(frozen=True, slots=True)
 class NormalizedIdentity:
     kind: IdentityKind

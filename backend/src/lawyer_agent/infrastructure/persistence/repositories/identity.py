@@ -3,6 +3,7 @@ from __future__ import annotations
 from base64 import urlsafe_b64encode
 from collections.abc import Mapping
 from datetime import datetime
+from math import isfinite
 from types import TracebackType
 from typing import Self
 from uuid import UUID
@@ -29,6 +30,14 @@ from lawyer_agent.infrastructure.persistence.models import (
 
 _IDENTITY_UNIQUE_CONSTRAINT = "uq_auth_identities_subject"
 _MYSQL_DUPLICATE_ENTRY = 1062
+_MYSQL_LOCK_TIMEOUT_SECONDS = 5.0
+
+
+def identity_advisory_lock_name(lock_digest: bytes) -> str:
+    if len(lock_digest) != 32:
+        raise ValueError("identity lock digest must contain exactly 32 bytes")
+    encoded = urlsafe_b64encode(lock_digest).rstrip(b"=").decode("ascii")
+    return f"lawyer_identity:{encoded}"
 
 
 class IdentityRepository:
@@ -201,12 +210,24 @@ class AuditRepository:
 
 
 class SqlAlchemyIdentityUnitOfWork:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        lock_timeout_seconds: float = _MYSQL_LOCK_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            isinstance(lock_timeout_seconds, bool)
+            or not isfinite(lock_timeout_seconds)
+            or not 0 <= lock_timeout_seconds <= _MYSQL_LOCK_TIMEOUT_SECONDS
+        ):
+            raise ValueError("identity lock timeout must be between 0 and 5 seconds")
         self._session_factory = session_factory
         bind = session_factory.kw.get("bind")
         if not isinstance(bind, AsyncEngine):
             raise TypeError("identity unit of work requires an AsyncEngine-bound session factory")
         self._lock_engine = bind
+        self._lock_timeout_seconds = lock_timeout_seconds
         self._session: AsyncSession | None = None
         self._lock_connection: AsyncConnection | None = None
         self._lock_names: list[str] = []
@@ -249,10 +270,12 @@ class SqlAlchemyIdentityUnitOfWork:
         self._require_session()
         if self._lock_connection is None:
             self._lock_connection = await self._lock_engine.connect()
-        encoded = urlsafe_b64encode(lock_digest).rstrip(b"=").decode("ascii")
-        lock_name = f"lawyer_identity:{encoded}"
+        lock_name = identity_advisory_lock_name(lock_digest)
         acquired = await self._lock_connection.scalar(
-            select(text("GET_LOCK(:lock_name, 5)")).params(lock_name=lock_name)
+            select(text("GET_LOCK(:lock_name, :lock_timeout)")).params(
+                lock_name=lock_name,
+                lock_timeout=self._lock_timeout_seconds,
+            )
         )
         if acquired != 1:
             raise TimeoutError("identity registration lock is unavailable")

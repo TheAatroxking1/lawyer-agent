@@ -153,6 +153,7 @@ class FakeAuditRepository:
 class FakeUnitOfWork:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.lock_digests: list[bytes] = []
         self.identities = FakeIdentityRepository(self.calls)
         self.audit = FakeAuditRepository(self.calls)
 
@@ -170,7 +171,7 @@ class FakeUnitOfWork:
         self.calls.append("rollback" if exc_type is not None else "commit")
 
     async def lock_identity(self, lock_digest: bytes) -> None:
-        del lock_digest
+        self.lock_digests.append(lock_digest)
         self.calls.append("lock")
 
 
@@ -202,6 +203,7 @@ def test_application_identity_has_no_sqlalchemy_or_infrastructure_dependency() -
     source = inspect.getsource(identity_application)
 
     assert "sqlalchemy" not in source
+    assert "cryptography" not in source
     assert "lawyer_agent.infrastructure" not in source
 
 
@@ -227,6 +229,10 @@ async def test_register_uses_ports_in_transactional_order_with_real_audit_contex
         "audit:identity.register",
         "flush",
         "commit",
+    ]
+    assert uow.lock_digests == [
+        item.digest
+        for item in FakeBlindIndex().digests("identity:username", "lawyer")
     ]
     event = uow.audit.events[0]
     assert event.trace_id == "trace-123"
@@ -321,7 +327,25 @@ def test_audit_context_accepts_only_fixed_length_client_hashes(bad_hash: bytes) 
         AuditContext("trace", bad_hash, None)
 
 
-@pytest.mark.parametrize("trace_id", ["   ", "trace\x00id", "x" * 65])
+@pytest.mark.parametrize(
+    "trace_id",
+    [
+        "   ",
+        "trace\x00id",
+        "trace\rid",
+        "trace\nid",
+        "trace\tid",
+        "追踪-id",
+        "trace/id",
+        "x" * 65,
+    ],
+)
 def test_audit_context_rejects_unsafe_trace_ids(trace_id: str) -> None:
     with pytest.raises(ValueError, match="trace_id"):
         AuditContext(trace_id, None, None)
+
+
+def test_audit_context_accepts_explicit_safe_ascii_trace_charset() -> None:
+    context = AuditContext("trace-01_ab.cd:ef", None, None)
+
+    assert context.trace_id == "trace-01_ab.cd:ef"

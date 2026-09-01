@@ -3,7 +3,10 @@ from __future__ import annotations
 import secrets
 from collections.abc import Mapping
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from lawyer_agent.domain.identity import CiphertextAuthenticationError
 
 _VERSION_BYTES = 2
 _NONCE_BYTES = 12
@@ -47,9 +50,12 @@ class SensitiveValueCipher:
             raise ValueError("ciphertext uses an unknown key version")
         nonce_start = _VERSION_BYTES
         nonce_end = nonce_start + _NONCE_BYTES
-        plaintext = AESGCM(key).decrypt(
-            envelope[nonce_start:nonce_end],
-            envelope[nonce_end:],
-            aad,
-        )
+        try:
+            plaintext = AESGCM(key).decrypt(
+                envelope[nonce_start:nonce_end],
+                envelope[nonce_end:],
+                aad,
+            )
+        except InvalidTag:
+            raise CiphertextAuthenticationError("ciphertext authentication failed") from None
         return plaintext.decode("utf-8")
