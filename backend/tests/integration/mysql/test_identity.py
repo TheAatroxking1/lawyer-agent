@@ -23,6 +23,8 @@ from alembic import command
 from lawyer_agent.application.identity import (
     AuditContext,
     BlindIndexKeyUnavailableError,
+    BlindIndexRolloutPhase,
+    BlindIndexRolloutPolicy,
     IdentityConflictError,
     IdentityService,
     LoginIdentifier,
@@ -99,6 +101,11 @@ def service_factory(
             password_hasher=Argon2PasswordHasher(),
             cipher=cipher,
             blind_index=blind,
+            rollout_policy=BlindIndexRolloutPolicy(
+                BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+                1,
+                False,
+            ),
         )
 
     return build
@@ -111,12 +118,19 @@ def _rotated_service(
     cipher_active: int,
     blind_keys: dict[int, bytes],
     blind_active: int,
+    rollout_phase: BlindIndexRolloutPhase = BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+    legacy_blind_version: int | None = None,
 ) -> IdentityService:
     return IdentityService(
         uow_factory=lambda: SqlAlchemyIdentityUnitOfWork(session_factory),
         password_hasher=Argon2PasswordHasher(),
         cipher=SensitiveValueCipher(cipher_keys, active_key_version=cipher_active),
         blind_index=BlindIndexService(blind_keys, active_key_version=blind_active),
+        rollout_policy=BlindIndexRolloutPolicy(
+            rollout_phase,
+            blind_active if legacy_blind_version is None else legacy_blind_version,
+            rollout_phase is BlindIndexRolloutPhase.ROTATION_READY,
+        ),
     )
 
 
@@ -308,6 +322,8 @@ async def test_blind_index_rotation_authenticates_reindexes_and_blocks_reregistr
         cipher_active=7,
         blind_keys={1: b"i" * 32, 2: b"j" * 32},
         blind_active=2,
+        rollout_phase=BlindIndexRolloutPhase.ROTATION_READY,
+        legacy_blind_version=1,
     )
     authenticated = await v2.authenticate(
         LoginIdentifier(IdentityKind.USERNAME, username),

@@ -13,6 +13,9 @@ from lawyer_agent.application.identity import (
     AuditContext,
     AuditEvent,
     AuthenticationRecord,
+    BlindIndexRolloutConfigurationError,
+    BlindIndexRolloutPhase,
+    BlindIndexRolloutPolicy,
     IdentityService,
     LoginIdentifier,
     RegisterCommand,
@@ -196,7 +199,104 @@ def _service(
         password_hasher=hasher or FakePasswordHasher(),
         cipher=FakeCipher(),
         blind_index=FakeBlindIndex(),
+        rollout_policy=BlindIndexRolloutPolicy(
+            phase=BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+            legacy_key_version=2,
+            legacy_writers_drained=False,
+        ),
     )
+
+
+def test_legacy_compatible_rollout_rejects_a_new_active_version_before_uow() -> None:
+    class VersionEightBlindIndex(FakeBlindIndex):
+        active_key_version = 8
+        key_versions = (7, 8)
+
+    factory_calls: list[str] = []
+
+    def factory() -> FakeUnitOfWork:
+        factory_calls.append("uow")
+        return FakeUnitOfWork()
+
+    with pytest.raises(BlindIndexRolloutConfigurationError, match="legacy key version"):
+        IdentityService(
+            uow_factory=factory,
+            password_hasher=FakePasswordHasher(),
+            cipher=FakeCipher(),
+            blind_index=VersionEightBlindIndex(),
+            rollout_policy=BlindIndexRolloutPolicy(
+                phase=BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+                legacy_key_version=7,
+                legacy_writers_drained=False,
+            ),
+        )
+
+    assert factory_calls == []
+
+
+def test_rotation_ready_requires_explicit_drain_ack_and_legacy_key() -> None:
+    with pytest.raises(BlindIndexRolloutConfigurationError, match="drained acknowledgement"):
+        BlindIndexRolloutPolicy(
+            phase=BlindIndexRolloutPhase.ROTATION_READY,
+            legacy_key_version=7,
+            legacy_writers_drained=False,
+        )
+
+    class VersionEightOnlyBlindIndex(FakeBlindIndex):
+        active_key_version = 8
+        key_versions = (8,)
+
+    with pytest.raises(BlindIndexRolloutConfigurationError, match="legacy key version"):
+        IdentityService(
+            uow_factory=FakeUnitOfWork,
+            password_hasher=FakePasswordHasher(),
+            cipher=FakeCipher(),
+            blind_index=VersionEightOnlyBlindIndex(),
+            rollout_policy=BlindIndexRolloutPolicy(
+                phase=BlindIndexRolloutPhase.ROTATION_READY,
+                legacy_key_version=7,
+                legacy_writers_drained=True,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "drained"),
+    [
+        ("legacy-compatible", False),
+        (BlindIndexRolloutPhase.LEGACY_COMPATIBLE, 1),
+    ],
+)
+def test_rollout_policy_rejects_untyped_phase_or_ack(
+    phase: object,
+    drained: object,
+) -> None:
+    with pytest.raises(BlindIndexRolloutConfigurationError, match="strongly typed"):
+        BlindIndexRolloutPolicy(
+            phase=phase,  # type: ignore[arg-type]
+            legacy_key_version=7,
+            legacy_writers_drained=drained,  # type: ignore[arg-type]
+        )
+
+
+def test_rotation_ready_ack_allows_new_active_version_with_legacy_key() -> None:
+    class RotatingBlindIndex(FakeBlindIndex):
+        active_key_version = 8
+        key_versions = (7, 8)
+
+    service = IdentityService(
+        uow_factory=FakeUnitOfWork,
+        password_hasher=FakePasswordHasher(),
+        cipher=FakeCipher(),
+        blind_index=RotatingBlindIndex(),
+        rollout_policy=BlindIndexRolloutPolicy(
+            phase=BlindIndexRolloutPhase.ROTATION_READY,
+            legacy_key_version=7,
+            legacy_writers_drained=True,
+        ),
+    )
+
+    assert isinstance(service, IdentityService)
 
 
 def test_application_identity_has_no_sqlalchemy_or_infrastructure_dependency() -> None:

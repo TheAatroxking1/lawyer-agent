@@ -17,6 +17,8 @@ from alembic import command
 from lawyer_agent.application.identity import (
     AuditContext,
     BlindIndexKeyUnavailableError,
+    BlindIndexRolloutPhase,
+    BlindIndexRolloutPolicy,
     IdentityConflictError,
     IdentityService,
     LoginIdentifier,
@@ -234,6 +236,11 @@ async def _exercise_authentication_and_conflict(
         password_hasher=Argon2PasswordHasher(),
         cipher=SensitiveValueCipher({7: _CIPHER_KEY}, active_key_version=7),
         blind_index=BlindIndexService({7: _BLIND_KEY_V7}, active_key_version=7),
+        rollout_policy=BlindIndexRolloutPolicy(
+            BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+            7,
+            False,
+        ),
     )
     try:
         authenticated = await service.authenticate(

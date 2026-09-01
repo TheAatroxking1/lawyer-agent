@@ -3,6 +3,7 @@ from base64 import b64encode
 import pytest
 from pydantic import ValidationError
 
+from lawyer_agent.application.identity import BlindIndexRolloutPhase
 from lawyer_agent.config import (
     DEVELOPMENT_BLIND_INDEX_KEY_B64,
     DEVELOPMENT_CSRF_KEY_B64,
@@ -25,6 +26,8 @@ def deployment_settings(environment: str = "production", **overrides: object) ->
         "redis_url": "redis://redis.example.cn:6379/0",
         "data_encryption_key_b64": encoded_key(11),
         "blind_index_key_b64": encoded_key(12),
+        "blind_index_rollout_phase": "legacy-compatible",
+        "blind_index_legacy_key_version": 1,
         "refresh_token_key_b64": encoded_key(13),
         "csrf_key_b64": encoded_key(14),
         "jwt_ed25519_key_ring": {"active": "configured-outside-source-control"},
@@ -61,6 +64,35 @@ def test_production_accepts_explicit_distinct_security_configuration() -> None:
 
     assert settings.cookie_secure is True
     assert settings.trusted_origins == ("https://app.example.cn",)
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_deployment_requires_explicit_blind_index_rollout_configuration(
+    environment: str,
+) -> None:
+    with pytest.raises(ValidationError, match="rollout phase and legacy key version"):
+        deployment_settings(
+            environment,
+            blind_index_rollout_phase=None,
+            blind_index_legacy_key_version=None,
+        )
+
+
+def test_rotation_ready_requires_explicit_legacy_writer_drain_ack() -> None:
+    with pytest.raises(ValidationError, match="drained acknowledgement"):
+        deployment_settings(
+            blind_index_rollout_phase="rotation-ready",
+            blind_index_legacy_key_version=7,
+            blind_index_legacy_writers_drained=False,
+        )
+
+
+def test_local_rollout_defaults_are_safe_and_strongly_typed() -> None:
+    policy = Settings(environment="test").identity_rollout_policy()
+
+    assert policy.phase is BlindIndexRolloutPhase.LEGACY_COMPATIBLE
+    assert policy.legacy_key_version == 1
+    assert policy.legacy_writers_drained is False
 
 
 @pytest.mark.parametrize("environment", ["staging", "production"])

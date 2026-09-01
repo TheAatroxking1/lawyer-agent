@@ -7,6 +7,11 @@ from urllib.parse import urlparse
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from lawyer_agent.application.identity import (
+    BlindIndexRolloutPhase,
+    BlindIndexRolloutPolicy,
+)
+
 DEVELOPMENT_SECRET = "development-only-change-before-exposure"  # noqa: S105
 DEVELOPMENT_DATA_ENCRYPTION_KEY_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
 DEVELOPMENT_BLIND_INDEX_KEY_B64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
@@ -71,6 +76,11 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     data_encryption_key_b64: str = DEVELOPMENT_DATA_ENCRYPTION_KEY_B64
     blind_index_key_b64: str = DEVELOPMENT_BLIND_INDEX_KEY_B64
+    blind_index_rollout_phase: Literal[
+        "legacy-compatible", "rotation-ready"
+    ] | None = None
+    blind_index_legacy_key_version: int | None = None
+    blind_index_legacy_writers_drained: bool = False
     refresh_token_key_b64: str = DEVELOPMENT_REFRESH_TOKEN_KEY_B64
     csrf_key_b64: str = DEVELOPMENT_CSRF_KEY_B64
     jwt_ed25519_key_ring: dict[str, str] = Field(
@@ -106,8 +116,26 @@ class Settings(BaseSettings):
             raise ValueError("jwt_ed25519_key_ring must not repeat key material")
         return value
 
+    @field_validator("blind_index_legacy_key_version")
+    @classmethod
+    def validate_legacy_blind_index_version(cls, value: int | None) -> int | None:
+        if value is None:
+            return value
+        if isinstance(value, bool) or not 1 <= value <= 32767:
+            raise ValueError("blind_index_legacy_key_version must be from 1 to 32767")
+        return value
+
     @model_validator(mode="after")
     def reject_development_secret_outside_local_environments(self) -> "Settings":
+        if self.environment in {"staging", "production"} and (
+            self.blind_index_rollout_phase is None
+            or self.blind_index_legacy_key_version is None
+        ):
+            raise ValueError(
+                "staging and production require an explicit blind-index rollout phase "
+                "and legacy key version"
+            )
+        self.identity_rollout_policy()
         if self.environment not in {"staging", "production"}:
             return self
 
@@ -147,6 +175,22 @@ class Settings(BaseSettings):
             if "*" in origin or parsed.scheme != "https" or not parsed.netloc:
                 raise ValueError("production trusted_origins must be explicit HTTPS origins")
         return self
+
+    def identity_rollout_policy(self) -> BlindIndexRolloutPolicy:
+        phase = BlindIndexRolloutPhase(
+            self.blind_index_rollout_phase
+            or BlindIndexRolloutPhase.LEGACY_COMPATIBLE.value
+        )
+        legacy_key_version = (
+            1
+            if self.blind_index_legacy_key_version is None
+            else self.blind_index_legacy_key_version
+        )
+        return BlindIndexRolloutPolicy(
+            phase=phase,
+            legacy_key_version=legacy_key_version,
+            legacy_writers_drained=self.blind_index_legacy_writers_drained,
+        )
 
 
 @lru_cache

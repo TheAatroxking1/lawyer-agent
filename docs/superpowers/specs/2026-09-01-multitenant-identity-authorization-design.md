@@ -130,9 +130,11 @@ Policy Engine 不依赖 FastAPI Request、SQLAlchemy Session 或供应商 SDK �
 - `display_value`：仅允许保存非敏感或已脱敏显示值；
 - `subject_ciphertext`：手机号、邮箱或微信 Subject 的密文；
 - `subject_blind_index`；
+- `key_version`：密文字段使用的加密密钥版本；
+- `blind_index_key_version`：Blind Index 使用的独立密钥版本；
 - `verified_at`、`status`、时间戳。
 
-唯一约束为 `(kind, issuer, subject_blind_index)`。用户名在创建账号时形成有效身份；手机号、邮箱和微信只有完成证明后才进入 `auth_identities`，未验证 Claim 保存在有期限的验证挑战中，避免未验证占位长期阻塞真实用户。
+唯一约束为 `(kind, issuer, blind_index_key_version, subject_blind_index)`。注册和认证必须对当前 Key Ring 中全部有效 Blind Index 版本查询并按稳定版本顺序取得用途隔离的 MySQL Advisory Lock；单一版本唯一约束只负责数据库最终防线，不能代替跨版本冲突检查。用户名在创建账号时形成有效身份；手机号、邮箱和微信只有完成证明后才进入 `auth_identities`，未验证 Claim 保存在有期限的验证挑战中，避免未验证占位长期阻塞真实用户。
 
 用户名采用 NFKC、去除首尾空白和 Casefold 后生成索引；手机号规范化为 E.164；邮箱规范化域名后生成用途隔离的 Blind Index；微信按 Provider Issuer + UnionID/OpenID 判断唯一性。
 
@@ -214,6 +216,16 @@ Schema 允许以后创建 `tenant_roles.is_custom = true` 的角色，本增量�
 - 本地开发从未提交的环境变量或只读 Secret 文件加载密钥。
 - 生产环境由中国大陆部署的 Vault/KMS 提供密钥和轮换能力。
 - 密文和 Blind Index 设计包含 `key_version`，为以后轮换和重加密保留路径。
+
+Blind Index 轮换采用不可跳步的两阶段发布门禁：
+
+1. `expand`：新增可空 `blind_index_key_version`，已有 revision-01 行按本行 `key_version` 回填；滚动期保留 `BEFORE INSERT` 兼容 Trigger，使旧 Writer 省略新列时仍写入本行旧版本，并由 `BEFORE UPDATE` Trigger 拒绝 NULL 或 digest/version 非原子变化。
+2. `legacy-compatible`：显式配置 legacy BI version，所有新 Worker 的 active BI version 必须与其相同。revision-01 Writer 不取得新 Advisory Lock，因此只要它仍可能运行，就禁止激活新 BI version；应用在构造身份服务或启动门禁时 Fail Closed。
+3. 运维通过实例清单、部署状态和流量证据确认所有 revision-01 Writer 已清退。系统不得从数据库行、时间窗口或“看起来没有旧流量”自动推断已清退；必须写入显式 `legacy_writers_drained` 确认。
+4. `rotation-ready`：只有 phase 与 drained acknowledgement 同时显式配置后才允许 active BI version 前进。Key Ring 必须继续保留 legacy version，以便查询旧行；新服务同时查询/锁定所有有效版本，并在认证成功事务中懒重索引。
+5. `contract`：待旧 Writer 清退、NULL 行为零、持久化版本均有可用 Key、旧版本行完成重索引且回退方案验证后，才允许新增前向 Migration 删除兼容 Trigger、收紧列非空并按计划退役旧 Key。不得在当前 expand revision 中提前 contract。
+
+Staging 与 Production 必须显式提供 `LAWYER_BLIND_INDEX_ROLLOUT_PHASE` 和 `LAWYER_BLIND_INDEX_LEGACY_KEY_VERSION`；进入 rotation-ready 时还必须显式设置 `LAWYER_BLIND_INDEX_LEGACY_WRITERS_DRAINED=true`。Development/Test 可以安全默认 `legacy-compatible + v1`，但仍执行同一强类型验证。Cipher Key 与 Blind Index Key 独立轮换，Cipher active version 不参与上述 BI phase 判断。
 
 ## 7. 认证与 Session 流程
 
@@ -414,6 +426,7 @@ Redis 限流维度至少包括：
 - 生产只执行已验证向前迁移；
 - 已发布 Migration 不得修改；
 - 破坏性迁移必须另行设计发布和恢复流程。
+- 身份 revision-02 处于 expand 兼容期；后续 contract 必须新增前向 Migration，并以第 6 节的 Writer 清退、显式确认、NULL/Key/重索引检查作为发布门禁。
 
 ## 14. 测试策略
 
@@ -425,6 +438,7 @@ Redis 限流维度至少包括：
 6. 权限矩阵测试：每个内置角色的允许与拒绝动作，租户状态、部门和资源状态限制。
 7. Migration 测试：真实 MySQL 上升级、降级和再次升级。
 8. OpenAPI Snapshot：防止 Cookie、Secret 和内部字段泄露。
+9. Blind Index 混合版本测试：revision-01 v7 Writer 与新 Worker 并存时，`legacy-compatible` 拒绝 active v8；active v7 并发注册只能留下一条身份；显式 `rotation-ready + drained` 后 v8 仍能查询并重索引 v7 行。
 
 不得用 SQLite 替代 MySQL 集成测试，因为 `BINARY(16)`、复合外键、唯一约束、事务锁和并发语义不同。
 
@@ -440,6 +454,7 @@ Redis 限流维度至少包括：
 8. 审计事件覆盖关键身份、成员、授权和审核操作，且不含敏感原文。
 9. pytest、Ruff、mypy、MySQL 集成测试、迁移测试和 OpenAPI 契约全部通过。
 10. Docker Compose 仍可一键启动，所有 Secret 保持未提交状态。
+11. Blind Index 轮换未取得显式旧 Writer 清退确认时不能激活新版本，且门禁发生在任何注册或认证写路径之前。
 
 ## 16. 规格自审时的安全修正
 

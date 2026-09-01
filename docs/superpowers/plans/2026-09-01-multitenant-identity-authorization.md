@@ -23,6 +23,7 @@
 - 每个租户私有 Repository 方法必须接收 `TenantContext`；不得提供私有资源的裸 `get_by_id(id)`。
 - 所有写端点使用 Idempotency-Key；更新使用 `If-Match`/ETag，版本冲突按已批准契约返回 409。
 - Token、Cookie、密码、验证码、密文、Blind Index、内部版本和个人信息不得出现在响应 Schema、日志、审计或指标标签。
+- Blind Index revision-02 保持 expand 兼容：`legacy-compatible` 时 active version 必须等于显式 legacy version；只有人工确认 revision-01 Writer 全部清退并配置 `rotation-ready + legacy_writers_drained` 后才可激活新版本，系统不得自动猜测清退状态。
 - 开发 Provider 可以在测试 Fixture 捕获 OTP/邀请值；本增量不接入真实短信、邮件或微信供应商。
 - 使用 TDD；每个任务先观察指定失败，再实现最小正确行为并提交；已发布 Migration 不得改写。
 
@@ -35,6 +36,7 @@
 3. 每张可被租户内复合外键引用的表增加 `UNIQUE(tenant_id, id)`。
 4. Step-up Grant 是 Redis 中一次性、绑定 `session_id + tenant_id + action` 的 5 分钟记录，通过 `X-Step-Up-Grant` 传递并原子消费。
 5. 本增量使用最小 Permission Catalog：`tenant.read`、`tenant.update`、`department.read`、`department.manage`、`membership.read`、`membership.invite`、`membership.update`、`membership.revoke`、`role.read`、`role.assign`、`external_service.enable`、`tenant_application.read`、`tenant_application.review`、`platform_admin.bootstrap`。角色矩阵采用最小权限，需在公网生产开放前由产品和安全负责人复核。
+6. Blind Index 轮换发布顺序固定为 `expand -> legacy-compatible（active=legacy）-> 人工确认旧 Writer 清退 -> 显式 rotation-ready/drained -> 激活新 BI version并保留旧 Key -> 完成重索引 -> 后续前向 contract Migration`。应用以强类型 `BlindIndexRolloutPolicy` 在 `IdentityService` 构造期 Fail Closed；Staging/Production 的 phase 与 legacy version 不允许隐式默认。
 
 ## File Map
 
@@ -283,9 +285,15 @@ Commit: `git commit -m "feat: add identity authorization database baseline"`
 - Create: `backend/src/lawyer_agent/application/identity.py`
 - Create: `backend/tests/unit/test_identity_security.py`
 - Create: `backend/tests/integration/mysql/test_identity.py`
+- Modify: `backend/src/lawyer_agent/config.py`
+- Create: `backend/alembic/versions/20260901_02_blind_index_key_version.py`
+- Create: `backend/tests/integration/mysql/test_identity_locks.py`
+- Create: `backend/tests/integration/mysql/test_identity_migration.py`
+- Modify: `deploy/compose.env.example`
+- Modify: `docs/superpowers/specs/2026-09-01-multitenant-identity-authorization-design.md`
 
 **Interfaces:**
-- Produces: `normalize_identifier(kind, value) -> NormalizedIdentity`、`Argon2PasswordHasher`、`SensitiveValueCipher.encrypt/decrypt`、`BlindIndexService.digest`、`IdentityService.register`、`IdentityService.authenticate`。
+- Produces: `normalize_identifier(kind, value) -> NormalizedIdentity`、`Argon2PasswordHasher`、`SensitiveValueCipher.encrypt/decrypt`、`BlindIndexService.digest`、强类型 `BlindIndexRolloutPolicy`、`IdentityService.register`、`IdentityService.authenticate`。
 
 - [ ] **Step 1: 写规范化、密码和 AAD 反向测试**
 
@@ -316,6 +324,8 @@ Expected: 新模块不存在。
 
 AESGCM envelope 为 `key_version(2 bytes) + nonce(12 bytes) + ciphertext_and_tag`，每次随机 nonce；Blind Index 使用用途前缀、key version 与 `hmac.compare_digest`。
 
+Blind Index 的 cipher version 与 index version 分列保存。revision-02 只做 expand：列保持 nullable 且无固定 default；旧行以本行 `key_version` 回填，INSERT Trigger 为旧 Writer 补同一版本，UPDATE Trigger 要求 digest/version 成对变化。Staging/Production 必须显式配置 rollout phase 与 legacy version；Development/Test 安全默认 `legacy-compatible + v1`。
+
 - [ ] **Step 4: 实现注册/认证事务**
 
 ```python
@@ -342,11 +352,13 @@ class IdentityService:
 
 `register` 在一个 UoW 写 User、已验证 local username identity、Argon2 credential 和审计。数据库唯一冲突映射为不泄露具体标识的 `identity_conflict`。`authenticate` 在账号不存在时仍验证固定 dummy hash；任何不存在、密码错误、锁定或禁用均返回同一失败结果。
 
+注册和认证对 Key Ring 全部有效 BI version 查询；注册按稳定版本顺序获取 Advisory Lock。`IdentityService` 构造期先验证 `BlindIndexRolloutPolicy`：`legacy-compatible` 只能 active=legacy；`rotation-ready` 必须带人工清退确认并保留 legacy Key。真实 MySQL 测试必须覆盖旧 v7 Writer 与新 v7 Worker 并发只有一条身份、旧 Writer 存续时 v8 配置启动失败，以及明确 rotation-ready 后 v8 查询并重索引旧 v7 行。后续 contract 必须另建 Migration，且只能在旧 Writer 清退、NULL 清零、旧行重索引和回退验证均完成后执行。
+
 - [ ] **Step 5: 验证并提交**
 
-Run: `cd backend; uv run pytest tests/unit/test_identity_security.py tests/integration/mysql/test_identity.py -v; uv run ruff check .; uv run mypy src`
+Run: `cd backend; uv run pytest tests/unit/test_identity_security.py tests/unit/test_identity_application.py tests/unit/test_settings_security.py tests/integration/mysql/test_identity.py tests/integration/mysql/test_identity_locks.py tests/integration/mysql/test_identity_migration.py -v; uv run ruff check .; uv run mypy src`
 
-Expected: 全局身份唯一、密文和索引隔离测试通过。
+Expected: 全局身份唯一、密文和索引隔离、真实混合版本并发、显式 rollout 启动门禁与 expand/trigger 生命周期测试通过。
 
 Commit: `git commit -m "feat: add protected global identities"`
 

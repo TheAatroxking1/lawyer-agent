@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from time import time_ns
 from uuid import UUID
@@ -10,6 +12,7 @@ import pytest
 from alembic.config import Config
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -20,11 +23,17 @@ from sqlalchemy.ext.asyncio import (
 from alembic import command
 from lawyer_agent.application.identity import (
     AuditContext,
+    BlindIndexRolloutConfigurationError,
+    BlindIndexRolloutPhase,
+    BlindIndexRolloutPolicy,
     IdentityConflictError,
     IdentityService,
+    LoginIdentifier,
     RegisterCommand,
     RegisteredUser,
 )
+from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.identity import IdentityKind, normalize_username
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
     AuthIdentityModel,
@@ -43,6 +52,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.mysql]
 
 _PASSWORD = "correct horse battery staple"  # noqa: S105
 _AUDIT_CONTEXT = AuditContext("trace-locks", b"i" * 32, b"u" * 32)
+_CIPHER_KEY_V7 = b"c" * 32
+_BLIND_KEY_V7 = b"g" * 32
+_BLIND_KEY_V8 = b"h" * 32
 
 
 def _alembic_config(mysql_url: URL) -> Config:
@@ -202,7 +214,191 @@ def _service(
         password_hasher=Argon2PasswordHasher(),
         cipher=SensitiveValueCipher({1: b"f" * 32}, active_key_version=1),
         blind_index=BlindIndexService(blind_keys, active_key_version=2),
+        rollout_policy=BlindIndexRolloutPolicy(
+            BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+            2,
+            False,
+        ),
     )
+
+
+def _rollout_service(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    active_version: int,
+    phase: BlindIndexRolloutPhase,
+    drained: bool,
+) -> IdentityService:
+    return IdentityService(
+        uow_factory=lambda: SqlAlchemyIdentityUnitOfWork(session_factory),
+        password_hasher=Argon2PasswordHasher(),
+        cipher=SensitiveValueCipher({7: _CIPHER_KEY_V7}, active_key_version=7),
+        blind_index=BlindIndexService(
+            {7: _BLIND_KEY_V7, 8: _BLIND_KEY_V8},
+            active_key_version=active_version,
+        ),
+        rollout_policy=BlindIndexRolloutPolicy(phase, 7, drained),
+    )
+
+
+async def _legacy_v7_writer_register(
+    engine: AsyncEngine,
+    username: str,
+    *,
+    ready: asyncio.Event | None = None,
+    proceed: asyncio.Event | None = None,
+) -> UUID:
+    user_id = new_uuid7()
+    identity_id = new_uuid7()
+    normalized = normalize_username(username)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    cipher = SensitiveValueCipher({7: _CIPHER_KEY_V7}, active_key_version=7)
+    blind = BlindIndexService({7: _BLIND_KEY_V7}, active_key_version=7)
+    hasher = Argon2PasswordHasher()
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO users "
+                "(id, status, display_name, auth_version, version) "
+                "VALUES (:id, 'active', 'Legacy Writer', 1, 1)"
+            ),
+            {"id": user_id.bytes},
+        )
+        if ready is not None:
+            ready.set()
+        if proceed is not None:
+            await asyncio.wait_for(proceed.wait(), timeout=2)
+        await connection.execute(
+            text(
+                "INSERT INTO auth_identities "
+                "(id, user_id, kind, provider, issuer, display_value, "
+                "subject_ciphertext, subject_blind_index, key_version, "
+                "verified_at, status) "
+                "VALUES (:id, :user_id, 'username', 'local', 'local', "
+                ":display_value, :ciphertext, :blind_index, 7, "
+                ":verified_at, 'active')"
+            ),
+            {
+                "id": identity_id.bytes,
+                "user_id": user_id.bytes,
+                "display_value": normalized,
+                "ciphertext": cipher.encrypt(
+                    normalized,
+                    aad=f"auth_identity:{identity_id}:subject".encode("ascii"),
+                ),
+                "blind_index": blind.digest("identity:username", normalized),
+                "verified_at": now,
+            },
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO password_credentials "
+                "(user_id, password_hash, algorithm, parameters_json, "
+                "password_changed_at, status, version) "
+                "VALUES (:user_id, :password_hash, 'argon2id', :parameters, "
+                ":changed_at, 'active', 1)"
+            ),
+            {
+                "user_id": user_id.bytes,
+                "password_hash": hasher.hash(_PASSWORD),
+                "parameters": json.dumps(hasher.parameters),
+                "changed_at": now,
+            },
+        )
+    return user_id
+
+
+@pytest.mark.asyncio
+async def test_legacy_v7_writer_prevents_legacy_phase_v8_service_from_starting(
+    lock_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+) -> None:
+    engine, session_factory = lock_database
+    username = f"legacy-gate-{UUID(int=time_ns() % (1 << 128))}"
+    await _legacy_v7_writer_register(engine, username)
+
+    with pytest.raises(BlindIndexRolloutConfigurationError, match="legacy key version"):
+        _rollout_service(
+            session_factory,
+            active_version=8,
+            phase=BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+            drained=False,
+        )
+
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(UserModel)) == 1
+        assert await session.scalar(select(func.count()).select_from(AuthIdentityModel)) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_and_new_v7_writers_concurrently_leave_one_identity(
+    lock_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+) -> None:
+    engine, session_factory = lock_database
+    username = f"legacy-concurrent-{UUID(int=time_ns() % (1 << 128))}"
+    ready = asyncio.Event()
+    proceed = asyncio.Event()
+    legacy_task = asyncio.create_task(
+        _legacy_v7_writer_register(engine, username, ready=ready, proceed=proceed)
+    )
+    await asyncio.wait_for(ready.wait(), timeout=2)
+    new_task = asyncio.create_task(
+        _rollout_service(
+            session_factory,
+            active_version=7,
+            phase=BlindIndexRolloutPhase.LEGACY_COMPATIBLE,
+            drained=False,
+        ).register(
+            RegisterCommand(username.upper(), _PASSWORD, "New Writer"),
+            audit_context=_AUDIT_CONTEXT,
+        )
+    )
+    proceed.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(legacy_task, new_task, return_exceptions=True),
+        timeout=3,
+    )
+
+    assert sum(isinstance(result, (UUID, RegisteredUser)) for result in results) == 1
+    assert sum(
+        isinstance(result, (IntegrityError, IdentityConflictError))
+        for result in results
+    ) == 1
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(UserModel)) == 1
+        assert await session.scalar(select(func.count()).select_from(AuthIdentityModel)) == 1
+
+
+@pytest.mark.asyncio
+async def test_rotation_ready_v8_service_authenticates_and_reindexes_legacy_v7(
+    lock_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+) -> None:
+    engine, session_factory = lock_database
+    username = f"rotation-ready-{UUID(int=time_ns() % (1 << 128))}"
+    legacy_user_id = await _legacy_v7_writer_register(engine, username)
+    service = _rollout_service(
+        session_factory,
+        active_version=8,
+        phase=BlindIndexRolloutPhase.ROTATION_READY,
+        drained=True,
+    )
+
+    authenticated = await service.authenticate(
+        LoginIdentifier(IdentityKind.USERNAME, username),
+        _PASSWORD,
+        audit_context=_AUDIT_CONTEXT,
+    )
+    with pytest.raises(IdentityConflictError):
+        await service.register(
+            RegisterCommand(username.upper(), _PASSWORD, "Duplicate"),
+            audit_context=_AUDIT_CONTEXT,
+        )
+
+    async with session_factory() as session:
+        identity = await session.scalar(
+            select(AuthIdentityModel).where(AuthIdentityModel.user_id == legacy_user_id)
+        )
+    assert authenticated is not None and authenticated.user_id == legacy_user_id
+    assert identity is not None and identity.blind_index_key_version == 8
 
 
 @pytest.mark.asyncio

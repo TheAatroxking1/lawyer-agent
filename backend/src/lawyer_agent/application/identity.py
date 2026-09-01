@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
@@ -34,6 +35,15 @@ class BlindIndexKeyUnavailableError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("required blind-index key version is unavailable")
+
+
+class BlindIndexRolloutConfigurationError(ValueError):
+    pass
+
+
+class BlindIndexRolloutPhase(StrEnum):
+    LEGACY_COMPATIBLE = "legacy-compatible"
+    ROTATION_READY = "rotation-ready"
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +180,50 @@ class BlindIndexPort(Protocol):
     def digests(self, purpose: str, value: str) -> tuple[VersionedBlindIndex, ...]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class BlindIndexRolloutPolicy:
+    phase: BlindIndexRolloutPhase
+    legacy_key_version: int
+    legacy_writers_drained: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase, BlindIndexRolloutPhase) or not isinstance(
+            self.legacy_writers_drained, bool
+        ):
+            raise BlindIndexRolloutConfigurationError(
+                "rollout phase and drained acknowledgement must be strongly typed"
+            )
+        if (
+            isinstance(self.legacy_key_version, bool)
+            or not isinstance(self.legacy_key_version, int)
+            or not 1 <= self.legacy_key_version <= 32767
+        ):
+            raise BlindIndexRolloutConfigurationError(
+                "legacy key version must be an integer from 1 to 32767"
+            )
+        if (
+            self.phase is BlindIndexRolloutPhase.ROTATION_READY
+            and not self.legacy_writers_drained
+        ):
+            raise BlindIndexRolloutConfigurationError(
+                "rotation-ready requires an explicit legacy-writers-drained acknowledgement"
+            )
+
+    def validate(self, blind_index: BlindIndexPort) -> None:
+        if self.legacy_key_version not in blind_index.key_versions:
+            raise BlindIndexRolloutConfigurationError(
+                "legacy key version must remain available in the blind-index key ring"
+            )
+        if (
+            self.phase is BlindIndexRolloutPhase.LEGACY_COMPATIBLE
+            and blind_index.active_key_version != self.legacy_key_version
+        ):
+            raise BlindIndexRolloutConfigurationError(
+                "legacy-compatible rollout requires the active blind-index version "
+                "to equal the legacy key version"
+            )
+
+
 class IdentityRepositoryPort(Protocol):
     async def has_unsupported_blind_index_versions(self, supported: tuple[int, ...]) -> bool: ...
 
@@ -236,11 +290,14 @@ class IdentityService:
         password_hasher: PasswordHasherPort,
         cipher: SensitiveValueCipherPort,
         blind_index: BlindIndexPort,
+        rollout_policy: BlindIndexRolloutPolicy,
     ) -> None:
+        rollout_policy.validate(blind_index)
         self._uow_factory = uow_factory
         self._password_hasher = password_hasher
         self._cipher = cipher
         self._blind_index = blind_index
+        self._rollout_policy = rollout_policy
 
     async def register(
         self,
