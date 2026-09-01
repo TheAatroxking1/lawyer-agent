@@ -553,6 +553,9 @@ class MembershipRepository:
 
 所有 tenant 表读写都重复 tenant predicate；跨租户猜测返回无结果。Department parent、Membership department、Role assignment、Invitation role 均由包含 tenant 的复合 FK 阻断。
 
+租户显示名称允许同名，`normalized_name` 只用于检索/展示规范化；重命名同步更新两列，
+且不得把无关 `IntegrityError` 伪装为名称冲突。
+
 - [ ] **Step 5: 验证并提交**
 
 Run: `cd backend; uv run pytest tests/unit/test_policy.py tests/integration/mysql/test_tenant_constraints.py -v`

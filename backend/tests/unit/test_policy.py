@@ -48,10 +48,15 @@ def test_tenant_name_normalization_is_nfkc_trimmed_casefolded_and_bounded() -> N
     normalized = normalize_tenant_name("  ＬＡＷ　ＦＩＲＭ  ")
     assert normalized.display_value == "LAW FIRM"
     assert normalized.normalized_value == "law firm"
+    expanding = normalize_tenant_name("ß" * 127)
+    assert len(expanding.display_value) == 127
+    assert len(expanding.normalized_value) == 254
     with pytest.raises(ValueError, match="tenant name"):
         normalize_tenant_name("　 ")
     with pytest.raises(ValueError, match="tenant name"):
         normalize_tenant_name("甲" * 256)
+    with pytest.raises(ValueError, match="tenant name"):
+        normalize_tenant_name("ß" * 128)
 
 
 def _principal(

@@ -18,7 +18,6 @@ from lawyer_agent.infrastructure.persistence.repositories.authorization import (
 from lawyer_agent.infrastructure.persistence.repositories.tenancy import (
     DepartmentRepository,
     MembershipRepository,
-    TenantNameConflictError,
     TenantRepository,
 )
 
@@ -162,22 +161,32 @@ async def test_repository_rejects_every_invalid_context_id_before_sql(
 
 
 @pytest.mark.asyncio
-async def test_tenant_name_unique_conflict_is_stable_and_hides_database_details() -> None:
+async def test_expanding_tenant_name_is_rejected_before_sql() -> None:
+    session = NoSqlSession()
+    repository = TenantRepository(cast(AsyncSession, session))
+
+    with pytest.raises(ValueError, match="tenant name"):
+        await repository.update_name(_context(), TENANT_ID, "ß" * 128, 1)
+    assert session.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unrelated_integrity_error_is_not_disguised_as_tenant_name_conflict() -> None:
+    database_error = IntegrityError(
+        "UPDATE tenants",
+        {},
+        RuntimeError("synthetic unrelated integrity failure"),
+    )
+
     class ConflictingSession(NoSqlSession):
         async def execute(self, *_args: object, **_kwargs: object) -> None:
             self.calls += 1
-            raise IntegrityError(
-                "UPDATE tenants",
-                {},
-                RuntimeError("Duplicate entry 'secret-tenant' for key normalized_name"),
-            )
+            raise database_error
 
     session = ConflictingSession()
     repository = TenantRepository(cast(AsyncSession, session))
-    with pytest.raises(TenantNameConflictError) as caught:
+    with pytest.raises(IntegrityError) as caught:
         await repository.update_name(_context(), TENANT_ID, "新租户名称", 1)
 
-    assert str(caught.value) == "tenant name conflicts with an existing tenant"
-    assert caught.value.__cause__ is None
-    assert "secret-tenant" not in str(caught.value)
+    assert caught.value is database_error
     assert session.calls == 1

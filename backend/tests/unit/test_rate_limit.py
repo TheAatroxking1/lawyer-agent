@@ -683,9 +683,21 @@ async def test_authorization_cache_uses_exact_versioned_key_and_typed_value() ->
             "maximum_confidentiality": "confidential",
             "unrecognized_scope_codes": [],
         },
-        "v": 1,
+        "v": 2,
     }
     assert set(payload) == {"v", "authz_version", "permissions", "scope"}
+
+    legacy_payload = dict(payload)
+    legacy_payload["v"] = 1
+    redis.get_values[key] = json.dumps(legacy_payload).encode()
+    assert (
+        await cache.get(
+            tenant_id=TENANT_ID,
+            membership_id=MEMBERSHIP_ID,
+            authz_version=7,
+        )
+        is None
+    )
 
     redis.get_values[key] = encoded
     assert (

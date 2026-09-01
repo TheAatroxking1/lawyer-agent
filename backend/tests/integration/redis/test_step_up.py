@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -229,6 +230,59 @@ async def test_authorization_cache_round_trip_version_miss_and_exact_invalidatio
     )
 
     assert [key async for key in raw.scan_iter(match=f"{prefix}*", count=100)] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_rolling_node_v1_or_unknown_scope_payload_is_only_a_safe_cache_miss(
+    redis_scope,
+) -> None:
+    redis, raw, prefix = redis_scope
+    cache = AuthorizationCache(redis=redis, ttl_seconds=60)
+    entry = AuthorizationCacheEntry(
+        permissions=frozenset({Action.TENANT_READ.value}),
+        scope=AuthorizationScope(allow_tenant_wide=True),
+    )
+    await cache.set(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=7,
+        entry=entry,
+    )
+    keys = [key async for key in raw.scan_iter(match=f"{prefix}*", count=100)]
+    assert len(keys) == 1
+    encoded = await raw.get(keys[0])
+    assert encoded is not None
+    payload = json.loads(encoded)
+    assert payload["v"] == 2
+
+    for incompatible_version in (1, 99):
+        incompatible = dict(payload)
+        incompatible["v"] = incompatible_version
+        await raw.set(keys[0], json.dumps(incompatible).encode(), ex=60)
+        assert (
+            await cache.get(
+                tenant_id=TENANT_ID,
+                membership_id=MEMBERSHIP_ID,
+                authz_version=7,
+            )
+            is None
+        )
+
+    await cache.set(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=7,
+        entry=entry,
+    )
+    assert (
+        await cache.get(
+            tenant_id=TENANT_ID,
+            membership_id=MEMBERSHIP_ID,
+            authz_version=7,
+        )
+        == entry
+    )
 
 
 @pytest.mark.integration

@@ -6,7 +6,6 @@ from uuid import UUID
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.authorization import AuthorizationScope
@@ -58,22 +57,19 @@ class TenantRepository:
         require_uuid7(tenant_id, field="tenant_id")
         normalized_name = normalize_tenant_name(name)
         _require_version(expected_version)
-        try:
-            result = cast(CursorResult[Any], await self._session.execute(
-                update(TenantModel)
-                .where(
-                    TenantModel.id == context.tenant_id,
-                    TenantModel.id == tenant_id,
-                    TenantModel.version == expected_version,
-                )
-                .values(
-                    name=normalized_name.display_value,
-                    normalized_name=normalized_name.normalized_value,
-                    version=TenantModel.version + 1,
-                )
-            ))
-        except IntegrityError:
-            raise TenantNameConflictError("tenant name conflicts with an existing tenant") from None
+        result = cast(CursorResult[Any], await self._session.execute(
+            update(TenantModel)
+            .where(
+                TenantModel.id == context.tenant_id,
+                TenantModel.id == tenant_id,
+                TenantModel.version == expected_version,
+            )
+            .values(
+                name=normalized_name.display_value,
+                normalized_name=normalized_name.normalized_value,
+                version=TenantModel.version + 1,
+            )
+        ))
         return result.rowcount == 1
 
     async def delete(
@@ -274,10 +270,6 @@ class MembershipRepository:
             MembershipStatus.REVOKED,
             expected_version,
         )
-
-
-class TenantNameConflictError(ValueError):
-    """Stable, non-sensitive tenant-name conflict at the repository boundary."""
 
 
 def _tenant(model: TenantModel) -> Tenant:

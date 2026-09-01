@@ -8,7 +8,7 @@ from uuid import UUID
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -375,6 +375,26 @@ async def test_tenant_rename_atomically_updates_display_normalized_name_and_vers
 
 
 @pytest.mark.asyncio
+async def test_two_tenants_may_rename_to_the_same_normalized_display_name(
+    database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
+) -> None:
+    async with database.begin() as session:
+        repository = TenantRepository(session)
+        assert await repository.update_name(
+            _context(graph, "a"), graph["tenant_a"], "  同名租户  ", 1
+        )
+        assert await repository.update_name(
+            _context(graph, "b"), graph["tenant_b"], "同名租户", 1
+        )
+
+        tenant_a = await repository.get(_context(graph, "a"), graph["tenant_a"])
+        tenant_b = await repository.get(_context(graph, "b"), graph["tenant_b"])
+        assert tenant_a is not None and tenant_b is not None
+        assert tenant_a.normalized_name == tenant_b.normalized_name == "同名租户"
+        assert tenant_a.name == tenant_b.name == "同名租户"
+
+
+@pytest.mark.asyncio
 async def test_repository_rejects_cross_tenant_dto_before_database_write(
     database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
 ) -> None:
@@ -529,6 +549,21 @@ async def test_role_assignment_waits_for_concurrent_membership_revocation_and_re
 ) -> None:
     target_id = await _insert_assignment_target(database, graph)
     barrier = asyncio.Barrier(2)
+    lock_sql_issued = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    sync_engine = database.kw["bind"].sync_engine
+
+    def observe_lock_sql(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.casefold()
+        if "tenant_memberships" in normalized and "for update" in normalized:
+            loop.call_soon_threadsafe(lock_sql_issued.set)
 
     async def attempt_assignment() -> str:
         await barrier.wait()
@@ -545,22 +580,27 @@ async def test_role_assignment_waits_for_concurrent_membership_revocation_and_re
                 return str(exc)
         return "inserted"
 
-    async with database.begin() as revoker:
-        target = await revoker.scalar(
-            select(TenantMembershipModel)
-            .where(
-                TenantMembershipModel.tenant_id == graph["tenant_a"],
-                TenantMembershipModel.id == target_id,
+    event.listen(sync_engine, "before_cursor_execute", observe_lock_sql)
+    try:
+        async with database.begin() as revoker:
+            target = await revoker.scalar(
+                select(TenantMembershipModel)
+                .where(
+                    TenantMembershipModel.tenant_id == graph["tenant_a"],
+                    TenantMembershipModel.id == target_id,
+                )
+                .with_for_update()
             )
-            .with_for_update()
-        )
-        assert target is not None
-        target.status = "revoked"
-        await revoker.flush()
-        attempt = asyncio.create_task(attempt_assignment())
-        await barrier.wait()
-        await asyncio.sleep(0.05)
-        assert not attempt.done()
+            assert target is not None
+            target.status = "revoked"
+            await revoker.flush()
+            lock_sql_issued.clear()
+            attempt = asyncio.create_task(attempt_assignment())
+            await barrier.wait()
+            await asyncio.wait_for(lock_sql_issued.wait(), timeout=2)
+            assert not attempt.done()
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", observe_lock_sql)
 
     assert await asyncio.wait_for(attempt, timeout=3) == (
         "membership unavailable for role assignment"
@@ -577,6 +617,21 @@ async def test_role_assignment_waits_for_concurrent_role_disable_and_rejects(
 ) -> None:
     target_id = await _insert_assignment_target(database, graph)
     barrier = asyncio.Barrier(2)
+    lock_sql_issued = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    sync_engine = database.kw["bind"].sync_engine
+
+    def observe_lock_sql(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.casefold()
+        if "tenant_roles" in normalized and "for update" in normalized:
+            loop.call_soon_threadsafe(lock_sql_issued.set)
 
     async def attempt_assignment() -> str:
         await barrier.wait()
@@ -593,22 +648,27 @@ async def test_role_assignment_waits_for_concurrent_role_disable_and_rejects(
                 return str(exc)
         return "inserted"
 
-    async with database.begin() as disabler:
-        role = await disabler.scalar(
-            select(TenantRoleModel)
-            .where(
-                TenantRoleModel.tenant_id == graph["tenant_a"],
-                TenantRoleModel.id == graph["role_a"],
+    event.listen(sync_engine, "before_cursor_execute", observe_lock_sql)
+    try:
+        async with database.begin() as disabler:
+            role = await disabler.scalar(
+                select(TenantRoleModel)
+                .where(
+                    TenantRoleModel.tenant_id == graph["tenant_a"],
+                    TenantRoleModel.id == graph["role_a"],
+                )
+                .with_for_update()
             )
-            .with_for_update()
-        )
-        assert role is not None
-        role.status = "disabled"
-        await disabler.flush()
-        attempt = asyncio.create_task(attempt_assignment())
-        await barrier.wait()
-        await asyncio.sleep(0.05)
-        assert not attempt.done()
+            assert role is not None
+            role.status = "disabled"
+            await disabler.flush()
+            lock_sql_issued.clear()
+            attempt = asyncio.create_task(attempt_assignment())
+            await barrier.wait()
+            await asyncio.wait_for(lock_sql_issued.wait(), timeout=2)
+            assert not attempt.done()
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", observe_lock_sql)
 
     assert await asyncio.wait_for(attempt, timeout=3) == (
         "role unavailable for role assignment"

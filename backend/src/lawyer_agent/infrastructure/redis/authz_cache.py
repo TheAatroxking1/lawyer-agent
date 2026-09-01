@@ -15,6 +15,7 @@ from lawyer_agent.infrastructure.redis.client import (
 
 _PERMISSION_PATTERN = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z", re.ASCII)
 _MAX_TTL_SECONDS = 300
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +95,7 @@ class AuthorizationCache:
         if not isinstance(entry, AuthorizationCacheEntry):
             raise ValueError("authorization cache entry must be strongly typed")
         payload = {
-            "v": 1,
+            "v": _SCHEMA_VERSION,
             "authz_version": authz_version,
             "permissions": sorted(entry.permissions),
             "scope": {
@@ -158,7 +159,7 @@ def _decode(
             return None
         if (
             type(payload["v"]) is not int
-            or payload["v"] != 1
+            or payload["v"] != _SCHEMA_VERSION
             or type(payload["authz_version"]) is not int
             or payload["authz_version"] != expected_authz_version
         ):

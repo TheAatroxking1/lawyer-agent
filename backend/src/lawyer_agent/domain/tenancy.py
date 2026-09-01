@@ -51,9 +51,12 @@ def normalize_tenant_name(value: object) -> NormalizedTenantName:
     display_value = unicodedata.normalize("NFKC", value).strip()
     if not display_value or len(display_value) > 255:
         raise ValueError("tenant name is invalid")
+    normalized_value = display_value.casefold()
+    if len(normalized_value) > 255:
+        raise ValueError("tenant name is invalid")
     return NormalizedTenantName(
         display_value=display_value,
-        normalized_value=display_value.casefold(),
+        normalized_value=normalized_value,
     )
 
 
