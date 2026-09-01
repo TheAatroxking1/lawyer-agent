@@ -282,8 +282,6 @@ class TokenServicePort(Protocol):
 
     def issue_platform(self, claims: AccessTokenClaims) -> str: ...
 
-    def issue_step_up(self, claims: AccessTokenClaims) -> str: ...
-
     def verify(
         self,
         encoded: str,

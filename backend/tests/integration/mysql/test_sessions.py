@@ -389,10 +389,6 @@ class _FailingTokenService:
         del claims
         raise RuntimeError("synthetic signer outage")
 
-    def issue_step_up(self, claims: object) -> str:
-        del claims
-        raise RuntimeError("synthetic signer outage")
-
     def verify(self, encoded: str, *, audience: object, now: object = None) -> object:
         del encoded, audience, now
         raise AssertionError("verify is not expected")
@@ -627,9 +623,6 @@ class _FailOnSecondAccountIssueTokenService:
 
     def issue_platform(self, claims: AccessTokenClaims) -> str:
         return self._delegate.issue_platform(claims)
-
-    def issue_step_up(self, claims: AccessTokenClaims) -> str:
-        return self._delegate.issue_step_up(claims)
 
     def verify(
         self,

@@ -64,11 +64,6 @@ class TokenService:
             raise ValueError("platform token requires platform claims")
         return self._issue(claims)
 
-    def issue_step_up(self, claims: AccessTokenClaims) -> str:
-        if claims.audience is not Audience.STEP_UP:
-            raise ValueError("step-up token requires step-up claims")
-        return self._issue(claims)
-
     def verify(
         self,
         encoded: str,
@@ -76,7 +71,12 @@ class TokenService:
         audience: Audience,
         now: datetime | None = None,
     ) -> AccessTokenClaims:
-        if not isinstance(audience, Audience) or not encoded or len(encoded) > 8192:
+        if (
+            not isinstance(audience, Audience)
+            or audience is Audience.STEP_UP
+            or not encoded
+            or len(encoded) > 8192
+        ):
             raise InvalidToken
         current = datetime.now(UTC) if now is None else now
         if current.tzinfo is None or current.utcoffset() != UTC.utcoffset(current):

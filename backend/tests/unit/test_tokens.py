@@ -86,11 +86,6 @@ def platform_claims(**changes: object) -> AccessTokenClaims:
     return account_claims(audience=Audience.PLATFORM, **changes)
 
 
-def step_up_claims(**changes: object) -> AccessTokenClaims:
-    changes.setdefault("expires_at", NOW + timedelta(minutes=5))
-    return account_claims(audience=Audience.STEP_UP, **changes)
-
-
 def token_payload(claims: AccessTokenClaims) -> dict[str, object]:
     payload: dict[str, object] = {
         "sub": str(claims.user_id),
@@ -139,18 +134,16 @@ def test_account_and_tenant_token_schemas_are_isolated(tokens: TokenService) -> 
         tokens.verify(tenant, audience=Audience.ACCOUNT, now=NOW)
 
 
-def test_all_audience_schemas_are_pairwise_isolated(tokens: TokenService) -> None:
+def test_access_token_audience_schemas_are_pairwise_isolated(tokens: TokenService) -> None:
     claims_by_audience = {
         Audience.ACCOUNT: account_claims(),
         Audience.TENANT: tenant_claims(),
         Audience.PLATFORM: platform_claims(),
-        Audience.STEP_UP: step_up_claims(),
     }
     encoded_by_audience = {
         Audience.ACCOUNT: tokens.issue_account(claims_by_audience[Audience.ACCOUNT]),
         Audience.TENANT: tokens.issue_tenant(claims_by_audience[Audience.TENANT]),
         Audience.PLATFORM: tokens.issue_platform(claims_by_audience[Audience.PLATFORM]),
-        Audience.STEP_UP: tokens.issue_step_up(claims_by_audience[Audience.STEP_UP]),
     }
 
     for issued_audience, encoded in encoded_by_audience.items():
@@ -163,6 +156,33 @@ def test_all_audience_schemas_are_pairwise_isolated(tokens: TokenService) -> Non
                 continue
             with pytest.raises(InvalidToken):
                 tokens.verify(encoded, audience=requested_audience, now=NOW)
+
+
+def test_step_up_is_reserved_without_an_access_token_signing_path(
+    tokens: TokenService,
+) -> None:
+    assert not hasattr(tokens, "issue_step_up")
+
+
+def test_access_token_claims_reject_reserved_step_up_audience() -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        account_claims(
+            audience=Audience.STEP_UP,
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
+
+def test_access_token_verifier_rejects_reserved_step_up_even_when_audience_matches(
+    tokens: TokenService,
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    payload = token_payload(account_claims(expires_at=NOW + timedelta(minutes=5)))
+    payload["aud"] = Audience.STEP_UP.value
+    encoded = sign_payload(payload, signing_key)
+
+    for audience in Audience:
+        with pytest.raises(InvalidToken):
+            tokens.verify(encoded, audience=audience, now=NOW)
 
 
 def test_token_verification_rejects_alg_confusion_and_unknown_kid(
@@ -304,7 +324,6 @@ def test_tenant_token_identifiers_must_be_uuidv7(
         (account_claims, timedelta(minutes=10)),
         (tenant_claims, timedelta(minutes=10)),
         (platform_claims, timedelta(minutes=5)),
-        (step_up_claims, timedelta(minutes=5)),
     ],
 )
 def test_token_lifetime_accepts_exact_audience_maximum(
@@ -322,7 +341,6 @@ def test_token_lifetime_accepts_exact_audience_maximum(
         (account_claims, timedelta(minutes=10)),
         (tenant_claims, timedelta(minutes=10)),
         (platform_claims, timedelta(minutes=5)),
-        (step_up_claims, timedelta(minutes=5)),
     ],
 )
 def test_token_lifetime_rejects_value_above_audience_maximum(

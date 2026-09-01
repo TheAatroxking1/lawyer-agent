@@ -55,6 +55,8 @@ class AccessTokenClaims:
             raise ValueError("token identifiers must be RFC 9562 UUIDv7 values")
         if not isinstance(self.audience, Audience):
             raise ValueError("audience must be strongly typed")
+        if self.audience is Audience.STEP_UP:
+            raise ValueError("step-up audience is reserved for a single-use grant")
         for value in (self.issued_at, self.not_before, self.expires_at):
             if (
                 not isinstance(value, datetime)
@@ -66,7 +68,7 @@ class AccessTokenClaims:
             raise ValueError("token time window is invalid")
         maximum_lifetime = (
             timedelta(minutes=5)
-            if self.audience in {Audience.PLATFORM, Audience.STEP_UP}
+            if self.audience is Audience.PLATFORM
             else timedelta(minutes=10)
         )
         if self.expires_at - self.issued_at > maximum_lifetime:
