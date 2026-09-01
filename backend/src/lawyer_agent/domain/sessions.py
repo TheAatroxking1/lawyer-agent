@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from uuid import UUID
+
+
+class Audience(StrEnum):
+    ACCOUNT = "lawyer-account"
+    TENANT = "lawyer-tenant"
+    PLATFORM = "lawyer-platform"
+    STEP_UP = "lawyer-step-up"
+
+
+class InvalidToken(Exception):
+    code = "authentication_failed"
+
+    def __init__(self) -> None:
+        super().__init__("invalid access token")
+
+
+@dataclass(frozen=True, slots=True)
+class AccessTokenClaims:
+    user_id: UUID
+    session_id: UUID
+    token_id: UUID
+    audience: Audience
+    issued_at: datetime
+    not_before: datetime
+    expires_at: datetime
+    auth_version: int
+    tenant_id: UUID | None = None
+    membership_id: UUID | None = None
+    authz_version: int | None = None
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, UUID)
+            for value in (self.user_id, self.session_id, self.token_id)
+        ):
+            raise ValueError("token identifiers must be UUID values")
+        if not isinstance(self.audience, Audience):
+            raise ValueError("audience must be strongly typed")
+        for value in (self.issued_at, self.not_before, self.expires_at):
+            if (
+                not isinstance(value, datetime)
+                or value.tzinfo is None
+                or value.utcoffset() != UTC.utcoffset(value)
+            ):
+                raise ValueError("token timestamps must be UTC-aware")
+        if self.not_before < self.issued_at or self.expires_at <= self.not_before:
+            raise ValueError("token time window is invalid")
+        if (
+            isinstance(self.auth_version, bool)
+            or not isinstance(self.auth_version, int)
+            or self.auth_version < 1
+        ):
+            raise ValueError("auth_version must be a positive integer")
+
+        tenant_values = (self.tenant_id, self.membership_id, self.authz_version)
+        if self.audience is Audience.TENANT:
+            if any(value is None for value in tenant_values):
+                raise ValueError("tenant token requires complete tenant context")
+            if not isinstance(self.tenant_id, UUID) or not isinstance(
+                self.membership_id, UUID
+            ):
+                raise ValueError("tenant context identifiers must be UUID values")
+            if (
+                isinstance(self.authz_version, bool)
+                or not isinstance(self.authz_version, int)
+                or self.authz_version < 1
+            ):
+                raise ValueError("tenant authz_version must be a positive integer")
+        elif any(value is not None for value in tenant_values):
+            raise ValueError("non-tenant token cannot contain tenant context")
