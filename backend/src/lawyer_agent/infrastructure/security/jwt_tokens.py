@@ -64,6 +64,11 @@ class TokenService:
             raise ValueError("platform token requires platform claims")
         return self._issue(claims)
 
+    def issue_step_up(self, claims: AccessTokenClaims) -> str:
+        if claims.audience is not Audience.STEP_UP:
+            raise ValueError("step-up token requires step-up claims")
+        return self._issue(claims)
+
     def verify(
         self,
         encoded: str,

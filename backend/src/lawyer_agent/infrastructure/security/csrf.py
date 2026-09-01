@@ -8,6 +8,8 @@ from hashlib import sha256
 from typing import TypedDict
 from uuid import UUID
 
+from lawyer_agent.domain.origins import HttpOrigin
+
 REFRESH_COOKIE_NAME = "__Host-lawyer_refresh"
 CSRF_COOKIE_NAME = "__Host-lawyer_csrf"
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{22,128}\.[A-Za-z0-9_-]{43}", re.ASCII)
@@ -45,13 +47,21 @@ def cookie_options(
 
 
 class CsrfService:
-    def __init__(self, *, key: bytes, trusted_origins: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        *,
+        key: bytes,
+        trusted_origins: tuple[str | HttpOrigin, ...],
+    ) -> None:
         if len(key) != 32:
             raise ValueError("CSRF key must contain exactly 32 bytes")
-        if not trusted_origins or any(not origin for origin in trusted_origins):
+        if not trusted_origins:
             raise ValueError("trusted origins must not be empty")
         self._key = key
-        self._trusted_origins = frozenset(trusted_origins)
+        self._trusted_origins = frozenset(
+            origin if isinstance(origin, HttpOrigin) else HttpOrigin.parse(origin)
+            for origin in trusted_origins
+        )
 
     def issue(self, session_id: UUID, *, nonce: bytes | None = None) -> str:
         nonce_value = secrets.token_bytes(32) if nonce is None else nonce
@@ -69,7 +79,11 @@ class CsrfService:
         cookie_token: str | None,
         session_id: UUID,
     ) -> None:
-        if origin is None or origin not in self._trusted_origins:
+        try:
+            request_origin = None if origin is None else HttpOrigin.parse(origin)
+        except ValueError:
+            raise UntrustedOrigin from None
+        if request_origin is None or request_origin not in self._trusted_origins:
             raise UntrustedOrigin
         header = "" if header_token is None else header_token
         cookie = "" if cookie_token is None else cookie_token

@@ -4,7 +4,7 @@ import hmac
 import re
 import secrets
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from types import TracebackType
@@ -13,7 +13,12 @@ from uuid import UUID
 
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.sessions import AccessTokenClaims, Audience, InvalidToken
+from lawyer_agent.domain.sessions import (
+    AccessTokenClaims,
+    Audience,
+    InvalidToken,
+    RevocationReason,
+)
 
 _ACCESS_TTL = timedelta(minutes=10)
 _REFRESH_ABSOLUTE_TTL = timedelta(days=30)
@@ -40,6 +45,13 @@ class RefreshReplayDetected(InvalidRefreshToken):
 
     def __init__(self) -> None:
         super().__init__()
+
+
+class InvalidRevocationReason(ValueError):
+    code = "invalid_revocation_reason"
+
+    def __init__(self) -> None:
+        super().__init__("revocation reason must be a supported reason code")
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +97,7 @@ class SessionValidationState:
 @dataclass(frozen=True, slots=True)
 class LockedRefreshToken:
     id: UUID
-    token_hash: bytes
+    token_hash: bytes = field(repr=False)
     family_id: UUID
     session_id: UUID
     user_id: UUID
@@ -113,7 +125,7 @@ class NewSession:
 @dataclass(frozen=True, slots=True)
 class NewRefreshToken:
     id: UUID
-    token_hash: bytes
+    token_hash: bytes = field(repr=False)
     family_id: UUID
     session_id: UUID
     user_id: UUID
@@ -145,16 +157,16 @@ class SessionAuditEvent:
 class SessionResult:
     session_id: UUID
     family_id: UUID
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class RefreshResult:
     session_id: UUID
     family_id: UUID
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,9 +224,21 @@ class SessionRepositoryPort(Protocol):
 
     async def touch_session(self, session_id: UUID, now: datetime) -> None: ...
 
-    async def revoke_family(self, family_id: UUID, *, reason: str, now: datetime) -> None: ...
+    async def revoke_family(
+        self,
+        family_id: UUID,
+        *,
+        reason: RevocationReason,
+        now: datetime,
+    ) -> None: ...
 
-    async def revoke_session(self, session_id: UUID, *, reason: str, now: datetime) -> None: ...
+    async def revoke_session(
+        self,
+        session_id: UUID,
+        *,
+        reason: RevocationReason,
+        now: datetime,
+    ) -> None: ...
 
     async def flush(self) -> None: ...
 
@@ -255,6 +279,10 @@ class TokenServicePort(Protocol):
     def issue_account(self, claims: AccessTokenClaims) -> str: ...
 
     def issue_tenant(self, claims: AccessTokenClaims) -> str: ...
+
+    def issue_platform(self, claims: AccessTokenClaims) -> str: ...
+
+    def issue_step_up(self, claims: AccessTokenClaims) -> str: ...
 
     def verify(
         self,
@@ -366,12 +394,12 @@ class SessionService:
             elif not _refresh_is_current(current, now):
                 await uow.sessions.revoke_family(
                     current.family_id,
-                    reason="refresh_invalid",
+                    reason=RevocationReason.REFRESH_INVALID,
                     now=now,
                 )
                 await uow.sessions.revoke_session(
                     current.session_id,
-                    reason="refresh_invalid",
+                    reason=RevocationReason.REFRESH_INVALID,
                     now=now,
                 )
                 await uow.audit.append(
@@ -398,12 +426,12 @@ class SessionService:
                 ):
                     await uow.sessions.revoke_family(
                         current.family_id,
-                        reason="authoritative_state_changed",
+                        reason=RevocationReason.AUTHORITATIVE_STATE_CHANGED,
                         now=now,
                     )
                     await uow.sessions.revoke_session(
                         current.session_id,
-                        reason="authoritative_state_changed",
+                        reason=RevocationReason.AUTHORITATIVE_STATE_CHANGED,
                         now=now,
                     )
                     await uow.audit.append(
@@ -510,9 +538,11 @@ class SessionService:
         self,
         session_id: UUID,
         *,
-        reason: str,
+        reason: RevocationReason,
         audit_context: AuditContext,
     ) -> None:
+        if not isinstance(reason, RevocationReason):
+            raise InvalidRevocationReason
         now = self._now()
         async with self._uow_factory() as uow:
             state = await uow.sessions.lock_session(session_id)
@@ -528,7 +558,7 @@ class SessionService:
                     membership_id=state.session_membership_id,
                     action="session.revoke",
                     result="success",
-                    reason=reason,
+                    reason=reason.value,
                     session_id=session_id,
                     now=now,
                 )
@@ -556,12 +586,12 @@ class SessionService:
                 raise InvalidSession
             await uow.sessions.revoke_family(
                 current.current_family_id,
-                reason="tenant_switched",
+                reason=RevocationReason.TENANT_SWITCHED,
                 now=now,
             )
             await uow.sessions.revoke_session(
                 current.session_id,
-                reason="tenant_switched",
+                reason=RevocationReason.TENANT_SWITCHED,
                 now=now,
             )
             user = UserSessionState(current.user_id, current.user_status, current.user_auth_version)
@@ -600,12 +630,12 @@ class SessionService:
     ) -> None:
         await uow.sessions.revoke_family(
             current.family_id,
-            reason="refresh_replay",
+            reason=RevocationReason.REFRESH_REPLAY,
             now=now,
         )
         await uow.sessions.revoke_session(
             current.session_id,
-            reason="refresh_replay",
+            reason=RevocationReason.REFRESH_REPLAY,
             now=now,
         )
         await uow.audit.append(
@@ -757,7 +787,7 @@ class SessionService:
 class _SessionMaterial:
     session: NewSession
     refresh_record: NewRefreshToken
-    raw_refresh: str
+    raw_refresh: str = field(repr=False)
 
 
 def _new_raw_refresh_token() -> str:

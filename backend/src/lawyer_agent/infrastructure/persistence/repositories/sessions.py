@@ -17,6 +17,7 @@ from lawyer_agent.application.sessions import (
     TenantSessionState,
     UserSessionState,
 )
+from lawyer_agent.domain.sessions import RevocationReason
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
     AuthSessionModel,
@@ -199,7 +200,13 @@ class SessionRepository:
         auth_session.version += 1
         auth_session.updated_at = _naive(now)
 
-    async def revoke_family(self, family_id: UUID, *, reason: str, now: datetime) -> None:
+    async def revoke_family(
+        self,
+        family_id: UUID,
+        *,
+        reason: RevocationReason,
+        now: datetime,
+    ) -> None:
         await self._session.execute(
             update(RefreshTokenRecordModel)
             .where(
@@ -208,13 +215,19 @@ class SessionRepository:
             )
             .values(
                 revoked_at=_naive(now),
-                revocation_reason=reason,
+                revocation_reason=reason.value,
                 version=RefreshTokenRecordModel.version + 1,
                 updated_at=_naive(now),
             )
         )
 
-    async def revoke_session(self, session_id: UUID, *, reason: str, now: datetime) -> None:
+    async def revoke_session(
+        self,
+        session_id: UUID,
+        *,
+        reason: RevocationReason,
+        now: datetime,
+    ) -> None:
         await self._session.execute(
             update(AuthSessionModel)
             .where(
@@ -223,7 +236,7 @@ class SessionRepository:
             )
             .values(
                 revoked_at=_naive(now),
-                revocation_reason=reason,
+                revocation_reason=reason.value,
                 version=AuthSessionModel.version + 1,
                 updated_at=_naive(now),
             )

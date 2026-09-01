@@ -52,6 +52,77 @@ def test_csrf_rejects_origin_before_token_validation(csrf: CsrfService) -> None:
 
 
 @pytest.mark.parametrize(
+    ("configured", "request_origin"),
+    [
+        ("HTTPS://APP.LAWYER-AGENT.TEST:443/", ORIGIN),
+        ("http://app.lawyer-agent.test:80", "HTTP://APP.LAWYER-AGENT.TEST/"),
+        ("HTTPS://[2001:DB8::1]:443/", "https://[2001:db8::1]"),
+    ],
+)
+def test_csrf_normalizes_configured_and_request_origins(
+    configured: str,
+    request_origin: str,
+) -> None:
+    csrf = CsrfService(key=b"c" * 32, trusted_origins=(configured,))
+    token = csrf.issue(SESSION_ID, nonce=b"n" * 32)
+
+    csrf.verify(
+        origin=request_origin,
+        header_token=token,
+        cookie_token=token,
+        session_id=SESSION_ID,
+    )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        "null",
+        "*",
+        "https://*.lawyer-agent.test",
+        "ftp://app.lawyer-agent.test",
+        "https://user@app.lawyer-agent.test",
+        "https://app.lawyer-agent.test/path",
+        "https://app.lawyer-agent.test?query=1",
+        "https://app.lawyer-agent.test#fragment",
+        "https://app.lawyer-agent.test\x00",
+        "app.lawyer-agent.test",
+    ],
+)
+def test_csrf_rejects_invalid_configured_origins(origin: str) -> None:
+    with pytest.raises(ValueError, match="origin"):
+        CsrfService(key=b"c" * 32, trusted_origins=(origin,))
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "null",
+        "*",
+        "https://*.lawyer-agent.test",
+        "ftp://app.lawyer-agent.test",
+        "https://user@app.lawyer-agent.test",
+        "https://app.lawyer-agent.test/path",
+        "https://app.lawyer-agent.test?query=1",
+        "https://app.lawyer-agent.test#fragment",
+    ],
+)
+def test_csrf_rejects_invalid_request_origin_before_token_validation(
+    csrf: CsrfService,
+    origin: str | None,
+) -> None:
+    with pytest.raises(UntrustedOrigin):
+        csrf.verify(
+            origin=origin,
+            header_token="malformed",  # noqa: S106 - synthetic CSRF fixture
+            cookie_token="different",  # noqa: S106 - synthetic CSRF fixture
+            session_id=SESSION_ID,
+        )
+
+
+@pytest.mark.parametrize(
     ("header", "cookie"),
     [
         ("same", "different"),

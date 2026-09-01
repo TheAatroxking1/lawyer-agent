@@ -11,6 +11,7 @@ from lawyer_agent.application.identity import (
     BlindIndexRolloutPhase,
     BlindIndexRolloutPolicy,
 )
+from lawyer_agent.domain.origins import HttpOrigin
 
 DEVELOPMENT_SECRET = "development-only-change-before-exposure"  # noqa: S105
 DEVELOPMENT_DATA_ENCRYPTION_KEY_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
@@ -30,32 +31,6 @@ def _decode_32_byte_key(value: str, field_name: str) -> bytes:
     if len(decoded) != 32:
         raise ValueError(f"{field_name} must decode to exactly 32 bytes")
     return decoded
-
-
-def _normalize_origin(value: str) -> str:
-    parsed = urlparse(value)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or "@" in parsed.netloc
-        or parsed.path not in {"", "/"}
-        or parsed.params
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("trusted_origins entries must be HTTP(S) origins without a path")
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("trusted_origins entries must use a valid port") from exc
-
-    host = parsed.hostname.lower()
-    if ":" in host:
-        host = f"[{host}]"
-    scheme = parsed.scheme.lower()
-    if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
-        return f"{scheme}://{host}"
-    return f"{scheme}://{host}:{port}"
 
 
 class Settings(BaseSettings):
@@ -103,7 +78,9 @@ class Settings(BaseSettings):
     def validate_trusted_origins(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if not value:
             raise ValueError("trusted_origins must not be empty")
-        return tuple(dict.fromkeys(_normalize_origin(origin) for origin in value))
+        return tuple(
+            dict.fromkeys(HttpOrigin.parse(origin).value for origin in value)
+        )
 
     @field_validator("jwt_ed25519_key_ring")
     @classmethod

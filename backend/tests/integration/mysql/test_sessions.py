@@ -22,6 +22,7 @@ from alembic import command
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.sessions import (
     InvalidRefreshToken,
+    InvalidRevocationReason,
     InvalidSession,
     RefreshReplayDetected,
     RefreshResult,
@@ -29,7 +30,7 @@ from lawyer_agent.application.sessions import (
     SwitchTenantCommand,
 )
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.sessions import Audience
+from lawyer_agent.domain.sessions import AccessTokenClaims, Audience, RevocationReason
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
     AuthSessionModel,
@@ -133,17 +134,22 @@ async def principal(
 
 
 @pytest.fixture
-def service_factory(
-    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
-) -> Callable[..., SessionService]:
-    _, factory = session_database
+def token_service() -> TokenService:
     private_key = Ed25519PrivateKey.generate()
-    token_service = TokenService(
+    return TokenService(
         issuer="https://identity.lawyer-agent.test",
         active_kid="integration-key",
         signing_keys={"integration-key": private_key},
         verification_keys={"integration-key": private_key.public_key()},
     )
+
+
+@pytest.fixture
+def service_factory(
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    token_service: TokenService,
+) -> Callable[..., SessionService]:
+    _, factory = session_database
 
     def build(
         *,
@@ -284,6 +290,7 @@ async def test_parallel_refresh_allows_one_success_then_revokes_family_for_repla
 class _MemoryValidationCache:
     def __init__(self) -> None:
         self.values: dict[UUID, object] = {}
+        self.invalidated: list[UUID] = []
 
     async def get(self, session_id: UUID) -> object | None:
         return self.values.get(session_id)
@@ -299,6 +306,7 @@ class _MemoryValidationCache:
         self.values[session_id] = state
 
     async def invalidate(self, session_id: UUID) -> None:
+        self.invalidated.append(session_id)
         self.values.pop(session_id, None)
 
 
@@ -377,6 +385,14 @@ class _FailingTokenService:
         del claims
         raise RuntimeError("synthetic signer outage")
 
+    def issue_platform(self, claims: object) -> str:
+        del claims
+        raise RuntimeError("synthetic signer outage")
+
+    def issue_step_up(self, claims: object) -> str:
+        del claims
+        raise RuntimeError("synthetic signer outage")
+
     def verify(self, encoded: str, *, audience: object, now: object = None) -> object:
         del encoded, audience, now
         raise AssertionError("verify is not expected")
@@ -442,3 +458,220 @@ async def test_malformed_refresh_token_is_a_generic_failure_without_state_change
     async with factory() as session:
         auth_session = await session.get(AuthSessionModel, started.session_id)
     assert auth_session is not None and auth_session.revoked_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_status", ["suspended", "closed"])
+async def test_tenant_access_rejects_non_active_tenant_statuses(
+    principal: tuple[UUID, UUID, UUID],
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    service_factory: Callable[..., SessionService],
+    tenant_status: str,
+) -> None:
+    user_id, tenant_id, membership_id = principal
+    _, factory = session_database
+    service = service_factory()
+    account = await service.start(user_id=user_id, audit_context=AUDIT)
+    tenant = await service.switch_tenant(
+        SwitchTenantCommand(account.session_id, tenant_id, membership_id),
+        audit_context=AUDIT,
+    )
+    async with factory.begin() as session:
+        await session.execute(
+            update(TenantModel)
+            .where(TenantModel.id == tenant_id)
+            .values(status=tenant_status)
+        )
+
+    with pytest.raises(InvalidSession):
+        await service.validate_access(tenant.access_token, audience=Audience.TENANT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "membership_values",
+    [
+        {"status": "suspended"},
+        {"status": "revoked"},
+        {"valid_from": (NOW + timedelta(seconds=1)).replace(tzinfo=None)},
+        {"valid_until": NOW.replace(tzinfo=None)},
+    ],
+)
+async def test_tenant_access_rejects_inactive_or_out_of_window_membership(
+    principal: tuple[UUID, UUID, UUID],
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    service_factory: Callable[..., SessionService],
+    membership_values: dict[str, object],
+) -> None:
+    user_id, tenant_id, membership_id = principal
+    _, factory = session_database
+    service = service_factory()
+    account = await service.start(user_id=user_id, audit_context=AUDIT)
+    tenant = await service.switch_tenant(
+        SwitchTenantCommand(account.session_id, tenant_id, membership_id),
+        audit_context=AUDIT,
+    )
+    async with factory.begin() as session:
+        await session.execute(
+            update(TenantMembershipModel)
+            .where(TenantMembershipModel.id == membership_id)
+            .values(**membership_values)
+        )
+
+    with pytest.raises(InvalidSession):
+        await service.validate_access(tenant.access_token, audience=Audience.TENANT)
+
+
+@pytest.mark.asyncio
+async def test_explicit_revoke_invalidates_session_family_and_cache(
+    principal: tuple[UUID, UUID, UUID],
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    service_factory: Callable[..., SessionService],
+) -> None:
+    user_id, _, _ = principal
+    _, factory = session_database
+    cache = _MemoryValidationCache()
+    service = service_factory(validation_cache=cache)
+    started = await service.start(user_id=user_id, audit_context=AUDIT)
+    await service.validate_access(started.access_token, audience=Audience.ACCOUNT)
+    assert started.session_id in cache.values
+
+    await service.revoke(
+        started.session_id,
+        reason=RevocationReason.LOGOUT,
+        audit_context=AUDIT,
+    )
+
+    async with factory() as session:
+        auth_session = await session.get(AuthSessionModel, started.session_id)
+        family = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.family_id == started.family_id
+                )
+            )
+        ).all()
+        revoke_audit = await session.scalar(
+            select(AuditEventModel).where(AuditEventModel.action == "session.revoke")
+        )
+    assert auth_session is not None
+    assert auth_session.revoked_at is not None
+    assert auth_session.revocation_reason == RevocationReason.LOGOUT.value
+    assert family and all(record.revoked_at is not None for record in family)
+    assert all(
+        record.revocation_reason == RevocationReason.LOGOUT.value for record in family
+    )
+    assert revoke_audit is not None
+    assert revoke_audit.reason_code == RevocationReason.LOGOUT.value
+    assert revoke_audit.metadata_json is None
+    assert started.session_id not in cache.values
+    assert cache.invalidated == [started.session_id]
+    with pytest.raises(InvalidSession):
+        await service.validate_access(started.access_token, audience=Audience.ACCOUNT)
+    with pytest.raises(InvalidRefreshToken):
+        await service.refresh(started.refresh_token, audit_context=AUDIT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_reason",
+    [
+        "logout",
+        "unknown_reason",
+        "Bearer synthetic.raw.token",
+        "user@example.test",
+        "x" * 129,
+        None,
+    ],
+)
+async def test_revoke_rejects_untyped_reason_before_opening_transaction(
+    token_service: TokenService,
+    invalid_reason: object,
+) -> None:
+    uow_opened = False
+
+    def forbidden_uow() -> object:
+        nonlocal uow_opened
+        uow_opened = True
+        raise AssertionError("unit of work must not open for an invalid reason")
+
+    service = SessionService(
+        uow_factory=forbidden_uow,  # type: ignore[arg-type]
+        token_service=token_service,
+        refresh_hash_key=b"r" * 32,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(InvalidRevocationReason):
+        await service.revoke(
+            new_uuid7(),
+            reason=invalid_reason,  # type: ignore[arg-type]
+            audit_context=AUDIT,
+        )
+    assert uow_opened is False
+
+
+class _FailOnSecondAccountIssueTokenService:
+    def __init__(self, delegate: TokenService) -> None:
+        self._delegate = delegate
+        self._account_issues = 0
+
+    def issue_account(self, claims: AccessTokenClaims) -> str:
+        self._account_issues += 1
+        if self._account_issues == 2:
+            raise RuntimeError("synthetic replacement signer outage")
+        return self._delegate.issue_account(claims)
+
+    def issue_tenant(self, claims: AccessTokenClaims) -> str:
+        return self._delegate.issue_tenant(claims)
+
+    def issue_platform(self, claims: AccessTokenClaims) -> str:
+        return self._delegate.issue_platform(claims)
+
+    def issue_step_up(self, claims: AccessTokenClaims) -> str:
+        return self._delegate.issue_step_up(claims)
+
+    def verify(
+        self,
+        encoded: str,
+        *,
+        audience: Audience,
+        now: datetime | None = None,
+    ) -> AccessTokenClaims:
+        return self._delegate.verify(encoded, audience=audience, now=now)
+
+
+@pytest.mark.asyncio
+async def test_refresh_signing_failure_rolls_back_rotation_and_audit(
+    principal: tuple[UUID, UUID, UUID],
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    service_factory: Callable[..., SessionService],
+    token_service: TokenService,
+) -> None:
+    user_id, _, _ = principal
+    _, factory = session_database
+    signer = _FailOnSecondAccountIssueTokenService(token_service)
+    service = service_factory(token_override=signer)
+    started = await service.start(user_id=user_id, audit_context=AUDIT)
+
+    with pytest.raises(RuntimeError, match="replacement signer outage"):
+        await service.refresh(started.refresh_token, audit_context=AUDIT)
+
+    async with factory() as session:
+        records = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.family_id == started.family_id
+                )
+            )
+        ).all()
+        refresh_audits = (
+            await session.scalars(
+                select(AuditEventModel).where(AuditEventModel.action == "session.refresh")
+            )
+        ).all()
+    assert len(records) == 1
+    assert records[0].used_at is None
+    assert records[0].replaced_by_id is None
+    assert records[0].revoked_at is None
+    assert refresh_audits == []
