@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
-from uuid import RFC_4122, UUID
+from uuid import UUID
+
+from lawyer_agent.domain.common import require_uuid7
 
 if TYPE_CHECKING:
     from lawyer_agent.domain.authorization import AuthorizationScope
@@ -34,6 +37,24 @@ class MemberType(StrEnum):
     INTERNAL = "internal"
     STUDENT = "student"
     EXTERNAL_CLIENT = "external_client"
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedTenantName:
+    display_value: str
+    normalized_value: str
+
+
+def normalize_tenant_name(value: object) -> NormalizedTenantName:
+    if not isinstance(value, str):
+        raise ValueError("tenant name is invalid")
+    display_value = unicodedata.normalize("NFKC", value).strip()
+    if not display_value or len(display_value) > 255:
+        raise ValueError("tenant name is invalid")
+    return NormalizedTenantName(
+        display_value=display_value,
+        normalized_value=display_value.casefold(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,18 +148,8 @@ class Membership:
         _require_version(self.version)
 
 
-def is_uuid7(value: object) -> bool:
-    return (
-        isinstance(value, UUID)
-        and value.version == 7
-        and value.variant == RFC_4122
-        and value.int != 0
-    )
-
-
 def _require_uuid7(value: object) -> None:
-    if not is_uuid7(value):
-        raise ValueError("identifier must be an RFC 9562 UUIDv7")
+    require_uuid7(value)
 
 
 def _require_utc(value: object) -> None:

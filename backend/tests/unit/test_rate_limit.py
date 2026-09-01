@@ -14,11 +14,11 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 import lawyer_agent.infrastructure.redis.client as redis_client
 import lawyer_agent.infrastructure.redis.rate_limit as rate_limit_module
 import lawyer_agent.infrastructure.redis.step_up as step_up_module
+from lawyer_agent.domain.authorization import AuthorizationScope, ConfidentialityLevel
 from lawyer_agent.domain.identity import IdentityKind, NormalizedIdentity, normalize_identifier
 from lawyer_agent.infrastructure.redis.authz_cache import (
     AuthorizationCache,
     AuthorizationCacheEntry,
-    AuthorizationScope,
 )
 from lawyer_agent.infrastructure.redis.client import (
     RedisAsyncioAdapter,
@@ -647,8 +647,13 @@ async def test_authorization_cache_uses_exact_versioned_key_and_typed_value() ->
         permissions=frozenset({"tenant.read", "membership.read"}),
         scope=AuthorizationScope(
             department_ids=frozenset({DEPARTMENT_ID}),
+            allow_tenant_wide=True,
             allow_owned=True,
             allow_shared=False,
+            allow_matter_team=True,
+            allow_class=True,
+            allow_client_delegation=True,
+            maximum_confidentiality=ConfidentialityLevel.CONFIDENTIAL,
         ),
     )
 
@@ -668,9 +673,15 @@ async def test_authorization_cache_uses_exact_versioned_key_and_typed_value() ->
         "authz_version": 7,
         "permissions": ["membership.read", "tenant.read"],
         "scope": {
+            "allow_class": True,
+            "allow_client_delegation": True,
+            "allow_matter_team": True,
             "allow_owned": True,
             "allow_shared": False,
+            "allow_tenant_wide": True,
             "department_ids": [str(DEPARTMENT_ID)],
+            "maximum_confidentiality": "confidential",
+            "unrecognized_scope_codes": [],
         },
         "v": 1,
     }

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
-from uuid import RFC_4122, UUID
+from dataclasses import dataclass
+from uuid import UUID
 
+from lawyer_agent.domain.authorization import AuthorizationScope, ConfidentialityLevel
+from lawyer_agent.domain.common import is_uuid7
 from lawyer_agent.infrastructure.redis.client import (
     RedisDependencyError,
     RedisDependencyInvalidResponse,
@@ -13,21 +15,6 @@ from lawyer_agent.infrastructure.redis.client import (
 
 _PERMISSION_PATTERN = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z", re.ASCII)
 _MAX_TTL_SECONDS = 300
-
-
-@dataclass(frozen=True, slots=True)
-class AuthorizationScope:
-    department_ids: frozenset[UUID] = field(default_factory=frozenset)
-    allow_owned: bool = False
-    allow_shared: bool = False
-
-    def __post_init__(self) -> None:
-        if any(not _is_uuid7(value) for value in self.department_ids):
-            raise ValueError("authorization department IDs must be RFC 9562 UUIDv7")
-        if not isinstance(self.allow_owned, bool) or not isinstance(
-            self.allow_shared, bool
-        ):
-            raise ValueError("authorization scope flags must be booleans")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +31,28 @@ class AuthorizationCacheEntry:
             raise ValueError("authorization permissions must be stable codes")
         if not isinstance(self.scope, AuthorizationScope):
             raise ValueError("authorization scope must be strongly typed")
+        flags = (
+            self.scope.allow_tenant_wide,
+            self.scope.allow_owned,
+            self.scope.allow_shared,
+            self.scope.allow_matter_team,
+            self.scope.allow_class,
+            self.scope.allow_client_delegation,
+        )
+        if (
+            not isinstance(self.scope.department_ids, frozenset)
+            or any(not is_uuid7(value) for value in self.scope.department_ids)
+            or any(not isinstance(value, bool) for value in flags)
+            or not isinstance(
+                self.scope.maximum_confidentiality, ConfidentialityLevel
+            )
+            or not isinstance(self.scope.unrecognized_scope_codes, frozenset)
+            or any(
+                not isinstance(value, str)
+                for value in self.scope.unrecognized_scope_codes
+            )
+        ):
+            raise ValueError("authorization scope contains invalid security fields")
 
 
 class AuthorizationCache:
@@ -90,8 +99,16 @@ class AuthorizationCache:
             "permissions": sorted(entry.permissions),
             "scope": {
                 "department_ids": sorted(str(value) for value in entry.scope.department_ids),
+                "allow_tenant_wide": entry.scope.allow_tenant_wide,
                 "allow_owned": entry.scope.allow_owned,
                 "allow_shared": entry.scope.allow_shared,
+                "allow_matter_team": entry.scope.allow_matter_team,
+                "allow_class": entry.scope.allow_class,
+                "allow_client_delegation": entry.scope.allow_client_delegation,
+                "maximum_confidentiality": entry.scope.maximum_confidentiality.value,
+                "unrecognized_scope_codes": sorted(
+                    entry.scope.unrecognized_scope_codes
+                ),
             },
         }
         encoded = json.dumps(
@@ -114,7 +131,7 @@ class AuthorizationCache:
 
 
 def _key(tenant_id: UUID, membership_id: UUID, authz_version: int) -> str:
-    if not _is_uuid7(tenant_id) or not _is_uuid7(membership_id):
+    if not is_uuid7(tenant_id) or not is_uuid7(membership_id):
         raise ValueError("authorization cache IDs must be RFC 9562 UUIDv7")
     if (
         isinstance(authz_version, bool)
@@ -156,36 +173,57 @@ def _decode(
         scope = payload["scope"]
         if not isinstance(scope, dict) or set(scope) != {
             "department_ids",
+            "allow_tenant_wide",
             "allow_owned",
             "allow_shared",
+            "allow_matter_team",
+            "allow_class",
+            "allow_client_delegation",
+            "maximum_confidentiality",
+            "unrecognized_scope_codes",
         }:
             return None
         department_values = scope["department_ids"]
+        unrecognized_scope_codes = scope["unrecognized_scope_codes"]
         if (
             not isinstance(department_values, list)
             or not all(isinstance(value, str) for value in department_values)
             or department_values != sorted(set(department_values))
-            or not isinstance(scope["allow_owned"], bool)
-            or not isinstance(scope["allow_shared"], bool)
+            or not isinstance(unrecognized_scope_codes, list)
+            or not all(isinstance(value, str) for value in unrecognized_scope_codes)
+            or unrecognized_scope_codes != sorted(set(unrecognized_scope_codes))
+            or any(
+                not isinstance(scope[name], bool)
+                for name in (
+                    "allow_tenant_wide",
+                    "allow_owned",
+                    "allow_shared",
+                    "allow_matter_team",
+                    "allow_class",
+                    "allow_client_delegation",
+                )
+            )
+            or not isinstance(scope["maximum_confidentiality"], str)
         ):
             return None
         departments = frozenset(UUID(value) for value in department_values)
+        if any(not is_uuid7(value) for value in departments):
+            return None
         return AuthorizationCacheEntry(
             permissions=frozenset(permissions),
             scope=AuthorizationScope(
                 department_ids=departments,
+                allow_tenant_wide=scope["allow_tenant_wide"],
                 allow_owned=scope["allow_owned"],
                 allow_shared=scope["allow_shared"],
+                allow_matter_team=scope["allow_matter_team"],
+                allow_class=scope["allow_class"],
+                allow_client_delegation=scope["allow_client_delegation"],
+                maximum_confidentiality=ConfidentialityLevel(
+                    scope["maximum_confidentiality"]
+                ),
+                unrecognized_scope_codes=frozenset(unrecognized_scope_codes),
             ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
         return None
-
-
-def _is_uuid7(value: object) -> bool:
-    return (
-        isinstance(value, UUID)
-        and value.version == 7
-        and value.variant == RFC_4122
-        and value.int != 0
-    )

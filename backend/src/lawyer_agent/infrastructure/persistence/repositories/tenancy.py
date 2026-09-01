@@ -6,9 +6,11 @@ from uuid import UUID
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.authorization import AuthorizationScope
+from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.tenancy import (
     Department,
     DepartmentStatus,
@@ -18,7 +20,7 @@ from lawyer_agent.domain.tenancy import (
     Tenant,
     TenantContext,
     TenantStatus,
-    is_uuid7,
+    normalize_tenant_name,
 )
 from lawyer_agent.infrastructure.persistence.models import (
     DepartmentModel,
@@ -33,6 +35,7 @@ class TenantRepository:
 
     async def get(self, context: TenantContext, tenant_id: UUID) -> Tenant | None:
         _require_context(context)
+        require_uuid7(tenant_id, field="tenant_id")
         model = await self._session.scalar(
             select(TenantModel).where(
                 TenantModel.id == context.tenant_id,
@@ -52,17 +55,25 @@ class TenantRepository:
         expected_version: int,
     ) -> bool:
         _require_context(context)
-        _require_name(name)
+        require_uuid7(tenant_id, field="tenant_id")
+        normalized_name = normalize_tenant_name(name)
         _require_version(expected_version)
-        result = cast(CursorResult[Any], await self._session.execute(
-            update(TenantModel)
-            .where(
-                TenantModel.id == context.tenant_id,
-                TenantModel.id == tenant_id,
-                TenantModel.version == expected_version,
-            )
-            .values(name=name.strip(), version=TenantModel.version + 1)
-        ))
+        try:
+            result = cast(CursorResult[Any], await self._session.execute(
+                update(TenantModel)
+                .where(
+                    TenantModel.id == context.tenant_id,
+                    TenantModel.id == tenant_id,
+                    TenantModel.version == expected_version,
+                )
+                .values(
+                    name=normalized_name.display_value,
+                    normalized_name=normalized_name.normalized_value,
+                    version=TenantModel.version + 1,
+                )
+            ))
+        except IntegrityError:
+            raise TenantNameConflictError("tenant name conflicts with an existing tenant") from None
         return result.rowcount == 1
 
     async def delete(
@@ -72,6 +83,7 @@ class TenantRepository:
         expected_version: int,
     ) -> bool:
         _require_context(context)
+        require_uuid7(tenant_id, field="tenant_id")
         _require_version(expected_version)
         result = cast(CursorResult[Any], await self._session.execute(
             update(TenantModel)
@@ -91,6 +103,7 @@ class DepartmentRepository:
 
     async def get(self, context: TenantContext, department_id: UUID) -> Department | None:
         _require_context(context)
+        require_uuid7(department_id, field="department_id")
         model = await self._session.scalar(
             select(DepartmentModel).where(
                 DepartmentModel.tenant_id == context.tenant_id,
@@ -136,6 +149,7 @@ class DepartmentRepository:
         expected_version: int,
     ) -> bool:
         _require_context(context)
+        require_uuid7(department_id, field="department_id")
         _require_name(name)
         _require_version(expected_version)
         result = cast(CursorResult[Any], await self._session.execute(
@@ -156,6 +170,7 @@ class DepartmentRepository:
         expected_version: int,
     ) -> bool:
         _require_context(context)
+        require_uuid7(department_id, field="department_id")
         _require_version(expected_version)
         result = cast(CursorResult[Any], await self._session.execute(
             update(DepartmentModel)
@@ -178,6 +193,7 @@ class MembershipRepository:
 
     async def get(self, context: TenantContext, membership_id: UUID) -> Membership | None:
         _require_context(context)
+        require_uuid7(membership_id, field="membership_id")
         model = await self._session.scalar(
             select(TenantMembershipModel).where(
                 TenantMembershipModel.tenant_id == context.tenant_id,
@@ -227,6 +243,7 @@ class MembershipRepository:
         expected_version: int,
     ) -> bool:
         _require_context(context)
+        require_uuid7(membership_id, field="membership_id")
         if not isinstance(status, MembershipStatus):
             raise ValueError("membership status must be strongly typed")
         _require_version(expected_version)
@@ -257,6 +274,10 @@ class MembershipRepository:
             MembershipStatus.REVOKED,
             expected_version,
         )
+
+
+class TenantNameConflictError(ValueError):
+    """Stable, non-sensitive tenant-name conflict at the repository boundary."""
 
 
 def _tenant(model: TenantModel) -> Tenant:
@@ -299,14 +320,20 @@ def _membership(model: TenantMembershipModel) -> Membership:
 
 
 def _require_context(context: TenantContext) -> None:
-    if (
-        not isinstance(context, TenantContext)
-        or not is_uuid7(context.tenant_id)
-        or not is_uuid7(context.membership_id)
-        or not is_uuid7(context.membership_user_id)
-        or not isinstance(context.scope, AuthorizationScope)
+    if not isinstance(context, TenantContext) or not isinstance(
+        context.scope, AuthorizationScope
     ):
         raise ValueError("invalid tenant context")
+    require_uuid7(context.tenant_id, field="tenant context tenant_id")
+    require_uuid7(context.membership_id, field="tenant context membership_id")
+    require_uuid7(
+        context.membership_user_id,
+        field="tenant context membership_user_id",
+    )
+    if context.department_id is not None:
+        require_uuid7(context.department_id, field="tenant context department_id")
+    for department_id in context.scope.department_ids:
+        require_uuid7(department_id, field="authorization scope department_id")
 
 
 def _require_name(value: str) -> None:

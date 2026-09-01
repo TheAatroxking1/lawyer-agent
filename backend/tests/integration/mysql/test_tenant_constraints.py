@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -7,7 +8,7 @@ from uuid import UUID
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -354,6 +355,26 @@ async def test_repository_scoped_add_read_update_delete_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_tenant_rename_atomically_updates_display_normalized_name_and_version(
+    database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
+) -> None:
+    context_a = _context(graph, "a")
+    async with database.begin() as session:
+        repository = TenantRepository(session)
+        assert await repository.update_name(
+            context_a,
+            graph["tenant_a"],
+            "  ＬＡＷ　ＦＩＲＭ  ",
+            1,
+        )
+        loaded = await repository.get(context_a, graph["tenant_a"])
+        assert loaded is not None
+        assert loaded.name == "LAW FIRM"
+        assert loaded.normalized_name == "law firm"
+        assert loaded.version == 2
+
+
+@pytest.mark.asyncio
 async def test_repository_rejects_cross_tenant_dto_before_database_write(
     database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
 ) -> None:
@@ -403,16 +424,235 @@ async def test_membership_and_authorization_write_paths_remain_tenant_scoped(
             membership_id,
             graph["role_a"],
             assigned_by_membership_id=graph["membership_a"],
+            now=NOW,
         )
         await session.flush()
         assert await authorization.assignment_exists(
             context_a, membership_id, graph["role_a"]
         )
 
-        with pytest.raises(ValueError, match="tenant context"):
-            await authorization.assign_role(
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("guard", "message"),
+    [
+        ("target_suspended", "membership unavailable"),
+        ("target_not_yet_valid", "membership unavailable"),
+        ("target_expired", "membership unavailable"),
+        ("assigner_suspended", "assigner unavailable"),
+        ("assigner_not_yet_valid", "assigner unavailable"),
+        ("assigner_expired", "assigner unavailable"),
+        ("role_disabled", "role unavailable"),
+    ],
+)
+async def test_role_assignment_requires_locked_active_memberships_and_role(
+    database: async_sessionmaker[AsyncSession],
+    graph: dict[str, UUID],
+    guard: str,
+    message: str,
+) -> None:
+    context_a = _context(graph, "a")
+    target_id = new_uuid7()
+    async with database.begin() as session:
+        target = TenantMembershipModel(
+            id=target_id,
+            tenant_id=graph["tenant_a"],
+            user_id=graph["user_c"],
+            department_id=graph["department_a"],
+            member_type="internal",
+            status="active",
+            valid_from=(NOW - timedelta(days=1)).replace(tzinfo=None),
+            valid_until=None,
+            authz_version=1,
+        )
+        session.add(target)
+        await session.flush()
+        if guard == "target_suspended":
+            target.status = "suspended"
+        elif guard == "target_not_yet_valid":
+            target.valid_from = (NOW + timedelta(minutes=1)).replace(tzinfo=None)
+        elif guard == "target_expired":
+            target.valid_until = NOW.replace(tzinfo=None)
+        elif guard.startswith("assigner_"):
+            assigner = await session.get(TenantMembershipModel, graph["membership_a"])
+            assert assigner is not None
+            if guard == "assigner_suspended":
+                assigner.status = "suspended"
+            elif guard == "assigner_not_yet_valid":
+                assigner.valid_from = (NOW + timedelta(minutes=1)).replace(tzinfo=None)
+            else:
+                assigner.valid_until = NOW.replace(tzinfo=None)
+        else:
+            role = await session.get(TenantRoleModel, graph["role_a"])
+            assert role is not None
+            role.status = "disabled"
+        await session.flush()
+
+        repository = AuthorizationRepository(session)
+        with pytest.raises(ValueError, match=message):
+            await repository.assign_role(
                 context_a,
-                graph["membership_b"],
-                graph["role_b"],
+                target_id,
+                graph["role_a"],
                 assigned_by_membership_id=graph["membership_a"],
+                now=NOW,
             )
+        assert not await repository.assignment_exists(
+            context_a, target_id, graph["role_a"]
+        )
+
+
+async def _insert_assignment_target(
+    database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
+) -> UUID:
+    target_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            TenantMembershipModel(
+                id=target_id,
+                tenant_id=graph["tenant_a"],
+                user_id=graph["user_c"],
+                department_id=graph["department_a"],
+                member_type="internal",
+                status="active",
+                valid_from=(NOW - timedelta(days=1)).replace(tzinfo=None),
+                valid_until=None,
+                authz_version=1,
+            )
+        )
+    return target_id
+
+
+@pytest.mark.asyncio
+async def test_role_assignment_waits_for_concurrent_membership_revocation_and_rejects(
+    database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
+) -> None:
+    target_id = await _insert_assignment_target(database, graph)
+    barrier = asyncio.Barrier(2)
+
+    async def attempt_assignment() -> str:
+        await barrier.wait()
+        async with database.begin() as session:
+            try:
+                await AuthorizationRepository(session).assign_role(
+                    _context(graph, "a"),
+                    target_id,
+                    graph["role_a"],
+                    assigned_by_membership_id=graph["membership_a"],
+                    now=NOW,
+                )
+            except ValueError as exc:
+                return str(exc)
+        return "inserted"
+
+    async with database.begin() as revoker:
+        target = await revoker.scalar(
+            select(TenantMembershipModel)
+            .where(
+                TenantMembershipModel.tenant_id == graph["tenant_a"],
+                TenantMembershipModel.id == target_id,
+            )
+            .with_for_update()
+        )
+        assert target is not None
+        target.status = "revoked"
+        await revoker.flush()
+        attempt = asyncio.create_task(attempt_assignment())
+        await barrier.wait()
+        await asyncio.sleep(0.05)
+        assert not attempt.done()
+
+    assert await asyncio.wait_for(attempt, timeout=3) == (
+        "membership unavailable for role assignment"
+    )
+    async with database() as session:
+        assert not await AuthorizationRepository(session).assignment_exists(
+            _context(graph, "a"), target_id, graph["role_a"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_role_assignment_waits_for_concurrent_role_disable_and_rejects(
+    database: async_sessionmaker[AsyncSession], graph: dict[str, UUID]
+) -> None:
+    target_id = await _insert_assignment_target(database, graph)
+    barrier = asyncio.Barrier(2)
+
+    async def attempt_assignment() -> str:
+        await barrier.wait()
+        async with database.begin() as session:
+            try:
+                await AuthorizationRepository(session).assign_role(
+                    _context(graph, "a"),
+                    target_id,
+                    graph["role_a"],
+                    assigned_by_membership_id=graph["membership_a"],
+                    now=NOW,
+                )
+            except ValueError as exc:
+                return str(exc)
+        return "inserted"
+
+    async with database.begin() as disabler:
+        role = await disabler.scalar(
+            select(TenantRoleModel)
+            .where(
+                TenantRoleModel.tenant_id == graph["tenant_a"],
+                TenantRoleModel.id == graph["role_a"],
+            )
+            .with_for_update()
+        )
+        assert role is not None
+        role.status = "disabled"
+        await disabler.flush()
+        attempt = asyncio.create_task(attempt_assignment())
+        await barrier.wait()
+        await asyncio.sleep(0.05)
+        assert not attempt.done()
+
+    assert await asyncio.wait_for(attempt, timeout=3) == (
+        "role unavailable for role assignment"
+    )
+    async with database() as session:
+        assert not await AuthorizationRepository(session).assignment_exists(
+            _context(graph, "a"), target_id, graph["role_a"]
+        )
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_tenant", "role_tenant", "assigner_tenant", "message"),
+    [
+        ("b", "a", "a", "membership unavailable"),
+        ("a", "b", "a", "role unavailable"),
+        ("a", "a", "b", "assigner unavailable"),
+    ],
+)
+async def test_role_assignment_separately_rejects_each_cross_tenant_reference(
+    database: async_sessionmaker[AsyncSession],
+    graph: dict[str, UUID],
+    target_tenant: str,
+    role_tenant: str,
+    assigner_tenant: str,
+    message: str,
+) -> None:
+    context_a = _context(graph, "a")
+    async with database.begin() as session:
+        repository = AuthorizationRepository(session)
+        before = await session.scalar(
+            select(func.count()).select_from(MembershipRoleAssignmentModel)
+        )
+        with pytest.raises(ValueError, match=message):
+            await repository.assign_role(
+                context_a,
+                graph[f"membership_{target_tenant}"],
+                graph[f"role_{role_tenant}"],
+                assigned_by_membership_id=graph[f"membership_{assigner_tenant}"],
+                now=NOW,
+            )
+        await session.flush()
+        after = await session.scalar(
+            select(func.count()).select_from(MembershipRoleAssignmentModel)
+        )
+        assert after == before

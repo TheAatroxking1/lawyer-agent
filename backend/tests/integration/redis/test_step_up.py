@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
 
+from lawyer_agent.domain.authorization import (
+    Action,
+    AuthorizationScope,
+    ConfidentialityLevel,
+    PolicyEngine,
+    Principal,
+    PrincipalAudience,
+    ResourceAccessPath,
+    ResourceAttributes,
+    ResourceState,
+)
+from lawyer_agent.domain.tenancy import MembershipStatus, TenantContext, TenantStatus
 from lawyer_agent.infrastructure.redis.authz_cache import (
     AuthorizationCache,
     AuthorizationCacheEntry,
-    AuthorizationScope,
 )
 from lawyer_agent.infrastructure.redis.step_up import StepUpStore
 
@@ -20,7 +33,9 @@ TENANT_ID = UUID("01990f00-0000-7000-8000-000000000515")
 OTHER_TENANT_ID = UUID("01990f00-0000-7000-8000-000000000516")
 MEMBERSHIP_ID = UUID("01990f00-0000-7000-8000-000000000517")
 DEPARTMENT_ID = UUID("01990f00-0000-7000-8000-000000000518")
+OWNER_ID = UUID("01990f00-0000-7000-8000-000000000519")
 ACTION = "tenant_application.review"
+NOW = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
 
 
 @pytest.mark.integration
@@ -172,8 +187,13 @@ async def test_authorization_cache_round_trip_version_miss_and_exact_invalidatio
         permissions=frozenset({"tenant.read", "membership.read"}),
         scope=AuthorizationScope(
             department_ids=frozenset({DEPARTMENT_ID}),
+            allow_tenant_wide=True,
             allow_owned=True,
             allow_shared=True,
+            allow_matter_team=True,
+            allow_class=True,
+            allow_client_delegation=True,
+            maximum_confidentiality=ConfidentialityLevel.CONFIDENTIAL,
         ),
     )
     await cache.set(
@@ -209,3 +229,178 @@ async def test_authorization_cache_round_trip_version_miss_and_exact_invalidatio
     )
 
     assert [key async for key in raw.scan_iter(match=f"{prefix}*", count=100)] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cached_domain_scope_round_trip_drives_every_policy_abac_path(
+    redis_scope,
+) -> None:
+    redis, _, _ = redis_scope
+    cache = AuthorizationCache(redis=redis, ttl_seconds=60)
+    scope = AuthorizationScope(
+        department_ids=frozenset({DEPARTMENT_ID}),
+        allow_tenant_wide=False,
+        allow_owned=True,
+        allow_shared=True,
+        allow_matter_team=True,
+        allow_class=True,
+        allow_client_delegation=True,
+        maximum_confidentiality=ConfidentialityLevel.CONFIDENTIAL,
+    )
+    await cache.set(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=7,
+        entry=AuthorizationCacheEntry(frozenset({Action.TENANT_READ.value}), scope),
+    )
+    loaded = await cache.get(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=7,
+    )
+    assert loaded is not None and loaded.scope == scope
+
+    principal = Principal(
+        user_id=OWNER_ID,
+        session_id=SESSION_ID,
+        audience=PrincipalAudience.TENANT,
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        user_status="active",
+        session_valid=True,
+        auth_version=3,
+        session_auth_version=3,
+        permissions=loaded.permissions,
+        role_codes=frozenset({"lawyer_or_legal"}),
+        authenticated_at=NOW - timedelta(minutes=1),
+    )
+    context = TenantContext(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        membership_user_id=OWNER_ID,
+        department_id=DEPARTMENT_ID,
+        tenant_status=TenantStatus.ACTIVE,
+        membership_status=MembershipStatus.ACTIVE,
+        valid_from=NOW - timedelta(days=1),
+        valid_until=NOW + timedelta(days=1),
+        authz_version=7,
+        session_authz_version=7,
+        scope=loaded.scope,
+    )
+    policy = PolicyEngine()
+    resources = (
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.DEPARTMENT}),
+            department_id=DEPARTMENT_ID,
+        ),
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.OWNER}),
+            owner_user_id=OWNER_ID,
+        ),
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.SHARED}),
+            shared_with_membership_ids=frozenset({MEMBERSHIP_ID}),
+        ),
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.MATTER_TEAM}),
+            matter_team_membership_ids=frozenset({MEMBERSHIP_ID}),
+        ),
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.CLASS}),
+            class_membership_ids=frozenset({MEMBERSHIP_ID}),
+        ),
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            access_paths=frozenset({ResourceAccessPath.CLIENT_DELEGATION}),
+            delegated_client_membership_ids=frozenset({MEMBERSHIP_ID}),
+        ),
+    )
+    assert all(
+        policy.decide(principal, context, Action.TENANT_READ, resource, NOW).allowed
+        for resource in resources
+    )
+    restricted = ResourceAttributes(
+        tenant_id=TENANT_ID,
+        state=ResourceState.ACTIVE,
+        access_paths=frozenset({ResourceAccessPath.OWNER}),
+        owner_user_id=OWNER_ID,
+        confidentiality=ConfidentialityLevel.RESTRICTED,
+    )
+    decision = policy.decide(principal, context, Action.TENANT_READ, restricted, NOW)
+    assert not decision.allowed and decision.reason_code == "resource_scope_denied"
+
+    tenant_wide_scope = AuthorizationScope(
+        allow_tenant_wide=True,
+        maximum_confidentiality=ConfidentialityLevel.CONFIDENTIAL,
+    )
+    await cache.set(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=8,
+        entry=AuthorizationCacheEntry(loaded.permissions, tenant_wide_scope),
+    )
+    tenant_wide = await cache.get(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=8,
+    )
+    assert tenant_wide is not None and tenant_wide.scope == tenant_wide_scope
+    tenant_wide_context = replace(
+        context,
+        authz_version=8,
+        session_authz_version=8,
+        scope=tenant_wide.scope,
+    )
+    assert policy.decide(
+        principal,
+        tenant_wide_context,
+        Action.TENANT_READ,
+        ResourceAttributes(
+            tenant_id=TENANT_ID,
+            state=ResourceState.ACTIVE,
+            confidentiality=ConfidentialityLevel.CONFIDENTIAL,
+        ),
+        NOW,
+    ).allowed
+
+    unknown_scope = replace(
+        tenant_wide_scope,
+        unrecognized_scope_codes=frozenset({"future.scope"}),
+    )
+    await cache.set(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=9,
+        entry=AuthorizationCacheEntry(loaded.permissions, unknown_scope),
+    )
+    unknown = await cache.get(
+        tenant_id=TENANT_ID,
+        membership_id=MEMBERSHIP_ID,
+        authz_version=9,
+    )
+    assert unknown is not None and unknown.scope == unknown_scope
+    decision = policy.decide(
+        principal,
+        replace(
+            context,
+            authz_version=9,
+            session_authz_version=9,
+            scope=unknown.scope,
+        ),
+        Action.TENANT_READ,
+        ResourceAttributes(tenant_id=TENANT_ID, state=ResourceState.ACTIVE),
+        NOW,
+    )
+    assert not decision.allowed and decision.reason_code == "unknown_scope"

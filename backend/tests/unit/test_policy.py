@@ -4,7 +4,7 @@ import inspect
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid1, uuid4
 
 import pytest
 
@@ -26,6 +26,7 @@ from lawyer_agent.domain.tenancy import (
     MembershipStatus,
     TenantContext,
     TenantStatus,
+    normalize_tenant_name,
 )
 from lawyer_agent.infrastructure.persistence.seed_authz import (
     PLATFORM_ROLES,
@@ -41,6 +42,16 @@ OTHER_TENANT_ID = new_uuid7()
 MEMBERSHIP_ID = new_uuid7()
 DEPARTMENT_ID = new_uuid7()
 OTHER_DEPARTMENT_ID = new_uuid7()
+
+
+def test_tenant_name_normalization_is_nfkc_trimmed_casefolded_and_bounded() -> None:
+    normalized = normalize_tenant_name("  ＬＡＷ　ＦＩＲＭ  ")
+    assert normalized.display_value == "LAW FIRM"
+    assert normalized.normalized_value == "law firm"
+    with pytest.raises(ValueError, match="tenant name"):
+        normalize_tenant_name("　 ")
+    with pytest.raises(ValueError, match="tenant name"):
+        normalize_tenant_name("甲" * 256)
 
 
 def _principal(
@@ -410,6 +421,59 @@ def test_non_uuid7_identity_and_session_are_rejected_in_order() -> None:
         _resource(),
         NOW,
     ).reason_code == "session_invalid"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [uuid1(), uuid4(), UUID(int=0), True, "01990f00-0000-7000-8000-000000000501", object()],
+)
+def test_every_tenant_context_department_id_type_fails_closed(invalid: object) -> None:
+    decision = PolicyEngine().decide(
+        _principal(),
+        replace(_context(), department_id=invalid),  # type: ignore[arg-type]
+        Action.TENANT_READ,
+        _resource(),
+        NOW,
+    )
+    assert decision.reason_code == "tenant_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("tenant_id", "tenant_mismatch"),
+        ("membership_id", "tenant_mismatch"),
+        ("membership_user_id", "tenant_mismatch"),
+    ],
+)
+def test_all_other_tenant_context_ids_are_checked(field: str, expected: str) -> None:
+    decision = PolicyEngine().decide(
+        _principal(),
+        replace(_context(), **{field: uuid4()}),
+        Action.TENANT_READ,
+        _resource(),
+        NOW,
+    )
+    assert decision.reason_code == expected
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"department_id": uuid4()},
+        {"owner_user_id": uuid4()},
+        {"shared_with_membership_ids": frozenset({uuid4()})},
+        {"matter_team_membership_ids": frozenset({uuid4()})},
+        {"class_membership_ids": frozenset({uuid4()})},
+        {"delegated_client_membership_ids": frozenset({uuid4()})},
+    ],
+)
+def test_every_resource_identifier_path_fails_closed(changes: dict[str, object]) -> None:
+    resource = _resource(**changes)
+    decision = PolicyEngine().decide(
+        _principal(), _context(), Action.TENANT_READ, resource, NOW
+    )
+    assert decision.reason_code == "unknown_resource_attributes"
 
 
 def test_unknown_or_non_uuid7_resource_attributes_fail_closed() -> None:

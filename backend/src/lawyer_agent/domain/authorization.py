@@ -6,11 +6,11 @@ from enum import StrEnum
 from types import MappingProxyType
 from uuid import UUID
 
+from lawyer_agent.domain.common import is_uuid7
 from lawyer_agent.domain.tenancy import (
     MembershipStatus,
     TenantContext,
     TenantStatus,
-    is_uuid7,
 )
 
 POLICY_VERSION = "identity-authz-v1"
@@ -307,6 +307,7 @@ def _tenant_match_reason(
         not isinstance(context, TenantContext)
         or not isinstance(resource, ResourceAttributes)
         or not is_uuid7(context.tenant_id)
+        or (context.department_id is not None and not is_uuid7(context.department_id))
         or not is_uuid7(resource.tenant_id)
         or resource.tenant_id != context.tenant_id
     ):

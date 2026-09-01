@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -7,7 +8,9 @@ from sqlalchemy import and_, delete, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lawyer_agent.domain.tenancy import TenantContext, is_uuid7
+from lawyer_agent.domain.authorization import AuthorizationScope
+from lawyer_agent.domain.common import require_uuid7
+from lawyer_agent.domain.tenancy import TenantContext
 from lawyer_agent.infrastructure.persistence.models import (
     MembershipRoleAssignmentModel,
     PermissionModel,
@@ -73,6 +76,7 @@ class AuthorizationRepository:
 
     async def role_exists(self, context: TenantContext, role_id: UUID) -> bool:
         _require_context(context)
+        require_uuid7(role_id, field="role_id")
         return (
             await self._session.scalar(
                 select(TenantRoleModel.id).where(
@@ -90,6 +94,8 @@ class AuthorizationRepository:
         role_id: UUID,
     ) -> bool:
         _require_context(context)
+        require_uuid7(membership_id, field="membership_id")
+        require_uuid7(role_id, field="role_id")
         return (
             await self._session.scalar(
                 select(MembershipRoleAssignmentModel.membership_id).where(
@@ -108,17 +114,42 @@ class AuthorizationRepository:
         role_id: UUID,
         *,
         assigned_by_membership_id: UUID,
+        now: datetime,
     ) -> None:
         _require_context(context)
-        for value in (membership_id, role_id, assigned_by_membership_id):
-            if not is_uuid7(value):
-                raise ValueError("role assignment identifier must be UUIDv7")
-        if not await self._membership_exists(context, membership_id):
-            raise ValueError("membership does not match tenant context")
-        if not await self._membership_exists(context, assigned_by_membership_id):
-            raise ValueError("assigner does not match tenant context")
-        if not await self.role_exists(context, role_id):
-            raise ValueError("role does not match tenant context")
+        require_uuid7(membership_id, field="membership_id")
+        require_uuid7(role_id, field="role_id")
+        require_uuid7(assigned_by_membership_id, field="assigned_by_membership_id")
+        effective_at = _naive_utc(now)
+        membership_ids = sorted({membership_id, assigned_by_membership_id}, key=str)
+        memberships = (
+            await self._session.scalars(
+                select(TenantMembershipModel)
+                .where(
+                    TenantMembershipModel.tenant_id == context.tenant_id,
+                    TenantMembershipModel.id.in_(membership_ids),
+                )
+                .order_by(TenantMembershipModel.id)
+                .with_for_update()
+            )
+        ).all()
+        memberships_by_id = {model.id: model for model in memberships}
+        if not _active_membership(memberships_by_id.get(membership_id), effective_at):
+            raise ValueError("membership unavailable for role assignment")
+        if not _active_membership(
+            memberships_by_id.get(assigned_by_membership_id), effective_at
+        ):
+            raise ValueError("assigner unavailable for role assignment")
+        role = await self._session.scalar(
+            select(TenantRoleModel)
+            .where(
+                TenantRoleModel.tenant_id == context.tenant_id,
+                TenantRoleModel.id == role_id,
+            )
+            .with_for_update()
+        )
+        if role is None or role.status != "active":
+            raise ValueError("role unavailable for role assignment")
         self._session.add(
             MembershipRoleAssignmentModel(
                 tenant_id=context.tenant_id,
@@ -135,6 +166,8 @@ class AuthorizationRepository:
         role_id: UUID,
     ) -> bool:
         _require_context(context)
+        require_uuid7(membership_id, field="membership_id")
+        require_uuid7(role_id, field="role_id")
         result = cast(CursorResult[Any], await self._session.execute(
             delete(MembershipRoleAssignmentModel).where(
                 MembershipRoleAssignmentModel.tenant_id == context.tenant_id,
@@ -144,26 +177,37 @@ class AuthorizationRepository:
         ))
         return result.rowcount == 1
 
-    async def _membership_exists(
-        self,
-        context: TenantContext,
-        membership_id: UUID,
-    ) -> bool:
-        return (
-            await self._session.scalar(
-                select(TenantMembershipModel.id).where(
-                    TenantMembershipModel.tenant_id == context.tenant_id,
-                    TenantMembershipModel.id == membership_id,
-                )
-            )
-            is not None
-        )
-
-
 def _require_context(context: TenantContext) -> None:
-    if (
-        not isinstance(context, TenantContext)
-        or not is_uuid7(context.tenant_id)
-        or not is_uuid7(context.membership_id)
+    if not isinstance(context, TenantContext) or not isinstance(
+        context.scope, AuthorizationScope
     ):
         raise ValueError("invalid tenant context")
+    require_uuid7(context.tenant_id, field="tenant context tenant_id")
+    require_uuid7(context.membership_id, field="tenant context membership_id")
+    require_uuid7(
+        context.membership_user_id,
+        field="tenant context membership_user_id",
+    )
+    if context.department_id is not None:
+        require_uuid7(context.department_id, field="tenant context department_id")
+    for department_id in context.scope.department_ids:
+        require_uuid7(department_id, field="authorization scope department_id")
+
+
+def _naive_utc(value: object) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != UTC.utcoffset(value)
+    ):
+        raise ValueError("role assignment time must be UTC-aware")
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _active_membership(model: TenantMembershipModel | None, now: datetime) -> bool:
+    return (
+        model is not None
+        and model.status == "active"
+        and model.valid_from <= now
+        and (model.valid_until is None or model.valid_until > now)
+    )
