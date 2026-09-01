@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID
 
 import pytest
@@ -93,6 +94,71 @@ async def test_step_up_uses_300_second_ttl_and_never_stores_raw_grant(
     assert grant.value.encode() not in (await raw.get(key) or b"")
     ttl = await raw.ttl(key)
     assert 295 <= ttl <= 300
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_twenty_concurrent_step_up_consumers_have_exactly_one_winner(
+    redis_scope,
+) -> None:
+    redis, _, _ = redis_scope
+    store = StepUpStore(redis=redis, hmac_key=b"s" * 32)
+    grant = await store.issue(
+        user_id=USER_ID,
+        session_id=SESSION_ID,
+        tenant_id=TENANT_ID,
+        action=ACTION,
+    )
+
+    results = await asyncio.gather(
+        *(
+            store.consume(
+                grant,
+                user_id=USER_ID,
+                session_id=SESSION_ID,
+                tenant_id=TENANT_ID,
+                action=ACTION,
+            )
+            for _ in range(20)
+        )
+    )
+
+    assert sum(results) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_expired_step_up_grant_fails_for_every_concurrent_consumer(
+    redis_scope,
+) -> None:
+    redis, raw, prefix = redis_scope
+    store = StepUpStore(redis=redis, hmac_key=b"s" * 32)
+    grant = await store.issue(
+        user_id=USER_ID,
+        session_id=SESSION_ID,
+        tenant_id=TENANT_ID,
+        action=ACTION,
+    )
+    keys = [key async for key in raw.scan_iter(match=f"{prefix}*", count=100)]
+    assert len(keys) == 1
+    assert await raw.pexpire(keys[0], 50) is True
+    await asyncio.wait_for(asyncio.sleep(0.1), timeout=2)
+    assert await raw.exists(keys[0]) == 0
+
+    results = await asyncio.gather(
+        *(
+            store.consume(
+                grant,
+                user_id=USER_ID,
+                session_id=SESSION_ID,
+                tenant_id=TENANT_ID,
+                action=ACTION,
+            )
+            for _ in range(20)
+        )
+    )
+
+    assert results == [False] * 20
 
 
 @pytest.mark.integration

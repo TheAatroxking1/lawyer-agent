@@ -6,6 +6,9 @@ from typing import Protocol, Self, cast
 
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError as RedisOutOfMemoryError
+from redis.exceptions import ReadOnlyError as RedisReadOnlyError
+from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 RedisValue = str | bytes | int | float
@@ -15,6 +18,7 @@ _PREFIX_PATTERN = re.compile(r"[A-Za-z0-9:_-]{0,160}\Z", re.ASCII)
 class RedisFailureKind(StrEnum):
     CONNECTION = "connection"
     TIMEOUT = "timeout"
+    SERVER = "server"
 
 
 class RedisDependencyError(Exception):
@@ -124,18 +128,14 @@ class RedisAsyncioAdapter:
         )
         try:
             return await self._client.eval(script, numkeys, *prefixed)
-        except RedisTimeoutError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.TIMEOUT) from exc
-        except RedisConnectionError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.CONNECTION) from exc
+        except RedisError as exc:
+            raise _translate_sdk_error(exc) from None
 
     async def get(self, key: str) -> bytes | None:
         try:
             result = await self._client.get(self._key(key))
-        except RedisTimeoutError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.TIMEOUT) from exc
-        except RedisConnectionError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.CONNECTION) from exc
+        except RedisError as exc:
+            raise _translate_sdk_error(exc) from None
         if result is None:
             return None
         if isinstance(result, bytes):
@@ -152,10 +152,8 @@ class RedisAsyncioAdapter:
     ) -> bool:
         try:
             result = await self._client.set(self._key(key), value, ex=ex, nx=nx)
-        except RedisTimeoutError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.TIMEOUT) from exc
-        except RedisConnectionError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.CONNECTION) from exc
+        except RedisError as exc:
+            raise _translate_sdk_error(exc) from None
         if result is True:
             return True
         if result is False or result is None:
@@ -169,10 +167,8 @@ class RedisAsyncioAdapter:
             return 0
         try:
             result = await self._client.delete(*(self._key(key) for key in keys))
-        except RedisTimeoutError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.TIMEOUT) from exc
-        except RedisConnectionError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.CONNECTION) from exc
+        except RedisError as exc:
+            raise _translate_sdk_error(exc) from None
         if isinstance(result, bool) or not isinstance(result, int):
             raise RedisDependencyInvalidResponse
         return result
@@ -180,12 +176,20 @@ class RedisAsyncioAdapter:
     async def aclose(self) -> None:
         try:
             await self._client.aclose()
-        except RedisTimeoutError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.TIMEOUT) from exc
-        except RedisConnectionError as exc:
-            raise RedisDependencyUnavailable(RedisFailureKind.CONNECTION) from exc
+        except RedisError as exc:
+            raise _translate_sdk_error(exc) from None
 
     def _key(self, value: RedisValue) -> str:
         if not isinstance(value, str) or not value or "\x00" in value:
             raise ValueError("Redis keys must be non-empty strings")
         return f"{self._key_prefix}{value}"
+
+
+def _translate_sdk_error(error: RedisError) -> RedisDependencyError:
+    if isinstance(error, RedisTimeoutError):
+        return RedisDependencyUnavailable(RedisFailureKind.TIMEOUT)
+    if isinstance(error, RedisConnectionError):
+        return RedisDependencyUnavailable(RedisFailureKind.CONNECTION)
+    if isinstance(error, (RedisReadOnlyError, RedisOutOfMemoryError)):
+        return RedisDependencyUnavailable(RedisFailureKind.SERVER)
+    return RedisDependencyInvalidResponse()

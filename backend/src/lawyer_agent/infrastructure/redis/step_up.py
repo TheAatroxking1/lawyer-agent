@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from uuid import RFC_4122, UUID
 
-from lawyer_agent.infrastructure.redis.client import RedisDependencyInvalidResponse, RedisPort
+from lawyer_agent.infrastructure.redis.client import (
+    RedisDependencyError,
+    RedisDependencyInvalidResponse,
+    RedisPort,
+)
 
 _GRANT_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 _ACTION_PATTERN = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z", re.ASCII)
@@ -25,9 +29,7 @@ return 0
 """
 
 
-class StepUpGrantAllocationError(Exception):
-    code = "security_dependency_unavailable"
-
+class StepUpGrantGenerationExhausted(RedisDependencyError):
     def __init__(self) -> None:
         super().__init__("could not allocate a step-up grant")
 
@@ -68,7 +70,7 @@ class StepUpStore:
             )
             if stored:
                 return grant
-        raise StepUpGrantAllocationError
+        raise StepUpGrantGenerationExhausted
 
     async def consume(
         self,
