@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.tenancy import (
     ActorSessionState,
+    MemberCollectionScope,
     MemberCursor,
     MemberPageItem,
     RoleTemplateUnavailable,
@@ -255,15 +256,24 @@ class MembershipWorkflowRepository:
         self,
         *,
         context: TenantContext,
+        collection_scope: MemberCollectionScope,
         after: MemberCursor | None,
         limit: int,
     ) -> tuple[MemberPageItem, ...]:
         _require_context(context)
+        if not isinstance(collection_scope, MemberCollectionScope):
+            raise ValueError("member collection scope must be strongly typed")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 101:
             raise ValueError("member repository page limit is invalid")
         statement = select(TenantMembershipModel).where(
             TenantMembershipModel.tenant_id == context.tenant_id
         )
+        if not collection_scope.tenant_wide:
+            if not collection_scope.department_ids:
+                raise ValueError("department-scoped member collection must not be empty")
+            statement = statement.where(
+                TenantMembershipModel.department_id.in_(collection_scope.department_ids)
+            )
         if after is not None:
             statement = statement.where(
                 or_(
@@ -677,45 +687,6 @@ class TenantAuthorizationWorkflowRepository:
 class TenantSessionRevocationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
-
-    async def lock_for_membership(
-        self,
-        *,
-        tenant_id: UUID,
-        membership_id: UUID,
-    ) -> None:
-        require_uuid7(tenant_id, field="tenant_id")
-        require_uuid7(membership_id, field="membership_id")
-        refresh_rows = (
-            await self._session.execute(
-                select(
-                    RefreshTokenRecordModel.id,
-                    RefreshTokenRecordModel.family_id,
-                    RefreshTokenRecordModel.session_id,
-                )
-                .where(
-                    RefreshTokenRecordModel.tenant_id == tenant_id,
-                    RefreshTokenRecordModel.membership_id == membership_id,
-                )
-                .order_by(
-                    RefreshTokenRecordModel.family_id,
-                    RefreshTokenRecordModel.id,
-                )
-                .with_for_update()
-            )
-        ).all()
-        session_ids = tuple(sorted({row.session_id for row in refresh_rows}, key=str))
-        if session_ids:
-            await self._session.execute(
-                select(AuthSessionModel.id)
-                .where(
-                    AuthSessionModel.tenant_id == tenant_id,
-                    AuthSessionModel.membership_id == membership_id,
-                    AuthSessionModel.id.in_(session_ids),
-                )
-                .order_by(AuthSessionModel.id)
-                .with_for_update()
-            )
 
     async def revoke_for_membership(
         self,

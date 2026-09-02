@@ -12,6 +12,10 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from lawyer_agent.application.identity import AuditContext
+from lawyer_agent.application.security_locks import (
+    SecurityWriteLockRepositoryPort,
+    SessionSecurityWriteLockRequest,
+)
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.sessions import (
     AccessTokenClaims,
@@ -185,6 +189,8 @@ class SwitchTenantCommand:
 
 
 class SessionRepositoryPort(Protocol):
+    async def peek_refresh_tenant(self, token_hash: bytes) -> UUID | None: ...
+
     async def get_user(self, user_id: UUID) -> UserSessionState | None: ...
 
     async def get_tenant_context(
@@ -249,6 +255,7 @@ class SessionAuditRepositoryPort(Protocol):
 
 class SessionUnitOfWork(Protocol):
     sessions: SessionRepositoryPort
+    security_locks: SecurityWriteLockRepositoryPort
     audit: SessionAuditRepositoryPort
 
     async def __aenter__(self) -> Self: ...
@@ -369,7 +376,16 @@ class SessionService:
         invalid = False
         invalidated_session_id: UUID | None = None
         async with self._uow_factory() as uow:
-            current = await uow.sessions.lock_refresh(token_hash)
+            refresh_tenant_id = await uow.sessions.peek_refresh_tenant(token_hash)
+            tenant_gate_available = (
+                refresh_tenant_id is None
+                or await uow.security_locks.acquire_tenant_gate(refresh_tenant_id)
+            )
+            current = (
+                await uow.sessions.lock_refresh(token_hash)
+                if tenant_gate_available
+                else None
+            )
             if current is None:
                 await uow.audit.append(
                     _audit_event(
@@ -543,7 +559,11 @@ class SessionService:
             raise InvalidRevocationReason
         now = self._now()
         async with self._uow_factory() as uow:
-            state = await uow.sessions.lock_session(session_id)
+            if not await uow.security_locks.acquire_session_revoke(
+                SessionSecurityWriteLockRequest(session_id)
+            ):
+                return
+            state = await uow.sessions.get_validation_state(session_id)
             if state is None:
                 return
             await uow.sessions.revoke_family(state.current_family_id, reason=reason, now=now)

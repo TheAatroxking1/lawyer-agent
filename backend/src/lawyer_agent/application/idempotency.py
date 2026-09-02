@@ -396,9 +396,10 @@ def _project_explicit_paths(
     secret_paths: frozenset[JsonPath],
 ) -> object:
     if path in secret_paths:
+        _require_explicit_leaf(value, classification="secret")
         return _OMIT
     if path in business_paths:
-        return _canonical_json_value(value)
+        return _canonical_business_leaf(value)
     if isinstance(value, Mapping):
         result: dict[str, object] = {}
         for raw_key, child in value.items():
@@ -418,19 +419,36 @@ def _project_explicit_paths(
     )
 
 
-def _canonical_json_value(value: object) -> object:
+def _canonical_business_leaf(value: object) -> object:
     if isinstance(value, Mapping):
-        result: dict[str, object] = {}
-        for raw_key, child in value.items():
-            if not isinstance(raw_key, str):
-                raise InvalidIdempotencyRequest("JSON object keys must be strings")
-            result[raw_key] = _canonical_json_value(child)
-        return result
+        raise InvalidIdempotencyRequest(
+            "fingerprint paths must terminate at an exact scalar leaf"
+        )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_canonical_json_value(child) for child in value]
+        if any(
+            isinstance(child, Mapping)
+            or (
+                isinstance(child, Sequence)
+                and not isinstance(child, (str, bytes, bytearray))
+            )
+            for child in value
+        ):
+            raise InvalidIdempotencyRequest(
+                "fingerprint sequence values require an explicit safe scalar schema"
+            )
+        return [_canonical_business_leaf(child) for child in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise InvalidIdempotencyRequest("request body must contain canonical JSON values")
+
+
+def _require_explicit_leaf(value: object, *, classification: str) -> None:
+    try:
+        _canonical_business_leaf(value)
+    except InvalidIdempotencyRequest as exc:
+        raise InvalidIdempotencyRequest(
+            f"{classification} paths must classify exact scalar leaves"
+        ) from exc
 
 
 def _require_paths(value: object, *, field_name: str) -> None:

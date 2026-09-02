@@ -75,6 +75,7 @@ class IdempotencyRecordModel(VersionMixin, TimestampMixin, Base):
             "key_hash",
             name="uq_idempotency_records_tenant_scope",
         ),
+        UniqueConstraint("tenant_id", "id", name="uq_idempotency_records_tenant_id_id"),
         ForeignKeyConstraint(
             ["tenant_id", "scope_id"],
             ["tenant_memberships.tenant_id", "tenant_memberships.id"],

@@ -6,8 +6,14 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
+from lawyer_agent.infrastructure.persistence.repositories.authorization_cache_outbox import (
+    AuthorizationCacheInvalidationOutboxRepository,
+)
 from lawyer_agent.infrastructure.persistence.repositories.idempotency import (
     SqlAlchemyIdempotencyRepository,
+)
+from lawyer_agent.infrastructure.persistence.repositories.security_locks import (
+    SecurityWriteLockRepository,
 )
 from lawyer_agent.infrastructure.persistence.repositories.tenant_workflows import (
     MembershipWorkflowRepository,
@@ -27,6 +33,8 @@ class SqlAlchemyTenantWorkflowUnitOfWork:
         self.roles: TenantRoleWorkflowRepository
         self.authorization: TenantAuthorizationWorkflowRepository
         self.sessions: TenantSessionRevocationRepository
+        self.security_locks: SecurityWriteLockRepository
+        self.cache_outbox: AuthorizationCacheInvalidationOutboxRepository
         self.idempotency: SqlAlchemyIdempotencyRepository
         self.audit: AuditRepository
 
@@ -39,6 +47,8 @@ class SqlAlchemyTenantWorkflowUnitOfWork:
         self.roles = TenantRoleWorkflowRepository(self._session)
         self.authorization = TenantAuthorizationWorkflowRepository(self._session)
         self.sessions = TenantSessionRevocationRepository(self._session)
+        self.security_locks = SecurityWriteLockRepository(self._session)
+        self.cache_outbox = AuthorizationCacheInvalidationOutboxRepository(self._session)
         self.idempotency = SqlAlchemyIdempotencyRepository(self._session)
         self.audit = AuditRepository(self._session)
         return self

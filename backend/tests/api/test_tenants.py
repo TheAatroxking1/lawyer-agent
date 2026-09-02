@@ -18,6 +18,7 @@ from lawyer_agent.application.tenancy import (
     CreateTenantApplicationCommand,
     InvalidMemberCursor,
     InvalidStrongETag,
+    MemberCollectionScope,
     MemberCursor,
     MemberCursorCodec,
     PreconditionRequired,
@@ -152,6 +153,45 @@ def test_fingerprint_rejects_every_unclassified_request_field() -> None:
         )
 
 
+def test_fingerprint_business_paths_must_classify_exact_scalar_leaves() -> None:
+    service = IdempotencyService(key_hash_secret=b"k" * 32)
+
+    with pytest.raises(InvalidIdempotencyRequest, match="leaf"):
+        service.prepare(
+            IdempotencyRequest(
+                key="canonical-key-000003",
+                method="POST",
+                canonical_route="/api/v1/auth/register",
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "profile": {
+                            "name": "甲",
+                            "password": "synthetic-password-material",
+                        }
+                    },
+                    business_paths=frozenset({("profile",)}),
+                ),
+            )
+        )
+
+
+def test_fingerprint_nested_sequences_require_an_explicit_safe_schema() -> None:
+    service = IdempotencyService(key_hash_secret=b"k" * 32)
+
+    with pytest.raises(InvalidIdempotencyRequest, match="sequence"):
+        service.prepare(
+            IdempotencyRequest(
+                key="canonical-key-000004",
+                method="POST",
+                canonical_route="/api/v1/auth/register",
+                body=IdempotencyFingerprintPayload(
+                    values={"profiles": [{"name": "甲", "password": "raw"}]},
+                    business_paths=frozenset({("profiles",)}),
+                ),
+            )
+        )
+
+
 def test_task_7_commands_and_raw_idempotency_material_do_not_leak_via_repr() -> None:
     raw_key = "raw-idempotency-key-0001"
     raw_password = "-".join(("synthetic", "password", "material"))
@@ -224,23 +264,44 @@ def test_member_cursor_is_opaque_signed_and_bound_to_the_tenant() -> None:
     other_tenant_id = new_uuid7()
     membership_id = new_uuid7()
     created_at = datetime(2026, 9, 1, 8, 0, 0, 123456, tzinfo=UTC)
+    scope = MemberCollectionScope(tenant_wide=True)
 
     encoded = codec.encode(
         tenant_id=tenant_id,
+        collection_scope=scope,
         cursor=MemberCursor(created_at=created_at, membership_id=membership_id),
     )
 
     assert str(tenant_id) not in encoded
     assert str(membership_id) not in encoded
-    assert codec.decode(tenant_id=tenant_id, encoded=encoded) == MemberCursor(
+    assert codec.decode(
+        tenant_id=tenant_id, collection_scope=scope, encoded=encoded
+    ) == MemberCursor(
         created_at=created_at,
         membership_id=membership_id,
     )
     with pytest.raises(InvalidMemberCursor):
-        codec.decode(tenant_id=other_tenant_id, encoded=encoded)
+        codec.decode(
+            tenant_id=other_tenant_id,
+            collection_scope=scope,
+            encoded=encoded,
+        )
+    with pytest.raises(InvalidMemberCursor, match="scope"):
+        codec.decode(
+            tenant_id=tenant_id,
+            collection_scope=MemberCollectionScope(
+                tenant_wide=False,
+                department_ids=frozenset({new_uuid7()}),
+            ),
+            encoded=encoded,
+        )
     with pytest.raises(InvalidMemberCursor):
         replacement = "A" if encoded[-1] != "A" else "B"
-        codec.decode(tenant_id=tenant_id, encoded=encoded[:-1] + replacement)
+        codec.decode(
+            tenant_id=tenant_id,
+            collection_scope=scope,
+            encoded=encoded[:-1] + replacement,
+        )
 
 
 def test_tenant_application_layer_has_no_framework_persistence_or_cache_imports() -> None:

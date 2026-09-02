@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from types import TracebackType
@@ -25,6 +25,10 @@ from lawyer_agent.application.idempotency import (
     IdempotencyService,
 )
 from lawyer_agent.application.identity import AuditContext
+from lawyer_agent.application.security_locks import (
+    SecurityWriteLockRepositoryPort,
+    TenantSecurityWriteLockRequest,
+)
 from lawyer_agent.domain.authorization import (
     Action,
     PolicyEngine,
@@ -267,6 +271,33 @@ class MemberPage:
 
 
 @dataclass(frozen=True, slots=True)
+class MemberCollectionScope:
+    tenant_wide: bool
+    department_ids: frozenset[UUID] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tenant_wide, bool) or not isinstance(
+            self.department_ids, frozenset
+        ):
+            raise ValueError("member collection scope must be strongly typed")
+        if any(not is_uuid7(value) for value in self.department_ids):
+            raise ValueError("member collection scope contains an invalid department")
+        if self.tenant_wide == bool(self.department_ids):
+            raise ValueError("member collection scope must be tenant-wide or department-scoped")
+
+    @property
+    def cursor_fingerprint(self) -> str:
+        material = (
+            b"tenant-wide"
+            if self.tenant_wide
+            else b"departments:" + b",".join(
+                value.hex.encode("ascii") for value in sorted(self.department_ids, key=str)
+            )
+        )
+        return sha256(b"member-collection-scope:v1:" + material).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ActorSessionState:
     id: UUID
     user_id: UUID
@@ -299,6 +330,101 @@ class AuthorizationCacheInvalidationPort(Protocol):
         membership_id: UUID,
         authz_version: int,
     ) -> None: ...
+
+
+class AuthorizationCacheInvalidationStatus(StrEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationCacheInvalidationTask:
+    id: UUID
+    tenant_id: UUID
+    membership_id: UUID
+    authz_version: int
+    idempotency_record_id: UUID
+    status: AuthorizationCacheInvalidationStatus
+    attempt_count: int
+    available_at: datetime
+    processing_started_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.id, "outbox id"),
+            (self.tenant_id, "outbox tenant_id"),
+            (self.membership_id, "outbox membership_id"),
+            (self.idempotency_record_id, "outbox idempotency_record_id"),
+        ):
+            require_uuid7(value, field=name)
+        _require_positive_version(self.authz_version)
+        if not isinstance(self.status, AuthorizationCacheInvalidationStatus):
+            raise ValueError("outbox status must be strongly typed")
+        if (
+            isinstance(self.attempt_count, bool)
+            or not isinstance(self.attempt_count, int)
+            or not 0 <= self.attempt_count <= _MAX_SIGNED_INTEGER
+        ):
+            raise ValueError("outbox attempt_count is invalid")
+        _require_utc(self.available_at, field_name="outbox available_at")
+        if self.processing_started_at is not None:
+            _require_utc(
+                self.processing_started_at,
+                field_name="outbox processing_started_at",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class NewAuthorizationCacheInvalidation:
+    id: UUID
+    tenant_id: UUID
+    membership_id: UUID
+    authz_version: int
+    idempotency_record_id: UUID
+    available_at: datetime
+
+    def __post_init__(self) -> None:
+        AuthorizationCacheInvalidationTask(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            membership_id=self.membership_id,
+            authz_version=self.authz_version,
+            idempotency_record_id=self.idempotency_record_id,
+            status=AuthorizationCacheInvalidationStatus.PENDING,
+            attempt_count=0,
+            available_at=self.available_at,
+        )
+
+
+class AuthorizationCacheInvalidationOutboxPort(Protocol):
+    async def add(self, task: NewAuthorizationCacheInvalidation) -> None: ...
+
+    async def claim_batch(
+        self,
+        *,
+        now: datetime,
+        processing_expired_before: datetime,
+        limit: int,
+    ) -> tuple[AuthorizationCacheInvalidationTask, ...]: ...
+
+    async def mark_completed(self, *, task_id: UUID, now: datetime) -> None: ...
+
+    async def release_failed(
+        self,
+        *,
+        task_id: UUID,
+        available_at: datetime,
+        error_code: str,
+        now: datetime,
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationCacheDispatchResult:
+    claimed: int
+    completed: int
+    failed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +500,7 @@ class MembershipWorkflowRepositoryPort(Protocol):
         self,
         *,
         context: TenantContext,
+        collection_scope: MemberCollectionScope,
         after: MemberCursor | None,
         limit: int,
     ) -> tuple[MemberPageItem, ...]: ...
@@ -428,13 +555,6 @@ class TenantAuthorizationWorkflowRepositoryPort(Protocol):
 
 
 class TenantSessionRevocationRepositoryPort(Protocol):
-    async def lock_for_membership(
-        self,
-        *,
-        tenant_id: UUID,
-        membership_id: UUID,
-    ) -> None: ...
-
     async def revoke_for_membership(
         self,
         *,
@@ -455,6 +575,8 @@ class TenantWorkflowUnitOfWork(Protocol):
     roles: TenantRoleWorkflowRepositoryPort
     authorization: TenantAuthorizationWorkflowRepositoryPort
     sessions: TenantSessionRevocationRepositoryPort
+    security_locks: SecurityWriteLockRepositoryPort
+    cache_outbox: AuthorizationCacheInvalidationOutboxPort
     idempotency: IdempotencyRepositoryPort
     audit: TenantAuditRepositoryPort
 
@@ -606,6 +728,12 @@ class TenantService:
         normalized = normalize_tenant_name(command.name)
         now = self._now()
         async with self._uow_factory() as uow:
+            initial = await self._require_snapshot(uow, actor, for_update=False)
+            self._authorize(actor, initial, Action.TENANT_UPDATE)
+            if not await uow.security_locks.acquire_tenant_write(
+                _tenant_security_write_lock(actor)
+            ):
+                raise TenantResourceNotFound
             locked = await self._require_snapshot(uow, actor, for_update=True)
             self._authorize(actor, locked, Action.TENANT_UPDATE)
             reservation = await self._idempotency.reserve(
@@ -696,17 +824,19 @@ class TenantService:
             raise ValueError("member page query must be strongly typed")
         async with self._uow_factory() as uow:
             snapshot = await self._require_snapshot(uow, actor, for_update=False)
-            self._authorize(actor, snapshot, Action.MEMBERSHIP_READ)
+            collection_scope = self._authorize_member_collection(actor, snapshot)
             after = (
                 None
                 if query.cursor is None
                 else self._cursor_codec.decode(
                     tenant_id=actor.context.tenant_id,
+                    collection_scope=collection_scope,
                     encoded=query.cursor,
                 )
             )
             rows = await uow.memberships.list_page(
                 context=snapshot.context,
+                collection_scope=collection_scope,
                 after=after,
                 limit=query.limit + 1,
             )
@@ -717,6 +847,7 @@ class TenantService:
                 last = items[-1]
                 next_cursor = self._cursor_codec.encode(
                     tenant_id=actor.context.tenant_id,
+                    collection_scope=collection_scope,
                     cursor=MemberCursor(last.created_at, last.membership.id),
                 )
             return MemberPage(items=items, next_cursor=next_cursor)
@@ -787,6 +918,7 @@ class TenantService:
         now = self._now()
         desired_role_ids = None if role_ids is None else tuple(sorted(role_ids, key=str))
         old_authz_version: int | None = None
+        cache_outbox_task_id: UUID | None = None
         changed = False
         result: MemberMutationResult
         async with self._uow_factory() as uow:
@@ -804,10 +936,10 @@ class TenantService:
                 self._authorize_member_action(
                     actor, initial, Action.ROLE_ASSIGN, initial_target
                 )
-            await uow.sessions.lock_for_membership(
-                tenant_id=actor.context.tenant_id,
-                membership_id=membership_id,
-            )
+            if not await uow.security_locks.acquire_tenant_write(
+                _tenant_security_write_lock(actor, target_membership_ids=(membership_id,))
+            ):
+                raise TenantResourceNotFound
             locked = await self._require_snapshot(
                 uow,
                 actor,
@@ -868,13 +1000,6 @@ class TenantService:
                     membership_id=membership_id,
                 )
                 replay_result = MemberMutationResult(current, replay_roles, True)
-                if reservation.replay.cache_authz_version is not None:
-                    await self._invalidate_authorization_cache(
-                        tenant_id=actor.context.tenant_id,
-                        membership_id=membership_id,
-                        authz_version=reservation.replay.cache_authz_version,
-                        result=replay_result,
-                    )
                 return replay_result
             if current.version != expected_version:
                 raise VersionConflict
@@ -981,16 +1106,36 @@ class TenantService:
                 ),
                 now=now,
             )
+            if changed and old_authz_version is not None:
+                cache_outbox_task_id = new_uuid7()
+                await uow.cache_outbox.add(
+                    NewAuthorizationCacheInvalidation(
+                        id=cache_outbox_task_id,
+                        tenant_id=actor.context.tenant_id,
+                        membership_id=membership_id,
+                        authz_version=old_authz_version,
+                        idempotency_record_id=reservation.record_id,
+                        available_at=now,
+                    )
+                )
             await uow.tenants.flush()
             result = MemberMutationResult(updated, desired_roles, False)
 
         if changed and old_authz_version is not None:
-            await self._invalidate_authorization_cache(
-                tenant_id=actor.context.tenant_id,
-                membership_id=membership_id,
-                authz_version=old_authz_version,
-                result=result,
-            )
+            try:
+                await self._authorization_cache.invalidate(
+                    tenant_id=actor.context.tenant_id,
+                    membership_id=membership_id,
+                    authz_version=old_authz_version,
+                )
+            except Exception as exc:
+                raise PostCommitCacheInvalidationError(result) from exc
+            assert cache_outbox_task_id is not None
+            async with self._uow_factory() as completion_uow:
+                await completion_uow.cache_outbox.mark_completed(
+                    task_id=cache_outbox_task_id,
+                    now=self._now(),
+                )
         return result
 
     async def _require_snapshot(
@@ -1108,22 +1253,49 @@ class TenantService:
         if not decision.allowed:
             raise TenantAuthorizationDenied(decision.reason_code)
 
-    async def _invalidate_authorization_cache(
+    def _authorize_member_collection(
         self,
-        *,
-        tenant_id: UUID,
-        membership_id: UUID,
-        authz_version: int,
-        result: MemberMutationResult,
-    ) -> None:
-        try:
-            await self._authorization_cache.invalidate(
-                tenant_id=tenant_id,
-                membership_id=membership_id,
-                authz_version=authz_version,
-            )
-        except Exception as exc:
-            raise PostCommitCacheInvalidationError(result) from exc
+        actor: TenantActor,
+        snapshot: TenantAuthorizationSnapshot,
+    ) -> MemberCollectionScope:
+        scope = snapshot.context.scope
+        if scope.allow_tenant_wide:
+            self._authorize(actor, snapshot, Action.MEMBERSHIP_READ)
+            return MemberCollectionScope(tenant_wide=True)
+        department_ids = scope.department_ids
+        if "department_admin" in snapshot.role_codes:
+            actor_department = snapshot.actor_membership.department_id
+            if actor_department is None or actor_department not in department_ids:
+                raise TenantAuthorizationDenied("resource_scope_denied")
+            department_ids = frozenset({actor_department})
+        if not department_ids:
+            raise TenantAuthorizationDenied("resource_scope_denied")
+        first_department = min(department_ids, key=str)
+        principal = replace(
+            actor.principal,
+            user_status=snapshot.user_status,
+            auth_version=snapshot.user_auth_version,
+            permissions=snapshot.permissions,
+            role_codes=snapshot.role_codes,
+        )
+        decision = self._policy.decide(
+            principal,
+            snapshot.context,
+            Action.MEMBERSHIP_READ,
+            ResourceAttributes(
+                tenant_id=snapshot.tenant.id,
+                state=ResourceState.ACTIVE,
+                access_paths=frozenset({ResourceAccessPath.DEPARTMENT}),
+                department_id=first_department,
+            ),
+            self._now(),
+        )
+        if not decision.allowed:
+            raise TenantAuthorizationDenied(decision.reason_code)
+        return MemberCollectionScope(
+            tenant_wide=False,
+            department_ids=department_ids,
+        )
 
     async def _reload_application_result(
         self,
@@ -1152,6 +1324,74 @@ class TenantService:
         value = self._clock()
         if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
             raise ValueError("tenant service clock must return a UTC-aware datetime")
+        return value.astimezone(UTC)
+
+
+class AuthorizationCacheInvalidationDispatcher:
+    def __init__(
+        self,
+        *,
+        uow_factory: Callable[[], TenantWorkflowUnitOfWork],
+        authorization_cache: AuthorizationCacheInvalidationPort,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        processing_lease: timedelta = timedelta(minutes=5),
+    ) -> None:
+        if (
+            not callable(uow_factory)
+            or authorization_cache is None
+            or not callable(getattr(authorization_cache, "invalidate", None))
+            or not isinstance(processing_lease, timedelta)
+            or processing_lease <= timedelta(0)
+        ):
+            raise ValueError("cache invalidation dispatcher dependencies are invalid")
+        self._uow_factory = uow_factory
+        self._authorization_cache = authorization_cache
+        self._clock = clock
+        self._processing_lease = processing_lease
+
+    async def run_once(self, *, limit: int = 50) -> AuthorizationCacheDispatchResult:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("cache invalidation batch limit must be between 1 and 100")
+        now = self._now()
+        async with self._uow_factory() as claim_uow:
+            tasks = await claim_uow.cache_outbox.claim_batch(
+                now=now,
+                processing_expired_before=now - self._processing_lease,
+                limit=limit,
+            )
+        completed = 0
+        failed = 0
+        for task in tasks:
+            try:
+                await self._authorization_cache.invalidate(
+                    tenant_id=task.tenant_id,
+                    membership_id=task.membership_id,
+                    authz_version=task.authz_version,
+                )
+            except Exception:
+                failed += 1
+                retry_at = now + timedelta(
+                    seconds=min(300, 2 ** min(task.attempt_count, 8))
+                )
+                async with self._uow_factory() as failure_uow:
+                    await failure_uow.cache_outbox.release_failed(
+                        task_id=task.id,
+                        available_at=retry_at,
+                        error_code="cache_unavailable",
+                        now=now,
+                    )
+            else:
+                completed += 1
+                async with self._uow_factory() as completion_uow:
+                    await completion_uow.cache_outbox.mark_completed(
+                        task_id=task.id,
+                        now=now,
+                    )
+        return AuthorizationCacheDispatchResult(len(tasks), completed, failed)
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        _require_utc(value, field_name="cache dispatcher clock")
         return value.astimezone(UTC)
 
 
@@ -1191,6 +1431,23 @@ def _membership_scope(actor: TenantActor) -> IdempotencyScope:
         IdempotencyScopeType.MEMBERSHIP,
         actor.context.membership_id,
         tenant_id=actor.context.tenant_id,
+    )
+
+
+def _tenant_security_write_lock(
+    actor: TenantActor,
+    *,
+    target_membership_ids: tuple[UUID, ...] = (),
+) -> TenantSecurityWriteLockRequest:
+    membership_id = actor.context.membership_id
+    if membership_id is None:
+        raise TenantAuthorizationDenied("membership_inactive")
+    return TenantSecurityWriteLockRequest(
+        tenant_id=actor.context.tenant_id,
+        actor_user_id=actor.principal.user_id,
+        actor_session_id=actor.principal.session_id,
+        actor_membership_id=membership_id,
+        target_membership_ids=tuple(sorted(set(target_membership_ids), key=str)),
     )
 
 
@@ -1346,15 +1603,24 @@ class MemberCursorCodec:
             raise ValueError("member cursor secret must contain at least 32 bytes")
         self._secret = secret
 
-    def encode(self, *, tenant_id: UUID, cursor: MemberCursor) -> str:
+    def encode(
+        self,
+        *,
+        tenant_id: UUID,
+        collection_scope: MemberCollectionScope,
+        cursor: MemberCursor,
+    ) -> str:
         if not is_uuid7(tenant_id):
             raise InvalidMemberCursor("member cursor tenant_id must be UUIDv7")
         if not isinstance(cursor, MemberCursor):
             raise InvalidMemberCursor("member cursor must be strongly typed")
+        if not isinstance(collection_scope, MemberCollectionScope):
+            raise InvalidMemberCursor("member cursor scope must be strongly typed")
         payload = json.dumps(
             {
                 "v": _CURSOR_SCHEMA_VERSION,
                 "t": tenant_id.hex,
+                "s": collection_scope.cursor_fingerprint,
                 "c": cursor.created_at.astimezone(UTC).isoformat(timespec="microseconds"),
                 "i": cursor.membership_id.hex,
             },
@@ -1365,7 +1631,13 @@ class MemberCursorCodec:
         signature = hmac.digest(self._secret, b"member-cursor:v1:" + payload, sha256)
         return _b64url_encode(payload + signature)
 
-    def decode(self, *, tenant_id: UUID, encoded: str) -> MemberCursor:
+    def decode(
+        self,
+        *,
+        tenant_id: UUID,
+        collection_scope: MemberCollectionScope,
+        encoded: str,
+    ) -> MemberCursor:
         if not is_uuid7(tenant_id) or not isinstance(encoded, str) or not encoded:
             raise InvalidMemberCursor("member cursor is invalid")
         try:
@@ -1377,7 +1649,7 @@ class MemberCursorCodec:
             if not hmac.compare_digest(signature, expected):
                 raise InvalidMemberCursor("member cursor is invalid")
             decoded = json.loads(payload)
-            if not isinstance(decoded, dict) or set(decoded) != {"v", "t", "c", "i"}:
+            if not isinstance(decoded, dict) or set(decoded) != {"v", "t", "s", "c", "i"}:
                 raise InvalidMemberCursor("member cursor is invalid")
             if type(decoded["v"]) is not int or decoded["v"] != _CURSOR_SCHEMA_VERSION:
                 raise InvalidMemberCursor("member cursor is invalid")
@@ -1385,6 +1657,14 @@ class MemberCursorCodec:
                 decoded["t"], tenant_id.hex
             ):
                 raise InvalidMemberCursor("member cursor belongs to another tenant")
+            if (
+                not isinstance(collection_scope, MemberCollectionScope)
+                or not isinstance(decoded["s"], str)
+                or not hmac.compare_digest(
+                    decoded["s"], collection_scope.cursor_fingerprint
+                )
+            ):
+                raise InvalidMemberCursor("member cursor belongs to another scope")
             created_at = datetime.fromisoformat(decoded["c"])
             membership_id = UUID(hex=decoded["i"])
             return MemberCursor(created_at=created_at, membership_id=membership_id)
@@ -1410,3 +1690,12 @@ def _b64url_decode(value: str) -> bytes:
         raise InvalidMemberCursor("member cursor is invalid")
     padding = "=" * (-len(value) % 4)
     return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+
+
+def _require_utc(value: object, *, field_name: str) -> None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != UTC.utcoffset(value)
+    ):
+        raise ValueError(f"{field_name} must be UTC-aware")

@@ -13,7 +13,7 @@ from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.engine import URL
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from alembic import command
@@ -30,6 +30,7 @@ from lawyer_agent.application.idempotency import (
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.sessions import SessionService, SwitchTenantCommand
 from lawyer_agent.application.tenancy import (
+    AuthorizationCacheInvalidationDispatcher,
     CreateTenantApplicationCommand,
     MemberPageQuery,
     MembershipMutationDenied,
@@ -52,9 +53,11 @@ from lawyer_agent.domain.authorization import (
     PrincipalAudience,
 )
 from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.sessions import RevocationReason
 from lawyer_agent.domain.tenancy import MembershipStatus, TenantContext, TenantStatus
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
+    AuthorizationCacheInvalidationOutboxModel,
     AuthSessionModel,
     DepartmentModel,
     IdempotencyRecordModel,
@@ -117,6 +120,7 @@ async def database(
     finally:
         async with factory.begin() as session:
             await session.execute(delete(AuditEventModel))
+            await session.execute(delete(AuthorizationCacheInvalidationOutboxModel))
             await session.execute(delete(IdempotencyRecordModel))
             await session.execute(delete(RefreshTokenRecordModel))
             await session.execute(delete(AuthSessionModel))
@@ -209,6 +213,8 @@ class _FailingRoleCloneUnitOfWork:
         self.roles = _FailingRoleRepository()
         self.authorization = self._inner.authorization
         self.sessions = self._inner.sessions
+        self.security_locks = self._inner.security_locks
+        self.cache_outbox = self._inner.cache_outbox
         self.idempotency = self._inner.idempotency
         self.audit = self._inner.audit
         return self
@@ -271,6 +277,7 @@ class _PauseAfterRefreshLockUow:
         self.sessions = _PauseAfterRefreshLockRepository(
             self._inner.sessions, self._locked, self._release
         )
+        self.security_locks = self._inner.security_locks
         self.audit = self._inner.audit
         return self
 
@@ -283,17 +290,19 @@ class _PauseAfterRefreshLockUow:
         await self._inner.__aexit__(exc_type, exc_value, traceback)
 
 
-class _PauseBeforeLockedAuthorizationRepository:
+class _PauseBeforeSecurityLockRepository:
     def __init__(self, inner: object, reached: asyncio.Event, release: asyncio.Event) -> None:
         self._inner = inner
         self._reached = reached
         self._release = release
 
-    async def load_snapshot(self, **kwargs: object) -> object:
-        if kwargs.get("for_update") is True:
-            self._reached.set()
-            await self._release.wait()
-        return await self._inner.load_snapshot(**kwargs)  # type: ignore[attr-defined,no-any-return]
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def acquire_tenant_write(self, request: object) -> object:
+        self._reached.set()
+        await self._release.wait()
+        return await self._inner.acquire_tenant_write(request)  # type: ignore[attr-defined,no-any-return]
 
 
 class _PauseBeforeLockedAuthorizationUow:
@@ -312,10 +321,12 @@ class _PauseBeforeLockedAuthorizationUow:
         self.tenants = self._inner.tenants
         self.memberships = self._inner.memberships
         self.roles = self._inner.roles
-        self.authorization = _PauseBeforeLockedAuthorizationRepository(
-            self._inner.authorization, self._reached, self._release
-        )
+        self.authorization = self._inner.authorization
         self.sessions = self._inner.sessions
+        self.security_locks = _PauseBeforeSecurityLockRepository(
+            self._inner.security_locks, self._reached, self._release
+        )
+        self.cache_outbox = self._inner.cache_outbox
         self.idempotency = self._inner.idempotency
         self.audit = self._inner.audit
         return self
@@ -1178,6 +1189,7 @@ async def test_concurrent_tenant_updates_lock_actor_before_idempotency_and_retur
         return_exceptions=True,
     )
 
+    assert not any(isinstance(value, OperationalError) for value in outcomes), outcomes
     assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
     assert sum(isinstance(value, VersionConflict) for value in outcomes) == 1, outcomes
 
@@ -1248,10 +1260,7 @@ async def test_member_role_change_increments_versions_revokes_sessions_and_inval
         ),
     )
     assert replay.replayed and replay.membership.version == 2
-    assert cache.invalidations == [
-        (created.tenant.id, target_id, 1),
-        (created.tenant.id, target_id, 1),
-    ]
+    assert cache.invalidations == [(created.tenant.id, target_id, 1)]
 
 
 @pytest.mark.asyncio
@@ -1332,8 +1341,12 @@ async def test_cache_invalidation_failure_is_explicit_after_committed_fact(
         await service.revoke_member(actor, command)
     assert caught.value.committed is True
     cache.fail = False
-    recovered = await service.revoke_member(actor, command)
-    assert recovered.replayed
+    dispatched = await AuthorizationCacheInvalidationDispatcher(
+        uow_factory=lambda: SqlAlchemyTenantWorkflowUnitOfWork(database),
+        authorization_cache=cache,
+        clock=lambda: NOW + timedelta(minutes=1),
+    ).run_once(limit=10)
+    assert dispatched.completed == 1
     assert cache.invalidations == [
         (created.tenant.id, target, 1),
         (created.tenant.id, target, 1),
@@ -1347,6 +1360,226 @@ async def test_cache_invalidation_failure_is_explicit_after_committed_fact(
                 AuditEventModel.action == "membership.revoke",
             )
         ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["suspend", "revoke", "remove_owner"])
+async def test_durable_cache_outbox_recovers_self_mutation_without_actor_retry(
+    database: async_sessionmaker[AsyncSession],
+    mutation: str,
+) -> None:
+    owner = await _add_active_user(database)
+    cache = _RecordingAuthorizationCache(fail=True)
+    service = _tenant_service(database, cache=cache)
+    created = await service.create_application(_create_command(owner))
+    await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="owner",
+        role_codes=("tenant_owner",),
+    )
+    actor = await _actor_with_session(database, created, owner)
+    if mutation == "revoke":
+        operation = service.revoke_member(
+            actor,
+            RevokeMemberCommand(
+                membership_id=created.owner_membership.id,
+                expected_version=1,
+                idempotency_key="self-revoke-outbox-0001",
+                audit_context=_audit_context(),
+            ),
+        )
+        expected_status = "revoked"
+        expected_action = "membership.revoke"
+    else:
+        operation = service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=created.owner_membership.id,
+                expected_version=1,
+                idempotency_key=f"self-{mutation}-outbox-0001",
+                audit_context=_audit_context(),
+                status=(MembershipStatus.SUSPENDED if mutation == "suspend" else None),
+                role_ids=(() if mutation == "remove_owner" else None),
+            ),
+        )
+        expected_status = "suspended" if mutation == "suspend" else "active"
+        expected_action = "membership.update"
+
+    with pytest.raises(PostCommitCacheInvalidationError) as committed:
+        await operation
+    assert committed.value.committed is True
+    async with database() as session:
+        pending = await session.scalar(select(AuthorizationCacheInvalidationOutboxModel))
+        membership = await session.get(TenantMembershipModel, created.owner_membership.id)
+        auth_session = await session.get(AuthSessionModel, actor.principal.session_id)
+        assert pending is not None and pending.status == "pending"
+        assert pending.tenant_id == created.tenant.id
+        assert pending.membership_id == created.owner_membership.id
+        assert pending.authz_version == 1
+        assert membership is not None and membership.status == expected_status
+        assert membership.version == 2 and membership.authz_version == 2
+        assert auth_session is not None and auth_session.revoked_at is not None
+        committed_session_version = auth_session.version
+
+    cache.fail = False
+    dispatcher = AuthorizationCacheInvalidationDispatcher(
+        uow_factory=lambda: SqlAlchemyTenantWorkflowUnitOfWork(database),
+        authorization_cache=cache,
+        clock=lambda: NOW + timedelta(minutes=1),
+    )
+    dispatched = await dispatcher.run_once(limit=10)
+    assert dispatched.completed == 1 and dispatched.failed == 0
+    assert (await dispatcher.run_once(limit=10)).claimed == 0
+    assert cache.invalidations == [
+        (created.tenant.id, created.owner_membership.id, 1),
+        (created.tenant.id, created.owner_membership.id, 1),
+    ]
+    async with database() as session:
+        completed = await session.scalar(select(AuthorizationCacheInvalidationOutboxModel))
+        auth_session = await session.get(AuthSessionModel, actor.principal.session_id)
+        assert completed is not None and completed.status == "completed"
+        assert completed.attempt_count == 1 and completed.completed_at is not None
+        assert auth_session is not None and auth_session.version == committed_session_version
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.tenant_id == created.tenant.id,
+                AuditEventModel.action == expected_action,
+            )
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_outbox_recovers_expired_processing_claim_and_uses_skip_locked(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    cache = _RecordingAuthorizationCache(fail=True)
+    service = _tenant_service(database, cache=cache)
+    created = await service.create_application(_create_command(owner))
+    targets = [
+        (await _add_internal_member_with_session(database, tenant_id=created.tenant.id))[1]
+        for _ in range(2)
+    ]
+    for index, target in enumerate(targets):
+        with pytest.raises(PostCommitCacheInvalidationError):
+            await service.update_member(
+                await _actor_with_session(database, created, owner),
+                UpdateMemberCommand(
+                    membership_id=target,  # type: ignore[arg-type]
+                    expected_version=1,
+                    idempotency_key=f"outbox-crash-recovery-{index:02d}",
+                    audit_context=_audit_context(),
+                    status=MembershipStatus.SUSPENDED,
+                ),
+            )
+    async with database.begin() as session:
+        first = await session.scalar(
+            select(AuthorizationCacheInvalidationOutboxModel)
+            .order_by(AuthorizationCacheInvalidationOutboxModel.id)
+            .limit(1)
+        )
+        assert first is not None
+        first.status = "processing"
+        first.processing_started_at = (NOW - timedelta(minutes=10)).replace(tzinfo=None)
+        first.attempt_count = 1
+
+    cache.fail = False
+    dispatchers = [
+        AuthorizationCacheInvalidationDispatcher(
+            uow_factory=lambda: SqlAlchemyTenantWorkflowUnitOfWork(database),
+            authorization_cache=cache,
+            clock=lambda: NOW + timedelta(minutes=1),
+        )
+        for _ in range(2)
+    ]
+    outcomes = await asyncio.gather(
+        *(dispatcher.run_once(limit=1) for dispatcher in dispatchers),
+        return_exceptions=True,
+    )
+    assert not any(isinstance(value, BaseException) for value in outcomes), outcomes
+    concurrent_completed = sum(
+        value.completed for value in outcomes  # type: ignore[union-attr]
+    )
+    follow_up = await dispatchers[0].run_once(limit=10)
+    assert concurrent_completed + follow_up.completed == 2
+    async with database() as session:
+        rows = (
+            await session.scalars(select(AuthorizationCacheInvalidationOutboxModel))
+        ).all()
+        assert len(rows) == 2 and all(row.status == "completed" for row in rows)
+        assert sorted(row.attempt_count for row in rows) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_cache_outbox_rejects_cross_tenant_membership_and_idempotency_references(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner_a = await _add_active_user(database)
+    tenant_a = await _tenant_service(database).create_application(_create_command(owner_a))
+    _, member_a = await _add_member(
+        database, tenant_id=tenant_a.tenant.id, member_type="internal"
+    )
+    owner_b = await _add_active_user(database)
+    tenant_b = await _tenant_service(database).create_application(
+        CreateTenantApplicationCommand(
+            actor_user_id=owner_b,  # type: ignore[arg-type]
+            name="Outbox 租户乙",
+            tenant_type=TenantType.ENTERPRISE,
+            idempotency_key="outbox-cross-tenant-create-b",
+            audit_context=_audit_context(),
+        )
+    )
+    _, member_b = await _add_member(
+        database, tenant_id=tenant_b.tenant.id, member_type="internal"
+    )
+    await _tenant_service(database).update_member(
+        await _actor_with_session(database, tenant_b, owner_b),
+        UpdateMemberCommand(
+            membership_id=member_b,  # type: ignore[arg-type]
+            expected_version=1,
+            idempotency_key="outbox-cross-tenant-mutation-b",
+            audit_context=_audit_context(),
+            status=MembershipStatus.SUSPENDED,
+        ),
+    )
+    async with database() as session:
+        tenant_b_outbox = await session.scalar(
+            select(AuthorizationCacheInvalidationOutboxModel).where(
+                AuthorizationCacheInvalidationOutboxModel.tenant_id == tenant_b.tenant.id
+            )
+        )
+        assert tenant_b_outbox is not None
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                session.add(
+                    AuthorizationCacheInvalidationOutboxModel(
+                        id=new_uuid7(),
+                        tenant_id=tenant_a.tenant.id,
+                        membership_id=member_a,
+                        authz_version=1,
+                        idempotency_record_id=tenant_b_outbox.idempotency_record_id,
+                        status="pending",
+                        attempt_count=0,
+                        available_at=NOW.replace(tzinfo=None),
+                    )
+                )
+                await session.flush()
+        with pytest.raises(IntegrityError):
+            async with session.begin_nested():
+                session.add(
+                    AuthorizationCacheInvalidationOutboxModel(
+                        id=new_uuid7(),
+                        tenant_id=tenant_a.tenant.id,
+                        membership_id=member_b,
+                        authz_version=1,
+                        idempotency_record_id=tenant_b_outbox.idempotency_record_id,
+                        status="pending",
+                        attempt_count=0,
+                        available_at=NOW.replace(tzinfo=None),
+                    )
+                )
+                await session.flush()
 
 
 @pytest.mark.asyncio
@@ -1393,6 +1626,117 @@ async def test_member_cursor_pagination_is_stable_bounded_and_tenant_bound(
             await _actor_with_session(database, other, other_owner),
             MemberPageQuery(limit=1, cursor=first_page.next_cursor),
         )
+
+
+@pytest.mark.asyncio
+async def test_member_list_enforces_authoritative_department_scope_and_binds_cursor(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    department_a, department_b = new_uuid7(), new_uuid7()
+    async with database.begin() as session:
+        session.add_all(
+            [
+                DepartmentModel(
+                    id=department_a,
+                    tenant_id=created.tenant.id,
+                    name="部门甲",
+                    status="active",
+                ),
+                DepartmentModel(
+                    id=department_b,
+                    tenant_id=created.tenant.id,
+                    name="部门乙",
+                    status="active",
+                ),
+            ]
+        )
+    admin_user, admin_membership = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        department_id=department_a,
+        role_codes=("department_admin",),
+    )
+    _, member_a = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        department_id=department_a,
+    )
+    _, member_b = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        department_id=department_b,
+    )
+    department_actor = await _actor_for_membership(
+        database,
+        created,
+        user_id=admin_user,
+        membership_id=admin_membership,
+        department_id=department_a,
+        scope=AuthorizationScope(department_ids=frozenset({department_a})),
+    )
+
+    first_page = await service.list_members(
+        department_actor,
+        MemberPageQuery(limit=1),
+    )
+    assert len(first_page.items) == 1
+    assert first_page.items[0].membership.department_id == department_a
+    assert first_page.next_cursor is not None
+    remaining = await service.list_members(
+        department_actor,
+        MemberPageQuery(limit=10, cursor=first_page.next_cursor),
+    )
+    assert {
+        first_page.items[0].membership.id,
+        *(item.membership.id for item in remaining.items),
+    } == {admin_membership, member_a}
+    assert member_b not in {item.membership.id for item in remaining.items}
+
+    changed_scope_actor = TenantActor(
+        principal=department_actor.principal,
+        context=replace(
+            department_actor.context,
+            scope=AuthorizationScope(department_ids=frozenset({department_b})),
+        ),
+    )
+    with pytest.raises(TenantAuthorizationDenied) as denied:
+        await service.list_members(
+            changed_scope_actor,
+            MemberPageQuery(limit=10, cursor=first_page.next_cursor),
+        )
+    assert denied.value.reason_code == "resource_scope_denied"
+
+    owner_actor = await _actor_with_session(database, created, owner)
+    owner_first_page = await service.list_members(
+        owner_actor,
+        MemberPageQuery(limit=1),
+    )
+    assert owner_first_page.next_cursor is not None
+    department_limited_owner = TenantActor(
+        principal=owner_actor.principal,
+        context=replace(
+            owner_actor.context,
+            scope=AuthorizationScope(department_ids=frozenset({department_a})),
+        ),
+    )
+    with pytest.raises(Exception, match="scope"):
+        await service.list_members(
+            department_limited_owner,
+            MemberPageQuery(limit=10, cursor=owner_first_page.next_cursor),
+        )
+    owner_page = await service.list_members(owner_actor, MemberPageQuery(limit=10))
+    assert {item.membership.id for item in owner_page.items} >= {
+        created.owner_membership.id,
+        admin_membership,
+        member_a,
+        member_b,
+    }
 
 
 @pytest.mark.asyncio
@@ -2014,6 +2358,7 @@ async def test_refresh_and_member_change_share_refresh_then_session_lock_order_w
         clock=lambda: NOW,
         validation_cache=None,
     )
+    owner_actor = await _actor_with_session(database, created, owner)
     mutation_sql_started = asyncio.Event()
     engine = database.kw["bind"]
 
@@ -2029,6 +2374,7 @@ async def test_refresh_and_member_change_share_refresh_then_session_lock_order_w
         normalized = " ".join(statement.casefold().split())
         if (
             normalized.startswith("update auth_sessions")
+            or ("from tenants" in normalized and "for update" in normalized)
             or (
                 "from refresh_token_records" in normalized
                 and "for update" in normalized
@@ -2044,7 +2390,7 @@ async def test_refresh_and_member_change_share_refresh_then_session_lock_order_w
     try:
         mutation_task = asyncio.create_task(
             tenant_service.update_member(
-                await _actor_with_session(database, created, owner),
+                owner_actor,
                 UpdateMemberCommand(
                     membership_id=target_membership,  # type: ignore[arg-type]
                     status=MembershipStatus.SUSPENDED,
@@ -2077,5 +2423,118 @@ async def test_refresh_and_member_change_share_refresh_then_session_lock_order_w
             )
         ).all()
         assert membership is not None and membership.status == "suspended"
+        assert auth_session is not None and auth_session.revoked_at is not None
+        assert refresh_rows and all(row.revoked_at is not None for row in refresh_rows)
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_explicit_revoke_use_refresh_then_session_lock_order(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    created = await _tenant_service(database).create_application(_create_command(owner))
+    target_user, target_membership = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    async with database.begin() as session:
+        await session.execute(
+            update(TenantModel)
+            .where(TenantModel.id == created.tenant.id)
+            .values(status="active", review_status="approved")
+        )
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-explicit-revoke-key",
+        signing_keys={"task7-explicit-revoke-key": private_key},
+        verification_keys={"task7-explicit-revoke-key": private_key.public_key()},
+    )
+    sessions = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"q" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    account = await sessions.start(
+        user_id=target_user,  # type: ignore[arg-type]
+        audit_context=_audit_context(),
+    )
+    tenant_session = await sessions.switch_tenant(
+        SwitchTenantCommand(
+            account.session_id,
+            created.tenant.id,
+            target_membership,  # type: ignore[arg-type]
+        ),
+        audit_context=_audit_context(),
+    )
+    refresh_locked, release_refresh = asyncio.Event(), asyncio.Event()
+    paused_refresh = SessionService(
+        uow_factory=lambda: _PauseAfterRefreshLockUow(
+            database, refresh_locked, release_refresh
+        ),  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"q" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    revoke_lock_started = asyncio.Event()
+    engine = database.kw["bind"]
+
+    def observe_revoke_lock(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        normalized = " ".join(statement.casefold().split())
+        if (
+            normalized.startswith("update refresh_token_records")
+            or (
+                "from refresh_token_records" in normalized
+                and "for update" in normalized
+                and "session_id" in normalized
+            )
+        ):
+            revoke_lock_started.set()
+
+    refresh_task = asyncio.create_task(
+        paused_refresh.refresh(tenant_session.refresh_token, audit_context=_audit_context())
+    )
+    await asyncio.wait_for(refresh_locked.wait(), timeout=5)
+    event.listen(engine.sync_engine, "before_cursor_execute", observe_revoke_lock)
+    try:
+        revoke_task = asyncio.create_task(
+            sessions.revoke(
+                tenant_session.session_id,
+                    reason=RevocationReason.ADMIN_REVOKED,
+                audit_context=_audit_context(),
+            )
+        )
+        await asyncio.wait_for(revoke_lock_started.wait(), timeout=5)
+        release_refresh.set()
+        refresh_outcome, revoke_outcome = await asyncio.wait_for(
+            asyncio.gather(refresh_task, revoke_task, return_exceptions=True),
+            timeout=10,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe_revoke_lock)
+        release_refresh.set()
+    assert not isinstance(refresh_outcome, OperationalError), refresh_outcome
+    assert not isinstance(revoke_outcome, OperationalError), revoke_outcome
+    assert not isinstance(refresh_outcome, BaseException), refresh_outcome
+    assert not isinstance(revoke_outcome, BaseException), revoke_outcome
+    async with database() as session:
+        auth_session = await session.get(AuthSessionModel, tenant_session.session_id)
+        refresh_rows = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.session_id == tenant_session.session_id
+                )
+            )
+        ).all()
         assert auth_session is not None and auth_session.revoked_at is not None
         assert refresh_rows and all(row.revoked_at is not None for row in refresh_rows)

@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from uuid import UUID
+
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from lawyer_agent.application.security_locks import (
+    SessionSecurityWriteLockRequest,
+    TenantSecurityWriteLockRequest,
+)
+from lawyer_agent.domain.common import require_uuid7
+from lawyer_agent.infrastructure.persistence.models import (
+    AuthSessionModel,
+    RefreshTokenRecordModel,
+    TenantMembershipModel,
+    TenantModel,
+    TenantRoleModel,
+    UserModel,
+)
+
+
+class SecurityWriteLockRepository:
+    """Acquire security-sensitive MySQL rows in one global order.
+
+    Tenant-scoped writes are serialized by Tenant first, then lock Refresh,
+    Session, User, Membership and Role rows in stable UUID order. Standalone
+    Session revocation uses the shared Refresh-before-Session suffix.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def acquire_tenant_gate(self, tenant_id: UUID) -> bool:
+        require_uuid7(tenant_id, field="tenant security gate tenant_id")
+        return (
+            await self._session.scalar(
+                select(TenantModel.id)
+                .where(TenantModel.id == tenant_id)
+                .with_for_update()
+            )
+            is not None
+        )
+
+    async def acquire_tenant_write(self, request: TenantSecurityWriteLockRequest) -> bool:
+        if not isinstance(request, TenantSecurityWriteLockRequest):
+            raise ValueError("tenant security lock request must be strongly typed")
+        if not await self.acquire_tenant_gate(request.tenant_id):
+            return False
+        membership_ids = tuple(
+            sorted(
+                {request.actor_membership_id, *request.target_membership_ids},
+                key=str,
+            )
+        )
+        await self._session.execute(
+            select(RefreshTokenRecordModel.id)
+            .where(
+                RefreshTokenRecordModel.tenant_id == request.tenant_id,
+                RefreshTokenRecordModel.membership_id.in_(membership_ids),
+            )
+            .order_by(
+                RefreshTokenRecordModel.family_id,
+                RefreshTokenRecordModel.id,
+            )
+            .with_for_update()
+        )
+        await self._session.execute(
+            select(AuthSessionModel.id)
+            .where(
+                AuthSessionModel.tenant_id == request.tenant_id,
+                or_(
+                    AuthSessionModel.id == request.actor_session_id,
+                    AuthSessionModel.membership_id.in_(membership_ids),
+                ),
+            )
+            .order_by(AuthSessionModel.id)
+            .with_for_update()
+        )
+        target_user_ids = tuple(
+            sorted(
+                set(
+                    (
+                        await self._session.scalars(
+                            select(TenantMembershipModel.user_id).where(
+                                TenantMembershipModel.tenant_id == request.tenant_id,
+                                TenantMembershipModel.id.in_(membership_ids),
+                            )
+                        )
+                    ).all()
+                )
+                | {request.actor_user_id},
+                key=str,
+            )
+        )
+        await self._session.execute(
+            select(UserModel.id)
+            .where(UserModel.id.in_(target_user_ids))
+            .order_by(UserModel.id)
+            .with_for_update()
+        )
+        await self._session.execute(
+            select(TenantMembershipModel.id)
+            .where(
+                TenantMembershipModel.tenant_id == request.tenant_id,
+                TenantMembershipModel.id.in_(membership_ids),
+            )
+            .order_by(TenantMembershipModel.id)
+            .with_for_update()
+        )
+        await self._session.execute(
+            select(TenantRoleModel.id)
+            .where(TenantRoleModel.tenant_id == request.tenant_id)
+            .order_by(TenantRoleModel.id)
+            .with_for_update()
+        )
+        return True
+
+    async def acquire_session_revoke(
+        self, request: SessionSecurityWriteLockRequest
+    ) -> bool:
+        if not isinstance(request, SessionSecurityWriteLockRequest):
+            raise ValueError("session security lock request must be strongly typed")
+        await self._session.execute(
+            select(RefreshTokenRecordModel.id)
+            .where(RefreshTokenRecordModel.session_id == request.session_id)
+            .order_by(
+                RefreshTokenRecordModel.family_id,
+                RefreshTokenRecordModel.id,
+            )
+            .with_for_update()
+        )
+        session_id = await self._session.scalar(
+            select(AuthSessionModel.id)
+            .where(AuthSessionModel.id == request.session_id)
+            .with_for_update()
+        )
+        return session_id is not None

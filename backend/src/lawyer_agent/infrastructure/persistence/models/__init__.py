@@ -20,6 +20,9 @@ from lawyer_agent.infrastructure.persistence.models.identity import (
     PasswordCredentialModel,
     UserModel,
 )
+from lawyer_agent.infrastructure.persistence.models.outbox import (
+    AuthorizationCacheInvalidationOutboxModel,
+)
 from lawyer_agent.infrastructure.persistence.models.sessions import (
     AuthSessionModel,
     RefreshTokenRecordModel,
@@ -33,6 +36,7 @@ from lawyer_agent.infrastructure.persistence.models.tenancy import (
 
 __all__ = [
     "AuditEventModel",
+    "AuthorizationCacheInvalidationOutboxModel",
     "AuthIdentityModel",
     "AuthSessionModel",
     "DepartmentModel",

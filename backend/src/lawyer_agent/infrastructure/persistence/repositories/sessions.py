@@ -26,6 +26,9 @@ from lawyer_agent.infrastructure.persistence.models import (
     TenantModel,
     UserModel,
 )
+from lawyer_agent.infrastructure.persistence.repositories.security_locks import (
+    SecurityWriteLockRepository,
+)
 
 
 class SessionRepository:
@@ -37,6 +40,13 @@ class SessionRepository:
         if user is None:
             return None
         return UserSessionState(user.id, user.status, user.auth_version)
+
+    async def peek_refresh_tenant(self, token_hash: bytes) -> UUID | None:
+        return await self._session.scalar(
+            select(RefreshTokenRecordModel.tenant_id).where(
+                RefreshTokenRecordModel.token_hash == token_hash
+            )
+        )
 
     async def get_tenant_context(
         self,
@@ -276,6 +286,7 @@ class SqlAlchemySessionUnitOfWork:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
         self.sessions: SessionRepository
+        self.security_locks: SecurityWriteLockRepository
         self.audit: SessionAuditRepository
 
     async def __aenter__(self) -> Self:
@@ -283,6 +294,7 @@ class SqlAlchemySessionUnitOfWork:
             raise RuntimeError("unit of work is already active")
         self._session = self._session_factory()
         self.sessions = SessionRepository(self._session)
+        self.security_locks = SecurityWriteLockRepository(self._session)
         self.audit = SessionAuditRepository(self._session)
         return self
 

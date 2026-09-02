@@ -39,6 +39,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.mysql]
 REQUIRED_TABLES = {
     "alembic_version",
     "audit_events",
+    "authz_cache_invalidation_outbox",
     "auth_identities",
     "auth_sessions",
     "departments",
@@ -92,6 +93,12 @@ async def _inspect_schema(mysql_url: URL) -> dict[str, object]:
                     "membership_fks": inspect(sync_connection).get_foreign_keys(
                         "membership_role_assignments"
                     ),
+                    "cache_outbox_fks": inspect(sync_connection).get_foreign_keys(
+                        "authz_cache_invalidation_outbox"
+                    ),
+                    "cache_outbox_uniques": inspect(sync_connection).get_unique_constraints(
+                        "authz_cache_invalidation_outbox"
+                    ),
                 }
             )
     finally:
@@ -131,6 +138,14 @@ def test_baseline_round_trip_and_tenant_constraints(mysql_url: URL) -> None:
         ("tenant_id", "membership_id"),
         ("tenant_id", "tenant_role_id"),
     } <= _column_sets(schema["membership_fks"], "constrained_columns")
+    assert {
+        ("tenant_id", "membership_id"),
+        ("tenant_id", "idempotency_record_id"),
+    } <= _column_sets(schema["cache_outbox_fks"], "constrained_columns")
+    assert {
+        ("tenant_id", "membership_id", "authz_version"),
+        ("tenant_id", "idempotency_record_id"),
+    } <= _column_sets(schema["cache_outbox_uniques"])
     refresh_indexes = _column_sets(schema["refresh_indexes"])
     assert {("family_id",), ("replaced_by_id",), ("token_hash",)} <= refresh_indexes
 
