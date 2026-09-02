@@ -124,7 +124,7 @@ class SecurityWriteLockRepository:
         for tenant_id in request.tenant_ids:
             if not await self.acquire_tenant_gate(tenant_id):
                 return False
-        refresh_ids = (
+        (
             await self._session.scalars(
                 select(RefreshTokenRecordModel.id)
                 .where(
@@ -135,8 +135,6 @@ class SecurityWriteLockRepository:
                 .with_for_update()
             )
         ).all()
-        if not refresh_ids:
-            return False
         session_id = await self._session.scalar(
             select(AuthSessionModel.id)
             .where(AuthSessionModel.id == request.session_id)

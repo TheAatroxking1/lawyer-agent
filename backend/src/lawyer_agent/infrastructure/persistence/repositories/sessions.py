@@ -64,13 +64,19 @@ class SessionRepository:
                 select(
                     AuthSessionModel.id,
                     AuthSessionModel.current_family_id,
+                    AuthSessionModel.user_id,
                     AuthSessionModel.tenant_id,
                 ).where(AuthSessionModel.id == session_id)
             )
         ).one_or_none()
         if row is None:
             return None
-        return SessionLockLocator(row.id, row.current_family_id, row.tenant_id)
+        return SessionLockLocator(
+            row.id,
+            row.current_family_id,
+            row.user_id,
+            row.tenant_id,
+        )
 
     async def get_tenant_context(
         self,
@@ -95,6 +101,43 @@ class SessionRepository:
         if row is None:
             return None
         tenant, membership = row
+        return TenantSessionState(
+            tenant.id,
+            tenant.status,
+            membership.id,
+            membership.user_id,
+            membership.status,
+            _aware(membership.valid_from),
+            _aware_optional(membership.valid_until),
+            membership.authz_version,
+        )
+
+    async def lock_tenant_context(
+        self,
+        *,
+        user_id: UUID,
+        tenant_id: UUID,
+        membership_id: UUID,
+    ) -> TenantSessionState | None:
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == user_id).with_for_update()
+        )
+        if user is None:
+            return None
+        tenant = await self._session.scalar(
+            select(TenantModel).where(TenantModel.id == tenant_id).with_for_update()
+        )
+        membership = await self._session.scalar(
+            select(TenantMembershipModel)
+            .where(
+                TenantMembershipModel.tenant_id == tenant_id,
+                TenantMembershipModel.id == membership_id,
+                TenantMembershipModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if tenant is None or membership is None:
+            return None
         return TenantSessionState(
             tenant.id,
             tenant.status,

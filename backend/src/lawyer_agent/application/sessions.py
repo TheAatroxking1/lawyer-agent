@@ -135,11 +135,13 @@ class RefreshLockLocator:
 class SessionLockLocator:
     session_id: UUID
     family_id: UUID
+    user_id: UUID
     tenant_id: UUID | None
 
     def __post_init__(self) -> None:
         require_uuid7(self.session_id, field="session locator session_id")
         require_uuid7(self.family_id, field="session locator family_id")
+        require_uuid7(self.user_id, field="session locator user_id")
         if self.tenant_id is not None:
             require_uuid7(self.tenant_id, field="session locator tenant_id")
 
@@ -227,6 +229,14 @@ class SessionRepositoryPort(Protocol):
     async def get_user(self, user_id: UUID) -> UserSessionState | None: ...
 
     async def get_tenant_context(
+        self,
+        *,
+        user_id: UUID,
+        tenant_id: UUID,
+        membership_id: UUID,
+    ) -> TenantSessionState | None: ...
+
+    async def lock_tenant_context(
         self,
         *,
         user_id: UUID,
@@ -636,9 +646,12 @@ class SessionService:
         audit_context: AuditContext,
     ) -> SessionResult:
         now = self._now()
+        async with self._uow_factory() as locator_uow:
+            locator = await locator_uow.sessions.locate_session(command.session_id)
+        if locator is None:
+            raise InvalidSession
         async with self._uow_factory() as uow:
-            locator = await uow.sessions.locate_session(command.session_id)
-            if locator is None or not await uow.security_locks.acquire_session_family(
+            if not await uow.security_locks.acquire_session_family(
                 _session_family_lock(
                     session_id=locator.session_id,
                     family_id=locator.family_id,
@@ -646,6 +659,11 @@ class SessionService:
                 )
             ):
                 raise InvalidSession
+            tenant = await uow.sessions.lock_tenant_context(
+                user_id=locator.user_id,
+                tenant_id=command.tenant_id,
+                membership_id=command.membership_id,
+            )
             current = await uow.sessions.lock_session(command.session_id)
             if (
                 current is None
@@ -653,11 +671,6 @@ class SessionService:
                 or not _state_is_authoritative(current, None, now)
             ):
                 raise InvalidSession
-            tenant = await uow.sessions.get_tenant_context(
-                user_id=current.user_id,
-                tenant_id=command.tenant_id,
-                membership_id=command.membership_id,
-            )
             if tenant is None or not _tenant_is_active(tenant, now):
                 raise InvalidSession
             await uow.sessions.revoke_family(
@@ -911,6 +924,7 @@ def _session_matches_locator(
     return (
         state.session_id == locator.session_id
         and state.current_family_id == locator.family_id
+        and state.user_id == locator.user_id
         and state.session_tenant_id == locator.tenant_id
     )
 

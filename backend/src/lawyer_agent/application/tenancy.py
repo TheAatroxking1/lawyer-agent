@@ -1138,6 +1138,7 @@ class TenantService:
             result = MemberMutationResult(updated, desired_roles, False)
 
         if changed and old_authz_version is not None:
+            cache_error: PostCommitCacheInvalidationError | None = None
             try:
                 await self._authorization_cache.invalidate(
                     tenant_id=actor.context.tenant_id,
@@ -1145,8 +1146,11 @@ class TenantService:
                     authz_version=old_authz_version,
                 )
             except Exception:
-                raise PostCommitCacheInvalidationError(result) from None
+                cache_error = PostCommitCacheInvalidationError(result)
+            if cache_error is not None:
+                raise cache_error from None
             assert cache_outbox_task_id is not None
+            completion_error: PostCommitCacheInvalidationError | None = None
             try:
                 async with self._uow_factory() as completion_uow:
                     await completion_uow.cache_outbox.mark_immediate_completed(
@@ -1154,7 +1158,9 @@ class TenantService:
                         now=self._now(),
                     )
             except Exception:
-                raise PostCommitCacheInvalidationError(result) from None
+                completion_error = PostCommitCacheInvalidationError(result)
+            if completion_error is not None:
+                raise completion_error from None
         return result
 
     async def _require_snapshot(

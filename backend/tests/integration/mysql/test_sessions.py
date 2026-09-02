@@ -569,6 +569,44 @@ async def test_explicit_revoke_invalidates_session_family_and_cache(
 
 
 @pytest.mark.asyncio
+async def test_explicit_revoke_handles_active_session_without_refresh_rows(
+    principal: tuple[UUID, UUID, UUID],
+    session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],
+    service_factory: Callable[..., SessionService],
+) -> None:
+    user_id, _, _ = principal
+    _, factory = session_database
+    service = service_factory()
+    started = await service.start(user_id=user_id, audit_context=AUDIT)
+    async with factory.begin() as session:
+        await session.execute(
+            delete(RefreshTokenRecordModel).where(
+                RefreshTokenRecordModel.session_id == started.session_id
+            )
+        )
+
+    await service.revoke(
+        started.session_id,
+        reason=RevocationReason.ADMIN_REVOKED,
+        audit_context=AUDIT,
+    )
+
+    async with factory() as session:
+        auth_session = await session.get(AuthSessionModel, started.session_id)
+        revoke_audits = (
+            await session.scalars(
+                select(AuditEventModel).where(
+                    AuditEventModel.action == "session.revoke",
+                    AuditEventModel.target_id == started.session_id,
+                )
+            )
+        ).all()
+    assert auth_session is not None and auth_session.revoked_at is not None
+    assert auth_session.revocation_reason == RevocationReason.ADMIN_REVOKED.value
+    assert len(revoke_audits) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_reason",
     [

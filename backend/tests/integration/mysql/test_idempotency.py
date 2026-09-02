@@ -30,6 +30,7 @@ from lawyer_agent.application.idempotency import (
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.sessions import (
     InvalidRefreshToken,
+    InvalidSession,
     RefreshReplayDetected,
     SessionService,
     SwitchTenantCommand,
@@ -379,6 +380,79 @@ class _TwoRefreshBarrierUow:
         traceback: TracebackType | None,
     ) -> None:
         await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+class _PauseAfterSessionLocatorRepository:
+    def __init__(self, inner: object, located: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._located = located
+        self._release = release
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def locate_session(self, session_id: object) -> object:
+        result = await self._inner.locate_session(session_id)  # type: ignore[attr-defined,no-any-return]
+        self._located.set()
+        await self._release.wait()
+        return result
+
+
+class _PauseAfterSessionLocatorUow:
+    def __init__(
+        self,
+        owner: _SwitchSnapshotUowFactory,
+        factory: async_sessionmaker[AsyncSession],
+        located: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._owner = owner
+        self._inner = SqlAlchemySessionUnitOfWork(factory)
+        self._located = located
+        self._release = release
+
+    async def __aenter__(self) -> Self:
+        await self._inner.__aenter__()
+        self.sessions = _PauseAfterSessionLocatorRepository(
+            self._inner.sessions, self._located, self._release
+        )
+        self.security_locks = self._inner.security_locks
+        self.audit = self._inner.audit
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+        self._owner.locator_uow_closed = True
+
+
+class _SwitchSnapshotUowFactory:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        located: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._factory = factory
+        self._located = located
+        self._release = release
+        self._calls = 0
+        self.locator_uow_closed = False
+
+    def __call__(self) -> object:
+        self._calls += 1
+        if self._calls == 1:
+            return _PauseAfterSessionLocatorUow(
+                self,
+                self._factory,
+                self._located,
+                self._release,
+            )
+        return SqlAlchemySessionUnitOfWork(self._factory)
 
 
 class _FailingCompletionOutbox:
@@ -1533,6 +1607,15 @@ async def test_cache_completion_failure_is_stable_and_worker_recoverable(
     assert caught.value.committed is True
     assert str(caught.value) == "authorization cache invalidation failed after commit"
     assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    chain_text = " ".join(
+        str(value)
+        for value in (caught.value, caught.value.__cause__, caught.value.__context__)
+        if value is not None
+    )
+    assert "sensitive-completion-material" not in chain_text
+    assert "runtimeerror" not in chain_text.casefold()
+    assert "sql" not in chain_text.casefold()
 
     dispatched = await AuthorizationCacheInvalidationDispatcher(
         uow_factory=lambda: SqlAlchemyTenantWorkflowUnitOfWork(database),
@@ -2970,6 +3053,125 @@ async def test_refresh_and_switch_tenant_share_complete_family_lock_order(
         ).all()
     assert old_session is not None and old_session.revoked_at is not None
     assert old_family and all(row.revoked_at is not None for row in old_family)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target_mutation",
+    ["membership_suspended", "membership_revoked", "tenant_suspended", "tenant_closed"],
+)
+async def test_switch_reloads_target_after_locator_transaction_closes(
+    database: async_sessionmaker[AsyncSession],
+    target_mutation: str,
+) -> None:
+    owner = await _add_active_user(database)
+    created = await _tenant_service(database).create_application(_create_command(owner))
+    target_user, target_membership = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    async with database.begin() as session:
+        await session.execute(
+            update(TenantModel)
+            .where(TenantModel.id == created.tenant.id)
+            .values(status="active", review_status="approved")
+        )
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-switch-snapshot-key",
+        signing_keys={"task7-switch-snapshot-key": private_key},
+        verification_keys={"task7-switch-snapshot-key": private_key.public_key()},
+    )
+    base = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"n" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    account = await base.start(
+        user_id=target_user,  # type: ignore[arg-type]
+        audit_context=_audit_context(),
+    )
+    async with database() as session:
+        before_sessions = await session.scalar(select(func.count()).select_from(AuthSessionModel))
+        before_refresh = await session.scalar(
+            select(func.count()).select_from(RefreshTokenRecordModel)
+        )
+        before_audits = await session.scalar(select(func.count()).select_from(AuditEventModel))
+
+    located, release = asyncio.Event(), asyncio.Event()
+    uow_factory = _SwitchSnapshotUowFactory(database, located, release)
+    service = SessionService(
+        uow_factory=uow_factory,  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"n" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    first_write_sql: list[str] = []
+    engine = database.kw["bind"]
+
+    def observe_first_write_uow_statement(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        if uow_factory.locator_uow_closed and not first_write_sql:
+            first_write_sql.append(" ".join(statement.casefold().split()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", observe_first_write_uow_statement)
+    task = asyncio.create_task(
+        service.switch_tenant(
+            SwitchTenantCommand(
+                account.session_id,
+                created.tenant.id,
+                target_membership,  # type: ignore[arg-type]
+            ),
+            audit_context=_audit_context(),
+        )
+    )
+    try:
+        await asyncio.wait_for(located.wait(), timeout=5)
+        async with database.begin() as session:
+            if target_mutation.startswith("membership_"):
+                await session.execute(
+                    update(TenantMembershipModel)
+                    .where(TenantMembershipModel.id == target_membership)
+                    .values(status=target_mutation.removeprefix("membership_"))
+                )
+            else:
+                await session.execute(
+                    update(TenantModel)
+                    .where(TenantModel.id == created.tenant.id)
+                    .values(status=target_mutation.removeprefix("tenant_"))
+                )
+        release.set()
+        with pytest.raises(InvalidSession):
+            await asyncio.wait_for(task, timeout=10)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe_first_write_uow_statement)
+        release.set()
+
+    assert first_write_sql
+    assert "from tenants" in first_write_sql[0] and "for update" in first_write_sql[0]
+    async with database() as session:
+        assert (
+            await session.scalar(select(func.count()).select_from(AuthSessionModel))
+            == before_sessions
+        )
+        assert (
+            await session.scalar(select(func.count()).select_from(RefreshTokenRecordModel))
+            == before_refresh
+        )
+        assert (
+            await session.scalar(select(func.count()).select_from(AuditEventModel))
+            == before_audits
+        )
 
 
 @pytest.mark.asyncio
