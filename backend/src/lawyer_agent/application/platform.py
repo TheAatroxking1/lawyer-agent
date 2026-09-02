@@ -72,6 +72,14 @@ class BootstrapAuthenticationFailed(Exception):
         super().__init__("platform administrator bootstrap authentication failed")
 
 
+class PlatformCommittedWithCleanupWarning(Exception):
+    code = "platform_committed_cleanup_warning"
+    committed = True
+
+    def __init__(self) -> None:
+        super().__init__("platform operation committed but cleanup was not confirmed")
+
+
 class BootstrapCommittedWithCleanupWarning(Exception):
     code = "platform_admin_bootstrap_committed_cleanup_warning"
     committed = True
@@ -518,6 +526,18 @@ class PlatformBootstrapService:
             raise BootstrapAuthenticationFailed
         now = self._clock()
         _require_utc(now)
+        try:
+            return await self._bootstrap_transaction(command, now=now)
+        except PlatformCommittedWithCleanupWarning:
+            translated_warning = BootstrapCommittedWithCleanupWarning()
+        raise translated_warning from None
+
+    async def _bootstrap_transaction(
+        self,
+        command: BootstrapPlatformAdminCommand,
+        *,
+        now: datetime,
+    ) -> BootstrapResult:
         async with self._uow_factory() as uow:
             await uow.acquire_bootstrap_lock()
             state = await uow.platform.load_bootstrap_state(

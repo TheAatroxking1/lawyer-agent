@@ -11,10 +11,12 @@ from lawyer_agent.application.invitations import (
     AcceptInvitationCommand,
     CreateInvitationCommand,
     InvitationAcceptanceResult,
+    InvitationBlindIndexWritersDrainedAck,
     InvitationResult,
     InvitationTargetFingerprintHasher,
     InvitationTargetKind,
     InvitationTokenHasher,
+    ReconcileLegacyInvitationBlindIndexesCommand,
 )
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.infrastructure.providers.development import (
@@ -78,6 +80,19 @@ def test_invitation_target_fingerprint_is_stable_secret_and_target_sensitive() -
     assert first == hasher.digest(InvitationTargetKind.EMAIL, "invitee@example.cn")
     assert first != hasher.digest(InvitationTargetKind.EMAIL, "other@example.cn")
     assert first != hasher.digest(InvitationTargetKind.PHONE, "invitee@example.cn")
+
+
+def test_legacy_invitation_reconciliation_requires_strong_writers_drained_ack() -> None:
+    with pytest.raises(ValueError, match="strongly typed"):
+        ReconcileLegacyInvitationBlindIndexesCommand(
+            writers_drained=object(),  # type: ignore[arg-type]
+            audit_context=_audit(),
+        )
+    with pytest.raises(ValueError, match="deployment reference"):
+        InvitationBlindIndexWritersDrainedAck(
+            deployment_reference="short",
+            confirmed_at=NOW,
+        )
 
 
 @pytest.mark.asyncio

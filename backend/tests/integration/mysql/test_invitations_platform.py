@@ -26,13 +26,16 @@ from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.invitations import (
     AcceptInvitationCommand,
     CreateInvitationCommand,
+    InvitationAuthorizationDenied,
     InvitationBlindIndexRetirementBlocked,
+    InvitationBlindIndexWritersDrainedAck,
     InvitationRoleDenied,
     InvitationService,
     InvitationTargetFingerprintHasher,
     InvitationTargetKind,
     InvitationTokenHasher,
     InvitationUnavailable,
+    ReconcileLegacyInvitationBlindIndexesCommand,
 )
 from lawyer_agent.application.platform import (
     BootstrapAuthenticationFailed,
@@ -44,6 +47,7 @@ from lawyer_agent.application.platform import (
     PlatformApplicationUnavailable,
     PlatformAuthorizationDenied,
     PlatformBootstrapService,
+    PlatformCommittedWithCleanupWarning,
     PlatformReviewService,
     ReviewDecision,
     ReviewTenantApplicationCommand,
@@ -78,6 +82,7 @@ from lawyer_agent.infrastructure.persistence.models import (
 from lawyer_agent.infrastructure.persistence.platform_uow import (
     SqlAlchemyPlatformWorkflowUnitOfWork,
 )
+from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 from lawyer_agent.infrastructure.persistence.repositories.invitations import (
     InvitationRepository,
 )
@@ -286,6 +291,7 @@ async def _tenant_graph(
         "role_assistant_a": role_a["assistant"],
         "role_owner_a": role_a["tenant_owner"],
         "role_admin_a": role_a["tenant_admin"],
+        "role_department_admin_a": role_a["department_admin"],
         "role_assistant_b": role_b["assistant"],
         "actor": TenantActor(principal, context),
     }
@@ -446,6 +452,119 @@ async def test_invitation_missing_bi_key_fails_only_target_and_retirement_gate_b
         stored.expires_at = (NOW - timedelta(seconds=1)).replace(tzinfo=None)
     await service_both.assert_blind_index_versions_retirable((1,))
 
+
+@pytest.mark.asyncio
+async def test_post_migration_legacy_writer_blocks_retirement_until_explicit_reconcile(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    legacy_invitation_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            TenantInvitationModel(
+                id=legacy_invitation_id,
+                tenant_id=graph["tenant_a"],
+                target_kind="email",
+                target_blind_index=b"l" * 32,
+                target_blind_index_key_version=None,
+                token_hash=b"q" * 32,
+                invited_by_membership_id=graph["actor"].context.membership_id,  # type: ignore[union-attr]
+                expires_at=(NOW + timedelta(days=1)).replace(tzinfo=None),
+                accepted_at=None,
+                revoked_at=None,
+                status="pending",
+                version=1,
+            )
+        )
+    service = _invitation_service(
+        database,
+        TestInvitationDeliveryAdapter(environment="test"),
+        blind_index=BlindIndexService(
+            {1: b"b" * 32, 2: b"d" * 32}, active_key_version=2
+        ),
+    )
+
+    with pytest.raises(InvitationBlindIndexRetirementBlocked):
+        await service.assert_blind_index_versions_retirable((1,))
+
+    result = await service.reconcile_legacy_unversioned_invitations(
+        ReconcileLegacyInvitationBlindIndexesCommand(
+            writers_drained=InvitationBlindIndexWritersDrainedAck(
+                deployment_reference="deploy-20260902-identity-rotation",
+                confirmed_at=NOW,
+            ),
+            audit_context=_audit("trace-legacy-invitation-reconcile"),
+        )
+    )
+
+    assert result.revoked_count == 1
+    assert result.deployment_reference == "deploy-20260902-identity-rotation"
+    await service.assert_blind_index_versions_retirable((1,))
+    async with database() as session:
+        invitation = await session.get(TenantInvitationModel, legacy_invitation_id)
+        assert invitation is not None
+        assert invitation.status == "revoked"
+        assert invitation.revoked_at == NOW.replace(tzinfo=None)
+        assert invitation.version == 2
+        audit = await session.scalar(
+            select(AuditEventModel).where(
+                AuditEventModel.action
+                == "invitation.blind_index_legacy_reconcile"
+            )
+        )
+        assert audit is not None
+        assert audit.actor_user_id is None
+        assert audit.tenant_id is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_invitation_reconcile_rolls_back_when_audit_fails(
+    database: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = await _tenant_graph(database)
+    legacy_invitation_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            TenantInvitationModel(
+                id=legacy_invitation_id,
+                tenant_id=graph["tenant_a"],
+                target_kind="email",
+                target_blind_index=b"m" * 32,
+                target_blind_index_key_version=None,
+                token_hash=b"r" * 32,
+                invited_by_membership_id=graph["actor"].context.membership_id,  # type: ignore[union-attr]
+                expires_at=(NOW + timedelta(days=1)).replace(tzinfo=None),
+                accepted_at=None,
+                revoked_at=None,
+                status="pending",
+                version=1,
+            )
+        )
+
+    async def fail_audit(*_: object, **__: object) -> None:
+        raise RuntimeError("synthetic reconciliation audit failure")
+
+    monkeypatch.setattr(AuditRepository, "append", fail_audit)
+    service = _invitation_service(
+        database, TestInvitationDeliveryAdapter(environment="test")
+    )
+    with pytest.raises(RuntimeError, match="synthetic reconciliation audit failure"):
+        await service.reconcile_legacy_unversioned_invitations(
+            ReconcileLegacyInvitationBlindIndexesCommand(
+                writers_drained=InvitationBlindIndexWritersDrainedAck(
+                    deployment_reference="deploy-20260902-rollback-check",
+                    confirmed_at=NOW,
+                ),
+                audit_context=_audit("trace-legacy-reconcile-rollback"),
+            )
+        )
+    async with database() as session:
+        invitation = await session.get(TenantInvitationModel, legacy_invitation_id)
+        assert invitation is not None
+        assert invitation.status == "pending"
+        assert invitation.revoked_at is None
+        assert invitation.version == 1
 
 @pytest.mark.asyncio
 async def test_invitation_create_accept_is_atomic_hashed_and_idempotent(
@@ -644,6 +763,91 @@ async def test_invitation_role_hierarchy_requires_strictly_lower_rank_except_own
             ),
         )
 
+
+@pytest.mark.asyncio
+async def test_invitation_role_hierarchy_uses_highest_role_for_mixed_assignments(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    actor = graph["actor"]
+    service = _invitation_service(
+        database, TestInvitationDeliveryAdapter(environment="test")
+    )
+    async with database.begin() as session:
+        session.add(
+            MembershipRoleAssignmentModel(
+                tenant_id=graph["tenant_a"],
+                membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+                tenant_role_id=graph["role_department_admin_a"],
+                assigned_by_membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+            )
+        )
+    owner_result = await service.create(
+        actor,  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="mixed-owner@example.cn",
+            role_ids=(graph["role_admin_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="mixed-owner-dept-invite-0001",
+            audit_context=_audit("trace-mixed-owner-dept"),
+        ),
+    )
+    assert owner_result.status == "pending"
+
+    async with database.begin() as session:
+        await session.execute(
+            delete(MembershipRoleAssignmentModel).where(
+                MembershipRoleAssignmentModel.tenant_id == graph["tenant_a"],
+                MembershipRoleAssignmentModel.membership_id
+                == actor.context.membership_id,  # type: ignore[union-attr]
+                MembershipRoleAssignmentModel.tenant_role_id
+                == graph["role_owner_a"],
+            )
+        )
+        session.add(
+            MembershipRoleAssignmentModel(
+                tenant_id=graph["tenant_a"],
+                membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+                tenant_role_id=graph["role_admin_a"],
+                assigned_by_membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+            )
+        )
+    admin_result = await service.create(
+        actor,  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="mixed-admin@example.cn",
+            role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="mixed-admin-dept-invite-0001",
+            audit_context=_audit("trace-mixed-admin-dept"),
+        ),
+    )
+    assert admin_result.status == "pending"
+
+    async with database.begin() as session:
+        await session.execute(
+            delete(MembershipRoleAssignmentModel).where(
+                MembershipRoleAssignmentModel.tenant_id == graph["tenant_a"],
+                MembershipRoleAssignmentModel.membership_id
+                == actor.context.membership_id,  # type: ignore[union-attr]
+                MembershipRoleAssignmentModel.tenant_role_id
+                == graph["role_admin_a"],
+            )
+        )
+    with pytest.raises((InvitationAuthorizationDenied, InvitationRoleDenied)):
+        await service.create(
+            actor,  # type: ignore[arg-type]
+            CreateInvitationCommand(
+                target_kind=InvitationTargetKind.EMAIL,
+                target="pure-dept@example.cn",
+                role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+                expires_at=NOW + timedelta(days=1),
+                idempotency_key="pure-dept-invite-0001",
+                audit_context=_audit("trace-pure-dept"),
+            ),
+        )
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tenant_status", ["suspended", "closed"])
@@ -1153,6 +1357,65 @@ async def test_platform_review_requires_authoritative_permission_and_bound_singl
     async with database() as session:
         tenant = await session.get(TenantModel, tenant_id)
         assert tenant is not None and tenant.status == "active"
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.action == "tenant_application.approve"
+            )
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_review_postcommit_close_failure_uses_generic_warning(
+    database: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor, tenant_id = await _platform_graph(database)
+    step_up = _SingleUseStepUp()
+    service = PlatformReviewService(
+        uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
+        idempotency=IdempotencyService(key_hash_secret=b"i" * 32),
+        step_up=step_up,
+        clock=lambda: NOW,
+    )
+    grant = step_up.issue(
+        user_id=actor.principal.user_id,
+        session_id=actor.principal.session_id,
+        tenant_id=tenant_id,
+        action="tenant_application.review:approve",
+    )
+    original_close = AsyncSession.close
+    close_calls = 0
+
+    async def fail_write_uow_close(session: AsyncSession) -> None:
+        nonlocal close_calls
+        await original_close(session)
+        close_calls += 1
+        if close_calls == 2:
+            raise RuntimeError("sensitive platform session cleanup detail")
+
+    monkeypatch.setattr(AsyncSession, "close", fail_write_uow_close)
+
+    with pytest.raises(PlatformCommittedWithCleanupWarning) as caught:
+        await service.approve(
+            actor,
+            ReviewTenantApplicationCommand(
+                tenant_id=tenant_id,
+                decision=ReviewDecision.APPROVE,
+                reason_code="approved",
+                step_up_grant=grant,
+                idempotency_key="platform-close-warning-0001",
+                audit_context=_audit("trace-platform-close-warning"),
+            ),
+        )
+
+    assert caught.value.committed is True
+    assert "bootstrap" not in str(caught.value).lower()
+    assert "sensitive" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    async with database() as session:
+        tenant = await session.get(TenantModel, tenant_id)
+        assert tenant is not None and tenant.review_status == "approved"
         assert await session.scalar(
             select(func.count()).select_from(AuditEventModel).where(
                 AuditEventModel.action == "tenant_application.approve"

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 from lawyer_agent.application.idempotency import IdempotencyRepositoryPort
 from lawyer_agent.application.platform import (
-    BootstrapCommittedWithCleanupWarning,
+    PlatformCommittedWithCleanupWarning,
     PlatformRepositoryPort,
 )
 from lawyer_agent.application.security_locks import SecurityWriteLockRepositoryPort
@@ -100,7 +100,7 @@ class SqlAlchemyPlatformWorkflowUnitOfWork:
             finally:
                 self._session = None
             if committed and cleanup_failed:
-                raise BootstrapCommittedWithCleanupWarning from None
+                raise PlatformCommittedWithCleanupWarning from None
 
     async def acquire_bootstrap_lock(self) -> None:
         if self._session is None:

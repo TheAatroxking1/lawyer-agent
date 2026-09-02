@@ -59,6 +59,7 @@ from lawyer_agent.domain.tenancy import (
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 _TOKEN_DOMAIN = b"lawyer-agent:tenant-invitation-token:v1\x00"
 _TARGET_FINGERPRINT_DOMAIN = b"lawyer-agent:invitation-target-fingerprint:v1\x00"
+_DEPLOYMENT_REFERENCE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}\Z")
 _ROLE_HIERARCHY = {
     "tenant_owner": 100,
     "tenant_admin": 80,
@@ -170,6 +171,41 @@ class InvitationAcceptanceResult:
 
 
 @dataclass(frozen=True, slots=True)
+class InvitationBlindIndexWritersDrainedAck:
+    deployment_reference: str
+    confirmed_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.deployment_reference, str)
+            or _DEPLOYMENT_REFERENCE_PATTERN.fullmatch(self.deployment_reference) is None
+        ):
+            raise ValueError("deployment reference is invalid")
+        _require_utc(self.confirmed_at, "writers-drained confirmed_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileLegacyInvitationBlindIndexesCommand:
+    writers_drained: InvitationBlindIndexWritersDrainedAck
+    audit_context: AuditContext
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.writers_drained, InvitationBlindIndexWritersDrainedAck
+        ):
+            raise ValueError("writers-drained acknowledgement must be strongly typed")
+        if not isinstance(self.audit_context, AuditContext):
+            raise ValueError("audit context must be strongly typed")
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyInvitationBlindIndexReconciliationResult:
+    deployment_reference: str
+    revoked_count: int
+    reconciled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class InvitationRecord:
     id: UUID
     tenant_id: UUID
@@ -246,6 +282,8 @@ class InvitationRepositoryPort(Protocol):
     async def count_pending_unexpired_by_blind_index_versions(
         self, *, key_versions: tuple[int, ...], now: datetime
     ) -> int: ...
+
+    async def revoke_unversioned_pending(self, *, now: datetime) -> int: ...
 
     async def add(self, invitation: InvitationRecord) -> None: ...
 
@@ -367,6 +405,36 @@ class InvitationService:
             )
         if count:
             raise InvitationBlindIndexRetirementBlocked
+
+    async def reconcile_legacy_unversioned_invitations(
+        self, command: ReconcileLegacyInvitationBlindIndexesCommand
+    ) -> LegacyInvitationBlindIndexReconciliationResult:
+        if not isinstance(command, ReconcileLegacyInvitationBlindIndexesCommand):
+            raise ValueError("legacy invitation reconciliation must be strongly typed")
+        now = self._now()
+        if command.writers_drained.confirmed_at > now:
+            raise ValueError("writers-drained acknowledgement cannot be in the future")
+        async with self._uow_factory() as uow:
+            revoked_count = await uow.invitations.revoke_unversioned_pending(now=now)
+            await uow.audit.append(
+                _audit_event(
+                    command.audit_context,
+                    actor_user_id=None,
+                    tenant_id=None,
+                    actor_membership_id=None,
+                    action="invitation.blind_index_legacy_reconcile",
+                    reason_code="legacy_unversioned_invitations_revoked",
+                    target_type="tenant_invitation",
+                    target_id=None,
+                    now=now,
+                )
+            )
+            await uow.invitations.flush()
+        return LegacyInvitationBlindIndexReconciliationResult(
+            deployment_reference=command.writers_drained.deployment_reference,
+            revoked_count=revoked_count,
+            reconciled_at=now,
+        )
 
     async def create(
         self, actor: TenantActor, command: CreateInvitationCommand
@@ -766,7 +834,10 @@ def _validate_invitation_roles(
         or not invited_roles
         or any(role not in _ROLE_HIERARCHY for role in actor_roles | invited_roles)
         or "tenant_owner" in invited_roles
-        or "department_admin" in actor_roles
+        or (
+            "department_admin" in actor_roles
+            and not actor_roles.intersection({"tenant_owner", "tenant_admin"})
+        )
     ):
         raise InvitationRoleDenied
     actor_rank = max(_ROLE_HIERARCHY[role] for role in actor_roles)

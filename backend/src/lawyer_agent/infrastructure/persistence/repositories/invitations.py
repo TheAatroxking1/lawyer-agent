@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.invitations import (
@@ -79,12 +81,38 @@ class InvitationRepository:
             select(func.count())
             .select_from(TenantInvitationModel)
             .where(
-                TenantInvitationModel.target_blind_index_key_version.in_(key_versions),
                 TenantInvitationModel.status == "pending",
                 TenantInvitationModel.expires_at > _naive(now),
+                or_(
+                    TenantInvitationModel.target_blind_index_key_version.in_(
+                        key_versions
+                    ),
+                    TenantInvitationModel.target_blind_index_key_version.is_(None),
+                ),
             )
         )
         return int(value or 0)
+
+    async def revoke_unversioned_pending(self, *, now: datetime) -> int:
+        database_now = _naive(now)
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantInvitationModel)
+                .where(
+                    TenantInvitationModel.status == "pending",
+                    TenantInvitationModel.target_blind_index_key_version.is_(None),
+                )
+                .values(
+                    status="revoked",
+                    revoked_at=database_now,
+                    version=TenantInvitationModel.version + 1,
+                    updated_at=database_now,
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        return int(result.rowcount)
 
     async def add(self, invitation: InvitationRecord) -> None:
         _require_invitation_record(invitation)

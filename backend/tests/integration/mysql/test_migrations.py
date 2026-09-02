@@ -198,6 +198,14 @@ def test_invitation_blind_index_migration_revokes_unknown_legacy_pending_rows(
     assert migrated == ("revoked", True, None, 2)
     asyncio.run(_delete_legacy_invitation_graph(mysql_url, invitation_id))
 
+    post_migration_legacy_id = asyncio.run(
+        _insert_legacy_pending_invitation(mysql_url)
+    )
+    with pytest.raises(RuntimeError, match="pending invitations"):
+        command.downgrade(config, "20260902_03")
+    asyncio.run(
+        _delete_legacy_invitation_graph(mysql_url, post_migration_legacy_id)
+    )
     command.downgrade(config, "20260902_03")
     columns = asyncio.run(_invitation_columns(mysql_url))
     assert "target_blind_index_key_version" not in columns
