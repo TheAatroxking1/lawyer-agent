@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = DEVELOPMENT_DATABASE_URL
     redis_url: str = DEVELOPMENT_REDIS_URL
+    redis_key_prefix: str = Field(default="lawyer:", pattern=r"^[a-z0-9][a-z0-9:-]{0,62}:$")
     redis_security_topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE
     database_pool_size: int = Field(default=10, gt=0)
     database_max_overflow: int = Field(default=20, ge=0)
@@ -60,6 +61,8 @@ class Settings(BaseSettings):
     blind_index_legacy_writers_drained: bool = False
     refresh_token_key_b64: str = DEVELOPMENT_REFRESH_TOKEN_KEY_B64
     csrf_key_b64: str = DEVELOPMENT_CSRF_KEY_B64
+    jwt_issuer: str = "https://identity.lawyer-agent.local"
+    jwt_active_kid: str = "development"
     jwt_ed25519_key_ring: dict[str, str] = Field(
         default_factory=lambda: DEVELOPMENT_ED25519_KEY_RING.copy()
     )
@@ -106,6 +109,23 @@ class Settings(BaseSettings):
         if len(set(value.values())) != len(value):
             raise ValueError("jwt_ed25519_key_ring must not repeat key material")
         return value
+
+    @model_validator(mode="after")
+    def validate_active_jwt_key(self) -> "Settings":
+        if (
+            self.jwt_active_kid == "development"
+            and self.jwt_active_kid not in self.jwt_ed25519_key_ring
+            and len(self.jwt_ed25519_key_ring) == 1
+        ):
+            # A single externally configured key is unambiguous. Rotation rings
+            # still require an explicit active kid and therefore fail closed.
+            self.jwt_active_kid = next(iter(self.jwt_ed25519_key_ring))
+        if self.jwt_active_kid not in self.jwt_ed25519_key_ring:
+            raise ValueError("jwt_active_kid must identify a configured signing key")
+        parsed = urlparse(self.jwt_issuer)
+        if parsed.scheme != "https" or not parsed.netloc or "*" in self.jwt_issuer:
+            raise ValueError("jwt_issuer must be an explicit HTTPS origin")
+        return self
 
     @field_validator("blind_index_legacy_key_version")
     @classmethod

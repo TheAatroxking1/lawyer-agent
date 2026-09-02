@@ -304,6 +304,41 @@ class PlatformReviewService:
         self._step_up = step_up
         self._clock = clock
 
+    async def authorize_access(
+        self,
+        actor: PlatformActor,
+        *,
+        permission: str,
+        audit_context: AuditContext,
+    ) -> PlatformActor:
+        """Authorize a short platform-token exchange from an already validated session."""
+        if (
+            not isinstance(actor, PlatformActor)
+            or not isinstance(audit_context, AuditContext)
+            or permission not in {
+                "tenant_application.read",
+                "tenant_application.review",
+            }
+        ):
+            raise ValueError("platform access exchange inputs are invalid")
+        now = self._now()
+        async with self._uow_factory() as uow:
+            snapshot = await self._require_actor(uow, actor, for_update=False)
+            self._require_permission(snapshot, permission)
+            await uow.audit.append(
+                _audit_event(
+                    audit_context,
+                    actor_user_id=actor.principal.user_id,
+                    tenant_id=None,
+                    action="platform.access.authorize",
+                    reason_code=permission.replace(".", "_"),
+                    target_type="platform_session",
+                    target_id=actor.principal.session_id,
+                    now=now,
+                )
+            )
+        return actor
+
     async def list(
         self,
         actor: PlatformActor,

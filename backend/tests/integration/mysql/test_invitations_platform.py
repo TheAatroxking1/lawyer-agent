@@ -1365,6 +1365,33 @@ async def test_platform_review_requires_authoritative_permission_and_bound_singl
 
 
 @pytest.mark.asyncio
+async def test_platform_access_exchange_requires_authoritative_active_permission(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    allowed_actor, _ = await _platform_graph(database, grant_review=True)
+    denied_actor, _ = await _platform_graph(database, grant_review=False)
+    service = PlatformReviewService(
+        uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
+        idempotency=IdempotencyService(key_hash_secret=b"i" * 32),
+        step_up=_SingleUseStepUp(),
+        clock=lambda: NOW,
+    )
+
+    authorized = await service.authorize_access(
+        allowed_actor,
+        permission="tenant_application.review",
+        audit_context=_audit("trace-platform-exchange"),
+    )
+    assert authorized.principal == allowed_actor.principal
+    with pytest.raises(PlatformAuthorizationDenied, match="not authorized"):
+        await service.authorize_access(
+            denied_actor,
+            permission="tenant_application.review",
+            audit_context=_audit("trace-platform-exchange-denied"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_platform_review_postcommit_close_failure_uses_generic_warning(
     database: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,

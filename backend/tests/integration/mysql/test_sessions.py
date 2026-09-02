@@ -209,6 +209,66 @@ async def test_start_refresh_and_authoritative_account_session_validation(
 
 
 @pytest.mark.asyncio
+async def test_refresh_session_lookup_is_read_only_and_platform_audience_uses_account_session(
+    principal: tuple[UUID, UUID, UUID],
+    service_factory: Callable[[], SessionService],
+    token_service: TokenService,
+) -> None:
+    user_id, _, _ = principal
+    service = service_factory()
+    started = await service.start(user_id=user_id, audit_context=AUDIT)
+
+    assert await service.refresh_session_id(started.refresh_token) == started.session_id
+
+    account_claims = token_service.verify(
+        started.access_token,
+        audience=Audience.ACCOUNT,
+        now=NOW,
+    )
+    platform_claims = AccessTokenClaims(
+        user_id=account_claims.user_id,
+        session_id=account_claims.session_id,
+        token_id=new_uuid7(),
+        audience=Audience.PLATFORM,
+        issued_at=NOW,
+        not_before=NOW,
+        expires_at=NOW + timedelta(minutes=5),
+        auth_version=account_claims.auth_version,
+    )
+    platform_token = token_service.issue_platform(platform_claims)
+
+    validated = await service.validate_access(platform_token, audience=Audience.PLATFORM)
+    assert validated.user_id == user_id
+    assert validated.tenant_id is None
+    assert validated.membership_id is None
+    with pytest.raises(InvalidSession):
+        await service.validate_access(platform_token, audience=Audience.ACCOUNT)
+
+
+@pytest.mark.asyncio
+async def test_refreshed_account_session_can_switch_to_an_active_tenant(
+    principal: tuple[UUID, UUID, UUID],
+    service_factory: Callable[[], SessionService],
+) -> None:
+    user_id, tenant_id, membership_id = principal
+    service = service_factory()
+    account = await service.start(user_id=user_id, audit_context=AUDIT)
+    refreshed = await service.refresh(account.refresh_token, audit_context=AUDIT)
+
+    tenant = await service.switch_tenant(
+        SwitchTenantCommand(refreshed.session_id, tenant_id, membership_id),
+        audit_context=AUDIT,
+    )
+
+    validated = await service.validate_access(
+        tenant.access_token,
+        audience=Audience.TENANT,
+    )
+    assert validated.tenant_id == tenant_id
+    assert validated.membership_id == membership_id
+
+
+@pytest.mark.asyncio
 async def test_tenant_session_checks_tenant_membership_status_and_authz_version(
     principal: tuple[UUID, UUID, UUID],
     session_database: tuple[AsyncEngine, async_sessionmaker[AsyncSession]],

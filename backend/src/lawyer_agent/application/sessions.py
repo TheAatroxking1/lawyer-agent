@@ -570,6 +570,15 @@ class SessionService:
             raise InvalidRefreshToken
         return outcome
 
+    async def refresh_session_id(self, raw_token: str) -> UUID:
+        """Resolve only the Session binding needed for pre-rotation CSRF and rate limiting."""
+        token_hash = self._refresh_hash(raw_token)
+        async with self._uow_factory() as uow:
+            locator = await uow.sessions.locate_refresh(token_hash)
+        if locator is None:
+            raise InvalidRefreshToken
+        return locator.session_id
+
     async def validate_access(
         self,
         encoded: str,
@@ -869,7 +878,11 @@ class SessionService:
         value = self._clock()
         if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
             raise ValueError("session clock must return a UTC-aware datetime")
-        return value.astimezone(UTC).replace(microsecond=0)
+        # Preserve database precision for membership validity checks. JWT
+        # serialization may use whole-second NumericDate values, but rounding the
+        # authoritative service clock down could make a membership created in the
+        # same second appear not-yet-valid.
+        return value.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -979,7 +992,10 @@ def _state_is_authoritative(
         return (
             state.session_membership_id is None
             and state.authz_version_at_issue is None
-            and (claims is None or claims.audience is Audience.ACCOUNT)
+            and (
+                claims is None
+                or claims.audience in {Audience.ACCOUNT, Audience.PLATFORM}
+            )
         )
     if (
         state.session_membership_id is None

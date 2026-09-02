@@ -1721,7 +1721,10 @@ def _b64url_decode(value: str) -> bytes:
     if re.fullmatch(r"[A-Za-z0-9_-]+", value, re.ASCII) is None:
         raise InvalidMemberCursor("member cursor is invalid")
     padding = "=" * (-len(value) % 4)
-    return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    if not hmac.compare_digest(_b64url_encode(decoded), value):
+        raise InvalidMemberCursor("member cursor is invalid")
+    return decoded
 
 
 def _require_utc(value: object, *, field_name: str) -> None:
