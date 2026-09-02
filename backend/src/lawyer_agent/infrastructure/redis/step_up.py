@@ -4,17 +4,16 @@ import hmac
 import json
 import re
 import secrets
-from dataclasses import dataclass, field
 from hashlib import sha256
 from uuid import RFC_4122, UUID
 
+from lawyer_agent.domain.sessions import StepUpGrant
 from lawyer_agent.infrastructure.redis.client import (
     RedisDependencyError,
     RedisDependencyInvalidResponse,
     RedisPort,
 )
 
-_GRANT_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 _ACTION_PATTERN = re.compile(r"[a-z][a-z0-9_.:-]{0,127}\Z", re.ASCII)
 _STEP_UP_TTL_SECONDS = 300
 _MAX_COLLISION_RETRIES = 3
@@ -32,15 +31,6 @@ return 0
 class StepUpGrantGenerationExhausted(RedisDependencyError):
     def __init__(self) -> None:
         super().__init__("could not allocate a step-up grant")
-
-
-@dataclass(frozen=True, slots=True)
-class StepUpGrant:
-    value: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        if not _GRANT_PATTERN.fullmatch(self.value):
-            raise ValueError("step-up grant has an invalid format")
 
 
 class StepUpStore:

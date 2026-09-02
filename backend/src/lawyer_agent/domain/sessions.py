@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from uuid import RFC_4122, UUID
+
+_STEP_UP_GRANT_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 
 
 class Audience(StrEnum):
@@ -31,6 +34,15 @@ class InvalidToken(Exception):
 
     def __init__(self) -> None:
         super().__init__("invalid access token")
+
+
+@dataclass(frozen=True, slots=True)
+class StepUpGrant:
+    value: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not _STEP_UP_GRANT_PATTERN.fullmatch(self.value):
+            raise ValueError("step-up grant has an invalid format")
 
 
 @dataclass(frozen=True, slots=True)
