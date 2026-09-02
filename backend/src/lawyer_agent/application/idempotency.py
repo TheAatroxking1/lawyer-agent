@@ -4,7 +4,7 @@ import hmac
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -17,17 +17,9 @@ from lawyer_agent.domain.common import new_uuid7, require_uuid7
 _KEY_PATTERN = re.compile(r"[A-Za-z0-9._~:-]{16,128}\Z", re.ASCII)
 _METHOD_PATTERN = re.compile(r"[A-Z]{1,16}\Z", re.ASCII)
 _ROUTE_PATTERN = re.compile(r"/[A-Za-z0-9._~:/{}-]{1,511}\Z", re.ASCII)
-_SENSITIVE_FIELD_FRAGMENTS = (
-    "authorization",
-    "cookie",
-    "csrf",
-    "otp",
-    "password",
-    "secret",
-    "token",
-    "verification_code",
-)
 _DEFAULT_TTL = timedelta(hours=24)
+JsonPath = tuple[str, ...]
+_OMIT = object()
 
 
 class InvalidIdempotencyKey(ValueError):
@@ -68,6 +60,11 @@ class IdempotencyStatus(StrEnum):
     FAILED = "failed"
 
 
+class IdempotencyMutationEffect(StrEnum):
+    CHANGED = "changed"
+    NO_CHANGE = "no_change"
+
+
 @dataclass(frozen=True, slots=True)
 class IdempotencyScope:
     scope_type: IdempotencyScopeType
@@ -85,11 +82,41 @@ class IdempotencyScope:
 
 
 @dataclass(frozen=True, slots=True)
+class IdempotencyFingerprintPayload:
+    values: Mapping[str, object] = field(repr=False)
+    business_paths: frozenset[JsonPath]
+    secret_paths: frozenset[JsonPath] = field(default_factory=frozenset, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, Mapping):
+            raise InvalidIdempotencyRequest("fingerprint payload values must be a mapping")
+        _require_paths(self.business_paths, field_name="business_paths")
+        _require_paths(self.secret_paths, field_name="secret_paths")
+        if self.business_paths & self.secret_paths:
+            raise InvalidIdempotencyRequest("fingerprint paths must not overlap")
+        for left in self.business_paths | self.secret_paths:
+            for right in self.business_paths | self.secret_paths:
+                if left != right and len(left) < len(right) and right[: len(left)] == left:
+                    raise InvalidIdempotencyRequest("fingerprint paths must not overlap")
+
+    def canonical_business_values(self) -> Mapping[str, object]:
+        projected = _project_explicit_paths(
+            self.values,
+            path=(),
+            business_paths=self.business_paths,
+            secret_paths=self.secret_paths,
+        )
+        if not isinstance(projected, Mapping):
+            raise InvalidIdempotencyRequest("fingerprint payload must remain an object")
+        return projected
+
+
+@dataclass(frozen=True, slots=True)
 class IdempotencyRequest:
-    key: str
+    key: str = field(repr=False)
     method: str
     canonical_route: str
-    body: Mapping[str, object]
+    body: IdempotencyFingerprintPayload = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +131,8 @@ class PreparedIdempotencyRequest:
 class IdempotencyResultReference:
     result_type: str
     result_id: UUID
+    mutation_effect: IdempotencyMutationEffect | None = None
+    cache_authz_version: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -113,6 +142,16 @@ class IdempotencyResultReference:
         ):
             raise ValueError("idempotency result type is invalid")
         require_uuid7(self.result_id, field="idempotency result_id")
+        if self.mutation_effect is not None and not isinstance(
+            self.mutation_effect, IdempotencyMutationEffect
+        ):
+            raise ValueError("idempotency mutation effect must be strongly typed")
+        if self.cache_authz_version is not None and (
+            isinstance(self.cache_authz_version, bool)
+            or not isinstance(self.cache_authz_version, int)
+            or not 1 <= self.cache_authz_version <= (1 << 31) - 1
+        ):
+            raise ValueError("idempotency cache authz version is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,9 +202,12 @@ class IdempotencyRepositoryPort(Protocol):
         self,
         *,
         record_id: UUID,
-        request_fingerprint: bytes,
+        old_request_fingerprint: bytes,
+        new_request_fingerprint: bytes,
+        allowed_statuses: frozenset[IdempotencyStatus],
+        expired_before: datetime | None,
         expires_at: datetime,
-    ) -> None: ...
+    ) -> bool: ...
 
     async def complete(
         self,
@@ -206,7 +248,11 @@ class IdempotencyService:
             raise InvalidIdempotencyKey("idempotency key must be 16-128 safe ASCII characters")
         method = _canonical_method(request.method)
         route = _canonical_route(request.canonical_route)
-        canonical_body = _canonical_json(_without_secrets(request.body))
+        if not isinstance(request.body, IdempotencyFingerprintPayload):
+            raise InvalidIdempotencyRequest(
+                "idempotency body must declare explicit business and secret paths"
+            )
+        canonical_body = _canonical_json(request.body.canonical_business_values())
         fingerprint_input = b"\n".join(
             (method.encode("ascii"), route.encode("ascii"), canonical_body)
         )
@@ -247,13 +293,6 @@ class IdempotencyService:
         record = acquired.record
         if acquired.inserted:
             return IdempotencyReservation(record.id, prepared.request_fingerprint, None)
-        if record.expires_at <= effective_now:
-            await repository.restart(
-                record_id=record.id,
-                request_fingerprint=prepared.request_fingerprint,
-                expires_at=effective_now + self._ttl,
-            )
-            return IdempotencyReservation(record.id, prepared.request_fingerprint, None)
         if not hmac.compare_digest(
             record.request_fingerprint,
             prepared.request_fingerprint,
@@ -268,11 +307,28 @@ class IdempotencyService:
                 record.result,
             )
         if record.status is IdempotencyStatus.FAILED:
-            await repository.restart(
+            restarted = await repository.restart(
                 record_id=record.id,
-                request_fingerprint=prepared.request_fingerprint,
+                old_request_fingerprint=record.request_fingerprint,
+                new_request_fingerprint=prepared.request_fingerprint,
+                allowed_statuses=frozenset({IdempotencyStatus.FAILED}),
+                expired_before=None,
                 expires_at=effective_now + self._ttl,
             )
+            if not restarted:
+                raise IdempotencyStateError("failed idempotency record could not be recovered")
+            return IdempotencyReservation(record.id, prepared.request_fingerprint, None)
+        if record.status is IdempotencyStatus.RESERVED and record.expires_at <= effective_now:
+            restarted = await repository.restart(
+                record_id=record.id,
+                old_request_fingerprint=record.request_fingerprint,
+                new_request_fingerprint=prepared.request_fingerprint,
+                allowed_statuses=frozenset({IdempotencyStatus.RESERVED}),
+                expired_before=effective_now,
+                expires_at=effective_now + self._ttl,
+            )
+            if not restarted:
+                raise IdempotencyStateError("expired idempotency record could not be recovered")
             return IdempotencyReservation(record.id, prepared.request_fingerprint, None)
         raise IdempotencyInProgressError
 
@@ -332,24 +388,61 @@ def _canonical_route(value: object) -> str:
     return route
 
 
-def _without_secrets(value: object) -> object:
+def _project_explicit_paths(
+    value: object,
+    *,
+    path: JsonPath,
+    business_paths: frozenset[JsonPath],
+    secret_paths: frozenset[JsonPath],
+) -> object:
+    if path in secret_paths:
+        return _OMIT
+    if path in business_paths:
+        return _canonical_json_value(value)
     if isinstance(value, Mapping):
         result: dict[str, object] = {}
         for raw_key, child in value.items():
             if not isinstance(raw_key, str):
                 raise InvalidIdempotencyRequest("JSON object keys must be strings")
-            normalized_key = raw_key.casefold().replace("-", "_")
-            if normalized_key == "code" or any(
-                fragment in normalized_key for fragment in _SENSITIVE_FIELD_FRAGMENTS
-            ):
-                continue
-            result[raw_key] = _without_secrets(child)
+            projected = _project_explicit_paths(
+                child,
+                path=(*path, raw_key),
+                business_paths=business_paths,
+                secret_paths=secret_paths,
+            )
+            if projected is not _OMIT:
+                result[raw_key] = projected
+        return result
+    raise InvalidIdempotencyRequest(
+        "request body contains an unclassified business or secret field"
+    )
+
+
+def _canonical_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for raw_key, child in value.items():
+            if not isinstance(raw_key, str):
+                raise InvalidIdempotencyRequest("JSON object keys must be strings")
+            result[raw_key] = _canonical_json_value(child)
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_without_secrets(child) for child in value]
+        return [_canonical_json_value(child) for child in value]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise InvalidIdempotencyRequest("request body must contain canonical JSON values")
+
+
+def _require_paths(value: object, *, field_name: str) -> None:
+    if not isinstance(value, frozenset):
+        raise InvalidIdempotencyRequest(f"{field_name} must be a frozenset")
+    for path in value:
+        if (
+            not isinstance(path, tuple)
+            or not path
+            or any(not isinstance(part, str) or not part for part in path)
+        ):
+            raise InvalidIdempotencyRequest(f"{field_name} contains an invalid JSON path")
 
 
 def _canonical_json(value: object) -> bytes:

@@ -6,7 +6,7 @@ import hmac
 import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -15,6 +15,8 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
+    IdempotencyMutationEffect,
     IdempotencyRepositoryPort,
     IdempotencyRequest,
     IdempotencyResultReference,
@@ -27,6 +29,7 @@ from lawyer_agent.domain.authorization import (
     Action,
     PolicyEngine,
     Principal,
+    ResourceAccessPath,
     ResourceAttributes,
     ResourceState,
 )
@@ -108,6 +111,13 @@ class InvalidMemberUpdate(ValueError):
     code = "invalid_member_update"
 
 
+class MembershipMutationDenied(Exception):
+    code = "membership_mutation_denied"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+
+
 class PostCommitCacheInvalidationError(RuntimeError):
     code = "security_dependency_unavailable"
     committed = True
@@ -122,7 +132,7 @@ class CreateTenantApplicationCommand:
     actor_user_id: UUID
     name: str
     tenant_type: TenantType
-    idempotency_key: str
+    idempotency_key: str = field(repr=False)
     audit_context: AuditContext
 
     def __post_init__(self) -> None:
@@ -156,7 +166,7 @@ class TenantActor:
 class UpdateTenantCommand:
     name: str
     expected_version: int
-    idempotency_key: str
+    idempotency_key: str = field(repr=False)
     audit_context: AuditContext
 
     def __post_init__(self) -> None:
@@ -169,13 +179,14 @@ class UpdateTenantCommand:
 class TenantMutationResult:
     tenant: Tenant
     replayed: bool
+    changed: bool
 
 
 @dataclass(frozen=True, slots=True)
 class UpdateMemberCommand:
     membership_id: UUID
     expected_version: int
-    idempotency_key: str
+    idempotency_key: str = field(repr=False)
     audit_context: AuditContext
     status: MembershipStatus | None = None
     role_ids: tuple[UUID, ...] | None = None
@@ -209,7 +220,7 @@ class UpdateMemberCommand:
 class RevokeMemberCommand:
     membership_id: UUID
     expected_version: int
-    idempotency_key: str
+    idempotency_key: str = field(repr=False)
     audit_context: AuditContext
 
     def __post_init__(self) -> None:
@@ -256,6 +267,18 @@ class MemberPage:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorSessionState:
+    id: UUID
+    user_id: UUID
+    tenant_id: UUID | None
+    membership_id: UUID | None
+    auth_version_at_issue: int
+    authz_version_at_issue: int | None
+    revoked_at: datetime | None
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class TenantAuthorizationSnapshot:
     tenant: Tenant
     actor_membership: Membership
@@ -265,6 +288,7 @@ class TenantAuthorizationSnapshot:
     permissions: frozenset[str]
     role_codes: frozenset[str]
     target_memberships: Mapping[UUID, Membership]
+    actor_session: ActorSessionState | None
 
 
 class AuthorizationCacheInvalidationPort(Protocol):
@@ -375,6 +399,12 @@ class TenantRoleWorkflowRepositoryPort(Protocol):
         self, *, context: TenantContext, role_ids: tuple[UUID, ...]
     ) -> bool: ...
 
+    async def role_codes_for_ids(
+        self, *, context: TenantContext, role_ids: tuple[UUID, ...]
+    ) -> Mapping[UUID, str] | None: ...
+
+    async def count_active_owners_locked(self, *, context: TenantContext) -> int: ...
+
     async def replace_roles(
         self,
         *,
@@ -390,6 +420,7 @@ class TenantAuthorizationWorkflowRepositoryPort(Protocol):
     async def load_snapshot(
         self,
         *,
+        principal: Principal,
         context: TenantContext,
         target_membership_ids: tuple[UUID, ...] = (),
         for_update: bool = False,
@@ -397,6 +428,13 @@ class TenantAuthorizationWorkflowRepositoryPort(Protocol):
 
 
 class TenantSessionRevocationRepositoryPort(Protocol):
+    async def lock_for_membership(
+        self,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+    ) -> None: ...
+
     async def revoke_for_membership(
         self,
         *,
@@ -437,11 +475,16 @@ class TenantService:
         uow_factory: Callable[[], TenantWorkflowUnitOfWork],
         idempotency: IdempotencyService,
         cursor_secret: bytes,
+        authorization_cache: AuthorizationCacheInvalidationPort,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        authorization_cache: AuthorizationCacheInvalidationPort | None = None,
         policy: PolicyEngine | None = None,
     ) -> None:
-        if not callable(uow_factory) or not isinstance(idempotency, IdempotencyService):
+        if (
+            not callable(uow_factory)
+            or not isinstance(idempotency, IdempotencyService)
+            or authorization_cache is None
+            or not callable(getattr(authorization_cache, "invalidate", None))
+        ):
             raise ValueError("tenant service dependencies are invalid")
         self._uow_factory = uow_factory
         self._idempotency = idempotency
@@ -472,10 +515,13 @@ class TenantService:
                     key=command.idempotency_key,
                     method="POST",
                     canonical_route="/api/v1/tenants",
-                    body={
-                        "name": normalized_name.display_value,
-                        "tenant_type": command.tenant_type.value,
-                    },
+                    body=IdempotencyFingerprintPayload(
+                        values={
+                            "name": normalized_name.display_value,
+                            "tenant_type": command.tenant_type.value,
+                        },
+                        business_paths=frozenset({("name",), ("tenant_type",)}),
+                    ),
                 ),
                 now=now,
             )
@@ -560,8 +606,8 @@ class TenantService:
         normalized = normalize_tenant_name(command.name)
         now = self._now()
         async with self._uow_factory() as uow:
-            initial = await self._require_snapshot(uow, actor, for_update=False)
-            self._authorize(actor, initial, Action.TENANT_UPDATE)
+            locked = await self._require_snapshot(uow, actor, for_update=True)
+            self._authorize(actor, locked, Action.TENANT_UPDATE)
             reservation = await self._idempotency.reserve(
                 uow.idempotency,
                 scope=_membership_scope(actor),
@@ -570,10 +616,13 @@ class TenantService:
                     key=command.idempotency_key,
                     method="PATCH",
                     canonical_route=f"/api/v1/tenants/{actor.context.tenant_id}",
-                    body={
-                        "name": normalized.display_value,
-                        "if_match": command.expected_version,
-                    },
+                    body=IdempotencyFingerprintPayload(
+                        values={
+                            "name": normalized.display_value,
+                            "if_match": command.expected_version,
+                        },
+                        business_paths=frozenset({("name",), ("if_match",)}),
+                    ),
                 ),
                 now=now,
             )
@@ -583,46 +632,60 @@ class TenantService:
                     or reservation.replay.result_id != actor.context.tenant_id
                 ):
                     raise IdempotentResultUnavailable("tenant update replay is invalid")
-                replay = await uow.tenants.get_application_for_creator(
-                    user_id=initial.tenant.created_by_user_id,
-                    tenant_id=actor.context.tenant_id,
+                return TenantMutationResult(
+                    locked.tenant,
+                    True,
+                    reservation.replay.mutation_effect
+                    is not IdempotencyMutationEffect.NO_CHANGE,
                 )
-                if replay is None:
-                    raise IdempotentResultUnavailable("tenant update result is unavailable")
-                return TenantMutationResult(replay, True)
 
-            locked = await self._require_snapshot(uow, actor, for_update=True)
-            self._authorize(actor, locked, Action.TENANT_UPDATE)
-            updated = await uow.tenants.update_name(
-                context=locked.context,
-                name=normalized.display_value,
-                normalized_name=normalized.normalized_value,
-                expected_version=command.expected_version,
-                now=now,
-            )
-            if updated is None:
+            if locked.tenant.version != command.expected_version:
                 raise VersionConflict
-            await uow.audit.append(
-                _tenant_audit_event(
-                    command.audit_context,
-                    actor_user_id=actor.principal.user_id,
-                    tenant_id=updated.id,
-                    actor_membership_id=locked.actor_membership.id,
-                    action="tenant.update",
-                    reason_code="tenant_updated",
-                    target_type="tenant",
-                    target_id=updated.id,
+            changed = (
+                locked.tenant.name != normalized.display_value
+                or locked.tenant.normalized_name != normalized.normalized_value
+            )
+            updated = locked.tenant
+            if changed:
+                stored = await uow.tenants.update_name(
+                    context=locked.context,
+                    name=normalized.display_value,
+                    normalized_name=normalized.normalized_value,
+                    expected_version=command.expected_version,
                     now=now,
                 )
-            )
+                if stored is None:
+                    raise VersionConflict
+                updated = stored
+                await uow.audit.append(
+                    _tenant_audit_event(
+                        command.audit_context,
+                        actor_user_id=actor.principal.user_id,
+                        tenant_id=updated.id,
+                        actor_membership_id=locked.actor_membership.id,
+                        action="tenant.update",
+                        reason_code="tenant_updated",
+                        target_type="tenant",
+                        target_id=updated.id,
+                        now=now,
+                    )
+                )
             await self._idempotency.complete(
                 uow.idempotency,
                 reservation,
-                IdempotencyResultReference("tenant", updated.id),
+                IdempotencyResultReference(
+                    "tenant",
+                    updated.id,
+                    mutation_effect=(
+                        IdempotencyMutationEffect.CHANGED
+                        if changed
+                        else IdempotencyMutationEffect.NO_CHANGE
+                    ),
+                ),
                 now=now,
             )
             await uow.tenants.flush()
-            return TenantMutationResult(updated, False)
+            return TenantMutationResult(updated, False, changed)
 
     async def list_members(
         self,
@@ -727,10 +790,36 @@ class TenantService:
         changed = False
         result: MemberMutationResult
         async with self._uow_factory() as uow:
-            initial = await self._require_snapshot(uow, actor, for_update=False)
-            self._authorize(actor, initial, action)
+            initial = await self._require_snapshot(
+                uow,
+                actor,
+                target_membership_ids=(membership_id,),
+                for_update=False,
+            )
+            initial_target = initial.target_memberships.get(membership_id)
+            if initial_target is None:
+                raise TenantResourceNotFound
+            self._authorize_member_action(actor, initial, action, initial_target)
             if desired_role_ids is not None:
-                self._authorize(actor, initial, Action.ROLE_ASSIGN)
+                self._authorize_member_action(
+                    actor, initial, Action.ROLE_ASSIGN, initial_target
+                )
+            await uow.sessions.lock_for_membership(
+                tenant_id=actor.context.tenant_id,
+                membership_id=membership_id,
+            )
+            locked = await self._require_snapshot(
+                uow,
+                actor,
+                target_membership_ids=(membership_id,),
+                for_update=True,
+            )
+            current = locked.target_memberships.get(membership_id)
+            if current is None:
+                raise TenantResourceNotFound
+            self._authorize_member_action(actor, locked, action, current)
+            if desired_role_ids is not None:
+                self._authorize_member_action(actor, locked, Action.ROLE_ASSIGN, current)
             reservation = await self._idempotency.reserve(
                 uow.idempotency,
                 scope=_membership_scope(actor),
@@ -741,17 +830,30 @@ class TenantService:
                     canonical_route=(
                         f"/api/v1/tenants/{actor.context.tenant_id}/members/{membership_id}"
                     ),
-                    body={
-                        "status": None if status is None else status.value,
-                        "role_ids": (
-                            None
-                            if desired_role_ids is None
-                            else [str(value) for value in desired_role_ids]
+                    body=IdempotencyFingerprintPayload(
+                        values={
+                            "status": None if status is None else status.value,
+                            "role_ids": (
+                                None
+                                if desired_role_ids is None
+                                else [str(value) for value in desired_role_ids]
+                            ),
+                            "change_department": change_department,
+                            "department_id": (
+                                None if department_id is None else str(department_id)
+                            ),
+                            "if_match": expected_version,
+                        },
+                        business_paths=frozenset(
+                            {
+                                ("status",),
+                                ("role_ids",),
+                                ("change_department",),
+                                ("department_id",),
+                                ("if_match",),
+                            }
                         ),
-                        "change_department": change_department,
-                        "department_id": None if department_id is None else str(department_id),
-                        "if_match": expected_version,
-                    },
+                    ),
                 ),
                 now=now,
             )
@@ -761,40 +863,34 @@ class TenantService:
                     or reservation.replay.result_id != membership_id
                 ):
                     raise IdempotentResultUnavailable("membership replay is invalid")
-                replay_member = await uow.memberships.get(
-                    context=initial.context,
-                    membership_id=membership_id,
-                )
-                if replay_member is None:
-                    raise IdempotentResultUnavailable("membership replay is unavailable")
                 replay_roles = await uow.roles.role_ids(
-                    context=initial.context,
+                    context=locked.context,
                     membership_id=membership_id,
                 )
-                return MemberMutationResult(replay_member, replay_roles, True)
-
-            locked = await self._require_snapshot(
-                uow,
-                actor,
-                target_membership_ids=(membership_id,),
-                for_update=True,
-            )
-            self._authorize(actor, locked, action)
-            if desired_role_ids is not None:
-                self._authorize(actor, locked, Action.ROLE_ASSIGN)
-            current = locked.target_memberships.get(membership_id)
-            if current is None:
-                raise TenantResourceNotFound
+                replay_result = MemberMutationResult(current, replay_roles, True)
+                if reservation.replay.cache_authz_version is not None:
+                    await self._invalidate_authorization_cache(
+                        tenant_id=actor.context.tenant_id,
+                        membership_id=membership_id,
+                        authz_version=reservation.replay.cache_authz_version,
+                        result=replay_result,
+                    )
+                return replay_result
             if current.version != expected_version:
                 raise VersionConflict
             current_roles = await uow.roles.role_ids(
                 context=locked.context,
                 membership_id=membership_id,
             )
-            if desired_role_ids is not None and not await uow.roles.roles_exist(
+            current_role_map = await uow.roles.role_codes_for_ids(
                 context=locked.context,
-                role_ids=desired_role_ids,
-            ):
+                role_ids=current_roles,
+            )
+            requested_role_map = await uow.roles.role_codes_for_ids(
+                context=locked.context,
+                role_ids=(current_roles if desired_role_ids is None else desired_role_ids),
+            )
+            if current_role_map is None or requested_role_map is None:
                 raise TenantResourceNotFound
             if (
                 change_department
@@ -809,6 +905,21 @@ class TenantService:
             desired_status = current.status if status is None else status
             desired_department = current.department_id if not change_department else department_id
             desired_roles = current_roles if desired_role_ids is None else desired_role_ids
+            removes_active_owner = _validate_membership_mutation(
+                actor_membership=locked.actor_membership,
+                actor_role_codes=locked.role_codes,
+                actor_context=locked.context,
+                target=current,
+                current_role_codes=frozenset(current_role_map.values()),
+                desired_status=desired_status,
+                desired_department_id=desired_department,
+                desired_role_codes=frozenset(requested_role_map.values()),
+                action=action,
+            )
+            if removes_active_owner and await uow.roles.count_active_owners_locked(
+                context=locked.context
+            ) <= 1:
+                raise MembershipMutationDenied("cannot remove the last active owner")
             changed = (
                 desired_status is not current.status
                 or desired_department != current.department_id
@@ -858,7 +969,16 @@ class TenantService:
             await self._idempotency.complete(
                 uow.idempotency,
                 reservation,
-                IdempotencyResultReference("membership", membership_id),
+                IdempotencyResultReference(
+                    "membership",
+                    membership_id,
+                    mutation_effect=(
+                        IdempotencyMutationEffect.CHANGED
+                        if changed
+                        else IdempotencyMutationEffect.NO_CHANGE
+                    ),
+                    cache_authz_version=old_authz_version,
+                ),
                 now=now,
             )
             await uow.tenants.flush()
@@ -884,13 +1004,49 @@ class TenantService:
         if not isinstance(actor, TenantActor):
             raise ValueError("tenant actor must be strongly typed")
         snapshot = await uow.authorization.load_snapshot(
+            principal=actor.principal,
             context=actor.context,
             target_membership_ids=target_membership_ids,
             for_update=for_update,
         )
         if snapshot is None:
             raise TenantResourceNotFound
+        self._validate_authoritative_actor(actor, snapshot)
         return snapshot
+
+    def _validate_authoritative_actor(
+        self,
+        actor: TenantActor,
+        snapshot: TenantAuthorizationSnapshot,
+    ) -> None:
+        session = snapshot.actor_session
+        principal = actor.principal
+        original_context = actor.context
+        authoritative_context = snapshot.context
+        now = self._now()
+        if (
+            session is None
+            or session.id != principal.session_id
+            or session.user_id != principal.user_id
+            or session.tenant_id != principal.tenant_id
+            or session.membership_id != principal.membership_id
+            or principal.user_id != original_context.membership_user_id
+            or principal.tenant_id != original_context.tenant_id
+            or principal.membership_id != original_context.membership_id
+            or authoritative_context.membership_user_id != principal.user_id
+            or authoritative_context.membership_id != principal.membership_id
+            or session.revoked_at is not None
+            or session.expires_at <= now
+            or principal.session_valid is not True
+            or principal.auth_version != snapshot.user_auth_version
+            or principal.session_auth_version != snapshot.user_auth_version
+            or session.auth_version_at_issue != snapshot.user_auth_version
+            or original_context.authz_version != snapshot.actor_membership.authz_version
+            or original_context.session_authz_version
+            != snapshot.actor_membership.authz_version
+            or session.authz_version_at_issue != snapshot.actor_membership.authz_version
+        ):
+            raise TenantAuthorizationDenied("session_invalid")
 
     def _authorize(
         self,
@@ -918,6 +1074,40 @@ class TenantService:
         if not decision.allowed:
             raise TenantAuthorizationDenied(decision.reason_code)
 
+    def _authorize_member_action(
+        self,
+        actor: TenantActor,
+        snapshot: TenantAuthorizationSnapshot,
+        action: Action,
+        target: Membership,
+    ) -> None:
+        principal = replace(
+            actor.principal,
+            user_status=snapshot.user_status,
+            auth_version=snapshot.user_auth_version,
+            permissions=snapshot.permissions,
+            role_codes=snapshot.role_codes,
+        )
+        access_paths = (
+            frozenset({ResourceAccessPath.DEPARTMENT})
+            if target.department_id is not None
+            else frozenset()
+        )
+        decision = self._policy.decide(
+            principal,
+            snapshot.context,
+            action,
+            ResourceAttributes(
+                tenant_id=snapshot.tenant.id,
+                state=ResourceState.ACTIVE,
+                access_paths=access_paths,
+                department_id=target.department_id,
+            ),
+            self._now(),
+        )
+        if not decision.allowed:
+            raise TenantAuthorizationDenied(decision.reason_code)
+
     async def _invalidate_authorization_cache(
         self,
         *,
@@ -926,8 +1116,6 @@ class TenantService:
         authz_version: int,
         result: MemberMutationResult,
     ) -> None:
-        if self._authorization_cache is None:
-            return
         try:
             await self._authorization_cache.invalidate(
                 tenant_id=tenant_id,
@@ -1015,13 +1203,107 @@ def _require_positive_version(value: object) -> None:
         raise ValueError("version must be a positive integer")
 
 
+_ROLE_HIERARCHY = {
+    "tenant_owner": 100,
+    "tenant_admin": 80,
+    "department_admin": 60,
+    "lawyer_or_legal": 40,
+    "teacher": 40,
+    "assistant": 30,
+    "student": 10,
+    "external_client": 10,
+}
+
+
+def _validate_membership_mutation(
+    *,
+    actor_membership: Membership,
+    actor_role_codes: frozenset[str],
+    actor_context: TenantContext,
+    target: Membership,
+    current_role_codes: frozenset[str],
+    desired_status: MembershipStatus,
+    desired_department_id: UUID | None,
+    desired_role_codes: frozenset[str],
+    action: Action,
+) -> bool:
+    if target.status in {MembershipStatus.INVITED, MembershipStatus.REVOKED}:
+        raise MembershipMutationDenied("membership state cannot be changed by Task 7")
+    if action is Action.MEMBERSHIP_UPDATE:
+        if target.status not in {MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED} or (
+            desired_status not in {MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED}
+        ):
+            raise MembershipMutationDenied("membership state transition is not allowed")
+    elif action is Action.MEMBERSHIP_REVOKE:
+        if desired_status is not MembershipStatus.REVOKED:
+            raise MembershipMutationDenied("membership revoke transition is invalid")
+    else:
+        raise MembershipMutationDenied("membership mutation action is unsupported")
+
+    if not actor_role_codes or any(code not in _ROLE_HIERARCHY for code in actor_role_codes):
+        raise MembershipMutationDenied("actor role hierarchy is invalid")
+    if any(code not in _ROLE_HIERARCHY for code in current_role_codes | desired_role_codes):
+        raise MembershipMutationDenied("target role hierarchy is invalid")
+    actor_rank = max(_ROLE_HIERARCHY[code] for code in actor_role_codes)
+    target_rank = max((_ROLE_HIERARCHY[code] for code in current_role_codes), default=0)
+    desired_rank = max((_ROLE_HIERARCHY[code] for code in desired_role_codes), default=0)
+    actor_is_owner = "tenant_owner" in actor_role_codes
+    actor_is_admin = "tenant_admin" in actor_role_codes and not actor_is_owner
+    actor_is_department_admin = (
+        "department_admin" in actor_role_codes and not actor_is_owner and not actor_is_admin
+    )
+
+    if actor_is_admin and (
+        "tenant_owner" in current_role_codes or "tenant_owner" in desired_role_codes
+    ):
+        raise MembershipMutationDenied("tenant admin cannot grant or remove owner role")
+    if not actor_is_owner and target_rank >= actor_rank and target.id != actor_membership.id:
+        raise MembershipMutationDenied("actor cannot manage an equal or higher role")
+    if desired_rank > actor_rank:
+        raise MembershipMutationDenied("actor cannot grant a role above its hierarchy")
+    if "tenant_owner" in (current_role_codes ^ desired_role_codes) and not actor_is_owner:
+        raise MembershipMutationDenied("only an active owner may grant or remove owner role")
+    if "tenant_owner" in desired_role_codes and target.member_type is not MemberType.OWNER:
+        raise MembershipMutationDenied("owner role is incompatible with target member type")
+
+    if actor_is_department_admin:
+        if (
+            actor_membership.department_id is None
+            or target.department_id != actor_membership.department_id
+            or desired_department_id != actor_membership.department_id
+            or actor_context.department_id != actor_membership.department_id
+        ):
+            raise MembershipMutationDenied("department admin can manage only the same department")
+        if desired_rank > _ROLE_HIERARCHY["department_admin"]:
+            raise MembershipMutationDenied("department admin cannot grant a higher role")
+
+    if target.member_type is MemberType.STUDENT and desired_role_codes != frozenset({"student"}):
+        raise MembershipMutationDenied("roles are incompatible with student member type")
+    if target.member_type is MemberType.EXTERNAL_CLIENT and desired_role_codes != frozenset(
+        {"external_client"}
+    ):
+        raise MembershipMutationDenied("roles are incompatible with external member type")
+    if target.member_type is MemberType.INTERNAL and "tenant_owner" in desired_role_codes:
+        raise MembershipMutationDenied("roles are incompatible with internal member type")
+
+    was_active_owner = (
+        target.status is MembershipStatus.ACTIVE and "tenant_owner" in current_role_codes
+    )
+    remains_active_owner = (
+        desired_status is MembershipStatus.ACTIVE and "tenant_owner" in desired_role_codes
+    )
+    return was_active_owner and not remains_active_owner
+
+
 @dataclass(frozen=True, slots=True)
 class StrongETag:
     version: int
 
     def __post_init__(self) -> None:
-        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
-            raise InvalidStrongETag("ETag version must be a positive integer")
+        try:
+            _require_positive_version(self.version)
+        except ValueError:
+            raise InvalidStrongETag("ETag version must be a positive integer") from None
 
     @classmethod
     def parse(cls, value: str | None) -> StrongETag:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
@@ -9,7 +10,8 @@ from typing import Self
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, func, select
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -17,20 +19,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from alembic import command
 from lawyer_agent.application.idempotency import (
     IdempotencyConflictError,
+    IdempotencyFingerprintPayload,
     IdempotencyRequest,
     IdempotencyResultReference,
     IdempotencyScope,
     IdempotencyScopeType,
     IdempotencyService,
+    IdempotencyStatus,
 )
 from lawyer_agent.application.identity import AuditContext
+from lawyer_agent.application.sessions import SessionService, SwitchTenantCommand
 from lawyer_agent.application.tenancy import (
     CreateTenantApplicationCommand,
     MemberPageQuery,
+    MembershipMutationDenied,
     PostCommitCacheInvalidationError,
     RevokeMemberCommand,
     RoleTemplateUnavailable,
     TenantActor,
+    TenantAuthorizationDenied,
     TenantResourceNotFound,
     TenantService,
     TenantType,
@@ -49,6 +56,7 @@ from lawyer_agent.domain.tenancy import MembershipStatus, TenantContext, TenantS
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
     AuthSessionModel,
+    DepartmentModel,
     IdempotencyRecordModel,
     MembershipRoleAssignmentModel,
     PermissionModel,
@@ -65,11 +73,15 @@ from lawyer_agent.infrastructure.persistence.models import (
 from lawyer_agent.infrastructure.persistence.repositories.idempotency import (
     SqlAlchemyIdempotencyRepository,
 )
+from lawyer_agent.infrastructure.persistence.repositories.sessions import (
+    SqlAlchemySessionUnitOfWork,
+)
 from lawyer_agent.infrastructure.persistence.seed_authz import (
     TENANT_ROLE_TEMPLATES,
     seed_authorization_catalog,
 )
 from lawyer_agent.infrastructure.persistence.tenancy_uow import SqlAlchemyTenantWorkflowUnitOfWork
+from lawyer_agent.infrastructure.security.jwt_tokens import TokenService
 
 pytestmark = [pytest.mark.integration, pytest.mark.mysql]
 
@@ -112,6 +124,7 @@ async def database(
             await session.execute(delete(TenantRolePermissionModel))
             await session.execute(delete(TenantRoleModel))
             await session.execute(delete(TenantMembershipModel))
+            await session.execute(delete(DepartmentModel))
             await session.execute(delete(TenantModel))
             await session.execute(delete(UserModel))
         await engine.dispose()
@@ -122,7 +135,10 @@ def _request(*, name: str = "合成律所") -> IdempotencyRequest:
         key=KEY,
         method="POST",
         canonical_route="/api/v1/tenants",
-        body={"name": name, "tenant_type": "law_firm"},
+        body=IdempotencyFingerprintPayload(
+            values={"name": name, "tenant_type": "law_firm"},
+            business_paths=frozenset({("name",), ("tenant_type",)}),
+        ),
     )
 
 
@@ -144,12 +160,13 @@ def _tenant_service(
     uow_factory: Callable[[], TenantWorkflowUnitOfWork] | None = None,
     cache: object | None = None,
 ) -> TenantService:
+    effective_cache = _RecordingAuthorizationCache() if cache is None else cache
     return TenantService(
         uow_factory=uow_factory or (lambda: SqlAlchemyTenantWorkflowUnitOfWork(database)),
         idempotency=_service(),
         cursor_secret=b"c" * 32,
         clock=lambda: NOW,
-        authorization_cache=cache,  # type: ignore[arg-type]
+        authorization_cache=effective_cache,  # type: ignore[arg-type]
     )
 
 
@@ -222,6 +239,96 @@ class _RecordingAuthorizationCache:
             raise RuntimeError("synthetic cache outage")
 
 
+class _PauseAfterRefreshLockRepository:
+    def __init__(self, inner: object, locked: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._locked = locked
+        self._release = release
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def lock_refresh(self, token_hash: bytes) -> object:
+        result = await self._inner.lock_refresh(token_hash)  # type: ignore[attr-defined,no-any-return]
+        self._locked.set()
+        await self._release.wait()
+        return result
+
+
+class _PauseAfterRefreshLockUow:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        locked: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._inner = SqlAlchemySessionUnitOfWork(factory)
+        self._locked = locked
+        self._release = release
+
+    async def __aenter__(self) -> Self:
+        await self._inner.__aenter__()
+        self.sessions = _PauseAfterRefreshLockRepository(
+            self._inner.sessions, self._locked, self._release
+        )
+        self.audit = self._inner.audit
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+class _PauseBeforeLockedAuthorizationRepository:
+    def __init__(self, inner: object, reached: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._reached = reached
+        self._release = release
+
+    async def load_snapshot(self, **kwargs: object) -> object:
+        if kwargs.get("for_update") is True:
+            self._reached.set()
+            await self._release.wait()
+        return await self._inner.load_snapshot(**kwargs)  # type: ignore[attr-defined,no-any-return]
+
+
+class _PauseBeforeLockedAuthorizationUow:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        reached: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        self._inner = SqlAlchemyTenantWorkflowUnitOfWork(factory)
+        self._reached = reached
+        self._release = release
+
+    async def __aenter__(self) -> Self:
+        await self._inner.__aenter__()
+        self.tenants = self._inner.tenants
+        self.memberships = self._inner.memberships
+        self.roles = self._inner.roles
+        self.authorization = _PauseBeforeLockedAuthorizationRepository(
+            self._inner.authorization, self._reached, self._release
+        )
+        self.sessions = self._inner.sessions
+        self.idempotency = self._inner.idempotency
+        self.audit = self._inner.audit
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
 def test_task_7_idempotency_service_is_available() -> None:
     assert _service() is not None
 
@@ -289,6 +396,121 @@ async def test_same_key_with_other_fingerprint_is_conflict(
                 request=_request(name="另一合成律所"),
                 now=NOW,
             )
+
+
+@pytest.mark.asyncio
+async def test_expiry_never_allows_a_different_fingerprint_to_reuse_any_state(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    for terminal_status in (
+        IdempotencyStatus.RESERVED,
+        IdempotencyStatus.FAILED,
+        IdempotencyStatus.COMPLETED,
+    ):
+        scope = IdempotencyScope(IdempotencyScopeType.USER, new_uuid7())
+        async with database.begin() as session:
+            repository = SqlAlchemyIdempotencyRepository(session)
+            reservation = await _service().reserve(
+                repository, scope=scope, operation="tenant.create", request=_request(), now=NOW
+            )
+            if terminal_status is IdempotencyStatus.FAILED:
+                await _service().fail(repository, reservation, now=NOW)
+            elif terminal_status is IdempotencyStatus.COMPLETED:
+                await _service().complete(
+                    repository,
+                    reservation,
+                    IdempotencyResultReference("tenant", new_uuid7()),
+                    now=NOW,
+                )
+
+        for attempted_at in (NOW + timedelta(minutes=1), NOW + timedelta(days=2)):
+            async with database.begin() as session:
+                with pytest.raises(IdempotencyConflictError):
+                    await _service().reserve(
+                        SqlAlchemyIdempotencyRepository(session),
+                        scope=scope,
+                        operation="tenant.create",
+                        request=_request(name="不同业务请求"),
+                        now=attempted_at,
+                    )
+
+
+@pytest.mark.asyncio
+async def test_same_fingerprint_replays_completed_after_expiry_and_recovers_expired_reserved(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    completed_scope = IdempotencyScope(IdempotencyScopeType.USER, new_uuid7())
+    completed_result = IdempotencyResultReference("tenant", new_uuid7())
+    reserved_scope = IdempotencyScope(IdempotencyScopeType.USER, new_uuid7())
+    async with database.begin() as session:
+        repository = SqlAlchemyIdempotencyRepository(session)
+        completed = await _service().reserve(
+            repository,
+            scope=completed_scope,
+            operation="tenant.create",
+            request=_request(),
+            now=NOW,
+        )
+        await _service().complete(repository, completed, completed_result, now=NOW)
+        await _service().reserve(
+            repository,
+            scope=reserved_scope,
+            operation="tenant.create",
+            request=_request(),
+            now=NOW,
+        )
+
+    async with database.begin() as session:
+        repository = SqlAlchemyIdempotencyRepository(session)
+        replay = await _service().reserve(
+            repository,
+            scope=completed_scope,
+            operation="tenant.create",
+            request=_request(),
+            now=NOW + timedelta(days=2),
+        )
+        recovered = await _service().reserve(
+            repository,
+            scope=reserved_scope,
+            operation="tenant.create",
+            request=_request(),
+            now=NOW + timedelta(days=2),
+        )
+
+        assert replay.replay == completed_result
+        assert recovered.replay is None
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecordModel)) == 2
+
+
+@pytest.mark.asyncio
+async def test_repository_restart_is_a_fingerprint_status_and_expiry_cas(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = IdempotencyScope(IdempotencyScopeType.USER, new_uuid7())
+    async with database.begin() as session:
+        repository = SqlAlchemyIdempotencyRepository(session)
+        reservation = await _service().reserve(
+            repository, scope=scope, operation="tenant.create", request=_request(), now=NOW
+        )
+
+    async with database.begin() as session:
+        repository = SqlAlchemyIdempotencyRepository(session)
+        assert not await repository.restart(
+            record_id=reservation.record_id,
+            old_request_fingerprint=b"x" * 32,
+            new_request_fingerprint=reservation.request_fingerprint,
+            allowed_statuses=frozenset({IdempotencyStatus.RESERVED}),
+            expired_before=NOW + timedelta(days=2),
+            expires_at=NOW + timedelta(days=3),
+        )
+        assert not await repository.restart(
+            record_id=reservation.record_id,
+            old_request_fingerprint=reservation.request_fingerprint,
+            new_request_fingerprint=reservation.request_fingerprint,
+            allowed_statuses=frozenset({IdempotencyStatus.FAILED}),
+            expired_before=None,
+            expires_at=NOW + timedelta(days=3),
+        )
 
 
 @pytest.mark.asyncio
@@ -425,7 +647,10 @@ async def test_membership_scope_composite_fk_rejects_cross_tenant_reference(
                     key=KEY,
                     method="PATCH",
                     canonical_route=f"/api/v1/tenants/{tenant_a}/members/{membership_b}",
-                    body={"status": "suspended"},
+                    body=IdempotencyFingerprintPayload(
+                        values={"status": "suspended"},
+                        business_paths=frozenset({("status",)}),
+                    ),
                 ),
                 now=NOW,
             )
@@ -618,6 +843,52 @@ def _actor(created: object, user_id: object) -> TenantActor:
     )
 
 
+async def _actor_with_session(
+    database: async_sessionmaker[AsyncSession],
+    created: object,
+    user_id: object,
+    *,
+    department_id: object | None = None,
+) -> TenantActor:
+    actor = _actor(created, user_id)
+    session_id = actor.principal.session_id
+    family_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            AuthSessionModel(
+                id=session_id,
+                user_id=user_id,
+                tenant_id=actor.context.tenant_id,
+                membership_id=actor.context.membership_id,
+                current_family_id=family_id,
+                auth_version_at_issue=1,
+                authz_version_at_issue=1,
+                revoked_at=None,
+                revocation_reason=None,
+                last_seen_at=NOW.replace(tzinfo=None),
+                expires_at=(NOW + timedelta(days=1)).replace(tzinfo=None),
+            )
+        )
+    if department_id is None:
+        return actor
+    return TenantActor(
+        principal=actor.principal,
+        context=TenantContext(
+            tenant_id=actor.context.tenant_id,
+            membership_id=actor.context.membership_id,
+            membership_user_id=actor.context.membership_user_id,
+            department_id=department_id,  # type: ignore[arg-type]
+            tenant_status=actor.context.tenant_status,
+            membership_status=actor.context.membership_status,
+            valid_from=actor.context.valid_from,
+            valid_until=actor.context.valid_until,
+            authz_version=actor.context.authz_version,
+            session_authz_version=actor.context.session_authz_version,
+            scope=actor.context.scope,
+        ),
+    )
+
+
 async def _add_internal_member_with_session(
     database: async_sessionmaker[AsyncSession],
     *,
@@ -686,6 +957,119 @@ async def _add_internal_member_with_session(
     return user_id, membership_id, session_id, refresh_id
 
 
+async def _tenant_roles(
+    database: async_sessionmaker[AsyncSession], tenant_id: object
+) -> dict[str, object]:
+    async with database() as session:
+        rows = (
+            await session.execute(
+                select(TenantRoleModel.code, TenantRoleModel.id).where(
+                    TenantRoleModel.tenant_id == tenant_id
+                )
+            )
+        ).all()
+    return dict(rows)
+
+
+async def _add_member(
+    database: async_sessionmaker[AsyncSession],
+    *,
+    tenant_id: object,
+    member_type: str,
+    status: str = "active",
+    department_id: object | None = None,
+    role_codes: tuple[str, ...] = (),
+) -> tuple[object, object]:
+    user_id, membership_id = new_uuid7(), new_uuid7()
+    roles = await _tenant_roles(database, tenant_id)
+    async with database.begin() as session:
+        session.add(UserModel(id=user_id, status="active", display_name="合成权限成员"))
+        await session.flush()
+        session.add(
+            TenantMembershipModel(
+                id=membership_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                department_id=department_id,
+                member_type=member_type,
+                status=status,
+                valid_from=NOW.replace(tzinfo=None),
+                valid_until=None,
+                authz_version=1,
+                version=1,
+            )
+        )
+        await session.flush()
+        for code in role_codes:
+            session.add(
+                MembershipRoleAssignmentModel(
+                    tenant_id=tenant_id,
+                    membership_id=membership_id,
+                    tenant_role_id=roles[code],
+                    assigned_by_membership_id=membership_id,
+                    created_at=NOW.replace(tzinfo=None),
+                )
+            )
+    return user_id, membership_id
+
+
+async def _actor_for_membership(
+    database: async_sessionmaker[AsyncSession],
+    created: object,
+    *,
+    user_id: object,
+    membership_id: object,
+    department_id: object | None,
+    scope: AuthorizationScope,
+) -> TenantActor:
+    session_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            AuthSessionModel(
+                id=session_id,
+                user_id=user_id,
+                tenant_id=created.tenant.id,  # type: ignore[attr-defined]
+                membership_id=membership_id,
+                current_family_id=new_uuid7(),
+                auth_version_at_issue=1,
+                authz_version_at_issue=1,
+                revoked_at=None,
+                revocation_reason=None,
+                last_seen_at=NOW.replace(tzinfo=None),
+                expires_at=(NOW + timedelta(days=1)).replace(tzinfo=None),
+            )
+        )
+    return TenantActor(
+        principal=Principal(
+            user_id=user_id,  # type: ignore[arg-type]
+            session_id=session_id,
+            audience=PrincipalAudience.TENANT,
+            tenant_id=created.tenant.id,  # type: ignore[attr-defined]
+            membership_id=membership_id,  # type: ignore[arg-type]
+            user_status="active",
+            session_valid=True,
+            auth_version=1,
+            session_auth_version=1,
+            permissions=frozenset(),
+            role_codes=frozenset(),
+            authenticated_at=NOW - timedelta(minutes=1),
+        ),
+        context=TenantContext(
+            tenant_id=created.tenant.id,  # type: ignore[attr-defined]
+            membership_id=membership_id,  # type: ignore[arg-type]
+            membership_user_id=user_id,  # type: ignore[arg-type]
+            department_id=department_id,  # type: ignore[arg-type]
+            tenant_status=TenantStatus.PENDING_VERIFICATION,
+            membership_status=MembershipStatus.ACTIVE,
+            valid_from=NOW,
+            valid_until=None,
+            authz_version=1,
+            session_authz_version=1,
+            scope=scope,
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_and_update_tenant_use_authoritative_policy_etag_and_idempotency(
     database: async_sessionmaker[AsyncSession],
@@ -693,7 +1077,7 @@ async def test_get_and_update_tenant_use_authoritative_policy_etag_and_idempoten
     user_id = await _add_active_user(database)
     service = _tenant_service(database)
     created = await service.create_application(_create_command(user_id))
-    actor = _actor(created, user_id)
+    actor = await _actor_with_session(database, created, user_id)
 
     assert await service.get(actor) == created.tenant
     updated = await service.update(
@@ -733,6 +1117,72 @@ async def test_get_and_update_tenant_use_authoritative_policy_etag_and_idempoten
 
 
 @pytest.mark.asyncio
+async def test_tenant_name_normalized_no_op_keeps_version_and_writes_no_update_audit(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(user_id))
+    actor = await _actor_with_session(database, created, user_id)
+
+    result = await service.update(
+        actor,
+        UpdateTenantCommand(
+            name="　合成律所　",
+            expected_version=1,
+            idempotency_key="tenant-no-change-key-01",
+            audit_context=_audit_context(),
+        ),
+    )
+
+    assert result.changed is False
+    assert result.tenant.version == 1
+    async with database() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.tenant_id == created.tenant.id,
+                AuditEventModel.action == "tenant.update",
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tenant_updates_lock_actor_before_idempotency_and_return_version_conflict(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    actor_a = await _actor_with_session(database, created, owner)
+    actor_b = await _actor_with_session(database, created, owner)
+
+    outcomes = await asyncio.gather(
+        service.update(
+            actor_a,
+            UpdateTenantCommand(
+                name="并发名称甲",
+                expected_version=1,
+                idempotency_key="tenant-concurrent-update-01",
+                audit_context=_audit_context(),
+            ),
+        ),
+        service.update(
+            actor_b,
+            UpdateTenantCommand(
+                name="并发名称乙",
+                expected_version=1,
+                idempotency_key="tenant-concurrent-update-02",
+                audit_context=_audit_context(),
+            ),
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
+    assert sum(isinstance(value, VersionConflict) for value in outcomes) == 1, outcomes
+
+
+@pytest.mark.asyncio
 async def test_member_role_change_increments_versions_revokes_sessions_and_invalidates_old_cache(
     database: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -754,7 +1204,7 @@ async def test_member_role_change_increments_versions_revokes_sessions_and_inval
         assert role_id is not None
 
     changed = await service.update_member(
-        _actor(created, owner_user_id),
+        await _actor_with_session(database, created, owner_user_id),
         UpdateMemberCommand(
             membership_id=target_id,  # type: ignore[arg-type]
             status=MembershipStatus.SUSPENDED,
@@ -787,7 +1237,7 @@ async def test_member_role_change_increments_versions_revokes_sessions_and_inval
         ) == 1
 
     replay = await service.update_member(
-        _actor(created, owner_user_id),
+        await _actor_with_session(database, created, owner_user_id),
         UpdateMemberCommand(
             membership_id=target_id,  # type: ignore[arg-type]
             status=MembershipStatus.SUSPENDED,
@@ -798,7 +1248,10 @@ async def test_member_role_change_increments_versions_revokes_sessions_and_inval
         ),
     )
     assert replay.replayed and replay.membership.version == 2
-    assert cache.invalidations == [(created.tenant.id, target_id, 1)]
+    assert cache.invalidations == [
+        (created.tenant.id, target_id, 1),
+        (created.tenant.id, target_id, 1),
+    ]
 
 
 @pytest.mark.asyncio
@@ -825,7 +1278,7 @@ async def test_revoke_member_uses_strong_version_and_is_cross_tenant_isolated(
 
     with pytest.raises(TenantResourceNotFound):
         await _tenant_service(database).revoke_member(
-            _actor(created_a, owner_a),
+            await _actor_with_session(database, created_a, owner_a),
             RevokeMemberCommand(
                 membership_id=target_b,  # type: ignore[arg-type]
                 expected_version=1,
@@ -842,7 +1295,7 @@ async def test_revoke_member_uses_strong_version_and_is_cross_tenant_isolated(
         tenant_id=created_a.tenant.id,
     )
     revoked = await _tenant_service(database).revoke_member(
-        _actor(created_a, owner_a),
+        await _actor_with_session(database, created_a, owner_a),
         RevokeMemberCommand(
             membership_id=target_a,  # type: ignore[arg-type]
             expected_version=1,
@@ -867,20 +1320,33 @@ async def test_cache_invalidation_failure_is_explicit_after_committed_fact(
     )
     cache = _RecordingAuthorizationCache(fail=True)
 
+    service = _tenant_service(database, cache=cache)
+    command = RevokeMemberCommand(
+        membership_id=target,  # type: ignore[arg-type]
+        expected_version=1,
+        idempotency_key="member-revoke-key-003",
+        audit_context=_audit_context(),
+    )
+    actor = await _actor_with_session(database, created, owner)
     with pytest.raises(PostCommitCacheInvalidationError) as caught:
-        await _tenant_service(database, cache=cache).revoke_member(
-            _actor(created, owner),
-            RevokeMemberCommand(
-                membership_id=target,  # type: ignore[arg-type]
-                expected_version=1,
-                idempotency_key="member-revoke-key-003",
-                audit_context=_audit_context(),
-            ),
-        )
+        await service.revoke_member(actor, command)
     assert caught.value.committed is True
+    cache.fail = False
+    recovered = await service.revoke_member(actor, command)
+    assert recovered.replayed
+    assert cache.invalidations == [
+        (created.tenant.id, target, 1),
+        (created.tenant.id, target, 1),
+    ]
     async with database() as session:
         committed = await session.get(TenantMembershipModel, target)
-        assert committed is not None and committed.status == "revoked"
+        assert committed is not None and committed.status == "revoked" and committed.version == 2
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.tenant_id == created.tenant.id,
+                AuditEventModel.action == "membership.revoke",
+            )
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -897,7 +1363,7 @@ async def test_member_cursor_pagination_is_stable_bounded_and_tenant_bound(
     cursor = None
     for _ in range(4):
         page = await service.list_members(
-            _actor(created, owner),
+            await _actor_with_session(database, created, owner),
             MemberPageQuery(limit=1, cursor=cursor),
         )
         assert len(page.items) == 1
@@ -918,13 +1384,13 @@ async def test_member_cursor_pagination_is_stable_bounded_and_tenant_bound(
         )
     )
     first_page = await service.list_members(
-        _actor(created, owner),
+        await _actor_with_session(database, created, owner),
         MemberPageQuery(limit=1, cursor=None),
     )
     assert first_page.next_cursor is not None
     with pytest.raises(Exception, match="cursor"):
         await service.list_members(
-            _actor(other, other_owner),
+            await _actor_with_session(database, other, other_owner),
             MemberPageQuery(limit=1, cursor=first_page.next_cursor),
         )
 
@@ -943,7 +1409,7 @@ async def test_concurrent_member_updates_with_same_etag_allow_only_one_commit(
 
     async def update_with(key: str, status: MembershipStatus) -> object:
         return await service.update_member(
-            _actor(created, owner),
+            await _actor_with_session(database, created, owner),
             UpdateMemberCommand(
                 membership_id=target,  # type: ignore[arg-type]
                 status=status,
@@ -959,7 +1425,7 @@ async def test_concurrent_member_updates_with_same_etag_allow_only_one_commit(
         return_exceptions=True,
     )
     assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
-    assert sum(isinstance(value, VersionConflict) for value in outcomes) == 1
+    assert sum(isinstance(value, VersionConflict) for value in outcomes) == 1, outcomes
     async with database() as session:
         stored = await session.get(TenantMembershipModel, target)
         assert stored is not None and stored.version == 2 and stored.authz_version == 2
@@ -998,7 +1464,7 @@ async def test_cross_tenant_role_id_is_rejected_before_assignment(
 
     with pytest.raises(TenantResourceNotFound):
         await service.update_member(
-            _actor(created_a, owner_a),
+            await _actor_with_session(database, created_a, owner_a),
             UpdateMemberCommand(
                 membership_id=target_a,  # type: ignore[arg-type]
                 role_ids=(role_b,),
@@ -1016,3 +1482,600 @@ async def test_cross_tenant_role_id_is_rejected_before_assignment(
                 MembershipRoleAssignmentModel.membership_id == target_a,
             )
         ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["invited", "revoked"])
+async def test_invited_and_revoked_memberships_cannot_be_changed_by_task_7_patch(
+    database: async_sessionmaker[AsyncSession], status: str
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    _, target = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        status=status,
+    )
+
+    with pytest.raises(MembershipMutationDenied, match="state"):
+        await service.update_member(
+            await _actor_with_session(database, created, owner),
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                status=MembershipStatus.SUSPENDED,
+                expected_version=1,
+                idempotency_key=f"member-state-{status}-0001",
+                audit_context=_audit_context(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("member_type", "requested_role"),
+    [("student", "lawyer_or_legal"), ("external_client", "tenant_admin")],
+)
+async def test_external_and_student_members_cannot_receive_internal_or_privileged_roles(
+    database: async_sessionmaker[AsyncSession], member_type: str, requested_role: str
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    _, target = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type=member_type,
+        role_codes=(("student",) if member_type == "student" else ("external_client",)),
+    )
+    roles = await _tenant_roles(database, created.tenant.id)
+
+    with pytest.raises(MembershipMutationDenied, match="member type"):
+        await service.update_member(
+            await _actor_with_session(database, created, owner),
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                role_ids=(roles[requested_role],),  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key=f"member-type-{member_type}-0001",
+                audit_context=_audit_context(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_tenant_admin_cannot_touch_owner_role_or_promote_itself_to_owner(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    admin_user, admin_membership = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        role_codes=("tenant_admin",),
+    )
+    roles = await _tenant_roles(database, created.tenant.id)
+    admin_actor = await _actor_for_membership(
+        database,
+        created,
+        user_id=admin_user,
+        membership_id=admin_membership,
+        department_id=None,
+        scope=AuthorizationScope(allow_tenant_wide=True),
+    )
+
+    with pytest.raises(MembershipMutationDenied, match="owner"):
+        await service.update_member(
+            admin_actor,
+            UpdateMemberCommand(
+                membership_id=created.owner_membership.id,
+                role_ids=(),
+                expected_version=1,
+                idempotency_key="tenant-admin-remove-owner-01",
+                audit_context=_audit_context(),
+            ),
+        )
+    with pytest.raises(MembershipMutationDenied, match="owner"):
+        await service.update_member(
+            admin_actor,
+            UpdateMemberCommand(
+                membership_id=admin_membership,  # type: ignore[arg-type]
+                role_ids=(roles["tenant_admin"], roles["tenant_owner"]),  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key="tenant-admin-self-owner-001",
+                audit_context=_audit_context(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_active_owner_cannot_be_revoked_or_have_owner_role_removed(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    actor = await _actor_with_session(database, created, owner)
+
+    with pytest.raises(MembershipMutationDenied, match="last active owner"):
+        await service.revoke_member(
+            actor,
+            RevokeMemberCommand(
+                membership_id=created.owner_membership.id,
+                expected_version=1,
+                idempotency_key="last-owner-revoke-0001",
+                audit_context=_audit_context(),
+            ),
+        )
+    with pytest.raises(MembershipMutationDenied, match="last active owner"):
+        await service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=created.owner_membership.id,
+                role_ids=(),
+                expected_version=1,
+                idempotency_key="last-owner-remove-role-1",
+                audit_context=_audit_context(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_owner_revocations_never_remove_the_last_active_owner(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner_a = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner_a))
+    owner_b, membership_b = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="owner",
+        role_codes=("tenant_owner",),
+    )
+    actor_a = await _actor_with_session(database, created, owner_a)
+    actor_b = await _actor_for_membership(
+        database,
+        created,
+        user_id=owner_b,
+        membership_id=membership_b,
+        department_id=None,
+        scope=AuthorizationScope(allow_tenant_wide=True),
+    )
+
+    outcomes = await asyncio.gather(
+        service.revoke_member(
+            actor_a,
+            RevokeMemberCommand(
+                membership_id=membership_b,  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key="owners-concurrent-revoke-1",
+                audit_context=_audit_context(),
+            ),
+        ),
+        service.revoke_member(
+            actor_b,
+            RevokeMemberCommand(
+                membership_id=created.owner_membership.id,
+                expected_version=1,
+                idempotency_key="owners-concurrent-revoke-2",
+                audit_context=_audit_context(),
+            ),
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
+    async with database() as session:
+        active_owners = await session.scalar(
+            select(func.count()).select_from(TenantMembershipModel).join(
+                MembershipRoleAssignmentModel,
+                MembershipRoleAssignmentModel.membership_id == TenantMembershipModel.id,
+            ).join(
+                TenantRoleModel,
+                TenantRoleModel.id == MembershipRoleAssignmentModel.tenant_role_id,
+            ).where(
+                TenantMembershipModel.tenant_id == created.tenant.id,
+                TenantMembershipModel.status == "active",
+                TenantRoleModel.code == "tenant_owner",
+            )
+        )
+        assert active_owners == 1
+
+
+@pytest.mark.asyncio
+async def test_disjoint_owner_revocations_use_one_stable_owner_lock_order(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner_a = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner_a))
+    owners = [
+        await _add_member(
+            database,
+            tenant_id=created.tenant.id,
+            member_type="owner",
+            role_codes=("tenant_owner",),
+        )
+        for _ in range(3)
+    ]
+    (owner_b, membership_b), (owner_c, membership_c), (_, membership_d) = owners
+    actor_a = await _actor_with_session(database, created, owner_a)
+    actor_c = await _actor_for_membership(
+        database,
+        created,
+        user_id=owner_c,
+        membership_id=membership_c,
+        department_id=None,
+        scope=AuthorizationScope(allow_tenant_wide=True),
+    )
+    del owner_b
+
+    outcomes = await asyncio.gather(
+        service.revoke_member(
+            actor_a,
+            RevokeMemberCommand(
+                membership_id=membership_b,  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key="owners-disjoint-revoke-key-1",
+                audit_context=_audit_context(),
+            ),
+        ),
+        service.revoke_member(
+            actor_c,
+            RevokeMemberCommand(
+                membership_id=membership_d,  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key="owners-disjoint-revoke-key-2",
+                audit_context=_audit_context(),
+            ),
+        ),
+        return_exceptions=True,
+    )
+
+    assert all(not isinstance(value, BaseException) for value in outcomes), outcomes
+
+
+@pytest.mark.asyncio
+async def test_department_admin_is_limited_to_same_department_and_cannot_grant_higher_role(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    department_a, department_b = new_uuid7(), new_uuid7()
+    async with database.begin() as session:
+        session.add_all(
+            [
+                DepartmentModel(
+                    id=department_a,
+                    tenant_id=created.tenant.id,
+                    name="部门甲",
+                    status="active",
+                ),
+                DepartmentModel(
+                    id=department_b,
+                    tenant_id=created.tenant.id,
+                    name="部门乙",
+                    status="active",
+                ),
+            ]
+        )
+    admin_user, admin_membership = await _add_member(
+        database,
+        tenant_id=created.tenant.id,
+        member_type="internal",
+        department_id=department_a,
+        role_codes=("department_admin",),
+    )
+    _, target_a = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal", department_id=department_a
+    )
+    _, target_b = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal", department_id=department_b
+    )
+    actor = await _actor_for_membership(
+        database,
+        created,
+        user_id=admin_user,
+        membership_id=admin_membership,
+        department_id=department_a,
+        scope=AuthorizationScope(department_ids=frozenset({department_a})),
+    )
+    roles = await _tenant_roles(database, created.tenant.id)
+
+    changed = await service.update_member(
+        actor,
+        UpdateMemberCommand(
+            membership_id=target_a,  # type: ignore[arg-type]
+            status=MembershipStatus.SUSPENDED,
+            expected_version=1,
+            idempotency_key="department-admin-same-dept-1",
+            audit_context=_audit_context(),
+        ),
+    )
+    assert changed.membership.status is MembershipStatus.SUSPENDED
+    with pytest.raises(TenantAuthorizationDenied) as other_department:
+        await service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=target_b,  # type: ignore[arg-type]
+                status=MembershipStatus.SUSPENDED,
+                expected_version=1,
+                idempotency_key="department-admin-other-dept-1",
+                audit_context=_audit_context(),
+            ),
+        )
+    assert other_department.value.reason_code == "resource_scope_denied"
+    with pytest.raises(TenantAuthorizationDenied) as higher_role:
+        await service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=target_a,  # type: ignore[arg-type]
+                role_ids=(roles["tenant_admin"],),  # type: ignore[arg-type]
+                expected_version=2,
+                idempotency_key="department-admin-high-role-01",
+                audit_context=_audit_context(),
+            ),
+        )
+    assert higher_role.value.reason_code == "permission_denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_change", ["revoked", "expired", "auth_version_drift"])
+async def test_member_write_rejects_authoritatively_invalid_actor_session(
+    database: async_sessionmaker[AsyncSession], session_change: str
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    _, target = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    actor = await _actor_with_session(database, created, owner)
+    async with database.begin() as session:
+        stored = await session.get(AuthSessionModel, actor.principal.session_id)
+        assert stored is not None
+        if session_change == "revoked":
+            stored.revoked_at = (NOW - timedelta(seconds=1)).replace(tzinfo=None)
+            stored.revocation_reason = "user_requested"
+        elif session_change == "expired":
+            stored.expires_at = (NOW - timedelta(seconds=1)).replace(tzinfo=None)
+        else:
+            user = await session.get(UserModel, owner)
+            assert user is not None
+            user.auth_version = 2
+            stored.auth_version_at_issue = 1
+            actor = TenantActor(
+                principal=replace(
+                    actor.principal,
+                    auth_version=2,
+                    session_auth_version=2,
+                ),
+                context=actor.context,
+            )
+
+    with pytest.raises(TenantAuthorizationDenied) as denied:
+        await service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                status=MembershipStatus.SUSPENDED,
+                expected_version=1,
+                idempotency_key=f"invalid-actor-session-{session_change}-01",
+                audit_context=_audit_context(),
+            ),
+        )
+    assert denied.value.reason_code == "session_invalid"
+
+
+@pytest.mark.asyncio
+async def test_member_write_rejects_unbound_principal_session_id(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    service = _tenant_service(database)
+    created = await service.create_application(_create_command(owner))
+    _, target = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    actor = await _actor_with_session(database, created, owner)
+    actor = TenantActor(
+        principal=replace(actor.principal, session_id=new_uuid7()),
+        context=actor.context,
+    )
+
+    with pytest.raises(TenantAuthorizationDenied) as denied:
+        await service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                status=MembershipStatus.SUSPENDED,
+                expected_version=1,
+                idempotency_key="unbound-principal-session-01",
+                audit_context=_audit_context(),
+            ),
+        )
+    assert denied.value.reason_code == "session_invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor_change", ["user_disabled", "session_revoked", "membership_revoked"])
+async def test_actor_security_change_committed_before_locked_snapshot_rejects_write(
+    database: async_sessionmaker[AsyncSession], actor_change: str
+) -> None:
+    owner = await _add_active_user(database)
+    created = await _tenant_service(database).create_application(_create_command(owner))
+    _, target = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    actor = await _actor_with_session(database, created, owner)
+    reached, release = asyncio.Event(), asyncio.Event()
+    service = _tenant_service(
+        database,
+        uow_factory=lambda: _PauseBeforeLockedAuthorizationUow(database, reached, release),
+    )
+    task = asyncio.create_task(
+        service.update_member(
+            actor,
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                status=MembershipStatus.SUSPENDED,
+                expected_version=1,
+                idempotency_key=f"actor-concurrent-change-{actor_change}",
+                audit_context=_audit_context(),
+            ),
+        )
+    )
+    await asyncio.wait_for(reached.wait(), timeout=5)
+    async with database.begin() as session:
+        if actor_change == "user_disabled":
+            await session.execute(
+                update(UserModel).where(UserModel.id == owner).values(status="disabled")
+            )
+        elif actor_change == "session_revoked":
+            await session.execute(
+                update(AuthSessionModel)
+                .where(AuthSessionModel.id == actor.principal.session_id)
+                .values(
+                    revoked_at=(NOW - timedelta(seconds=1)).replace(tzinfo=None),
+                    revocation_reason="user_requested",
+                )
+            )
+        else:
+            await session.execute(
+                update(TenantMembershipModel)
+                .where(TenantMembershipModel.id == created.owner_membership.id)
+                .values(status="revoked", authz_version=2, version=2)
+            )
+    release.set()
+    outcome = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert isinstance(outcome[0], TenantAuthorizationDenied)
+    async with database() as session:
+        untouched = await session.get(TenantMembershipModel, target)
+        assert untouched is not None and untouched.status == "active" and untouched.version == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_member_change_share_refresh_then_session_lock_order_without_deadlock(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = await _add_active_user(database)
+    tenant_service = _tenant_service(database)
+    created = await tenant_service.create_application(_create_command(owner))
+    target_user, target_membership = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    async with database.begin() as session:
+        await session.execute(
+            update(TenantModel)
+            .where(TenantModel.id == created.tenant.id)
+            .values(status="active", review_status="approved")
+        )
+
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-lock-key",
+        signing_keys={"task7-lock-key": private_key},
+        verification_keys={"task7-lock-key": private_key.public_key()},
+    )
+    base_sessions = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"r" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    account = await base_sessions.start(
+        user_id=target_user,  # type: ignore[arg-type]
+        audit_context=_audit_context(),
+    )
+    tenant_session = await base_sessions.switch_tenant(
+        SwitchTenantCommand(
+            account.session_id,
+            created.tenant.id,
+            target_membership,  # type: ignore[arg-type]
+        ),
+        audit_context=_audit_context(),
+    )
+
+    refresh_locked, release_refresh = asyncio.Event(), asyncio.Event()
+    paused_sessions = SessionService(
+        uow_factory=lambda: _PauseAfterRefreshLockUow(
+            database, refresh_locked, release_refresh
+        ),  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"r" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    mutation_sql_started = asyncio.Event()
+    engine = database.kw["bind"]
+
+    def observe_mutation_sql(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        normalized = " ".join(statement.casefold().split())
+        if (
+            normalized.startswith("update auth_sessions")
+            or (
+                "from refresh_token_records" in normalized
+                and "for update" in normalized
+            )
+        ):
+            mutation_sql_started.set()
+
+    refresh_task = asyncio.create_task(
+        paused_sessions.refresh(tenant_session.refresh_token, audit_context=_audit_context())
+    )
+    await asyncio.wait_for(refresh_locked.wait(), timeout=5)
+    event.listen(engine.sync_engine, "before_cursor_execute", observe_mutation_sql)
+    try:
+        mutation_task = asyncio.create_task(
+            tenant_service.update_member(
+                await _actor_with_session(database, created, owner),
+                UpdateMemberCommand(
+                    membership_id=target_membership,  # type: ignore[arg-type]
+                    status=MembershipStatus.SUSPENDED,
+                    expected_version=1,
+                    idempotency_key="refresh-member-lock-order-01",
+                    audit_context=_audit_context(),
+                ),
+            )
+        )
+        await asyncio.wait_for(mutation_sql_started.wait(), timeout=5)
+        release_refresh.set()
+        refresh_outcome, mutation_outcome = await asyncio.wait_for(
+            asyncio.gather(refresh_task, mutation_task, return_exceptions=True),
+            timeout=10,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe_mutation_sql)
+        release_refresh.set()
+
+    assert not isinstance(refresh_outcome, BaseException)
+    assert not isinstance(mutation_outcome, BaseException)
+    async with database() as session:
+        membership = await session.get(TenantMembershipModel, target_membership)
+        auth_session = await session.get(AuthSessionModel, tenant_session.session_id)
+        refresh_rows = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.session_id == tenant_session.session_id
+                )
+            )
+        ).all()
+        assert membership is not None and membership.status == "suspended"
+        assert auth_session is not None and auth_session.revoked_at is not None
+        assert refresh_rows and all(row.revoked_at is not None for row in refresh_rows)

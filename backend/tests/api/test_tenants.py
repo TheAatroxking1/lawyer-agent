@@ -1,24 +1,35 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import fields
 from datetime import UTC, datetime
 
 import pytest
 
 from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
     IdempotencyRequest,
     IdempotencyService,
     InvalidIdempotencyKey,
+    InvalidIdempotencyRequest,
 )
+from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.tenancy import (
+    CreateTenantApplicationCommand,
     InvalidMemberCursor,
     InvalidStrongETag,
     MemberCursor,
     MemberCursorCodec,
     PreconditionRequired,
+    RevokeMemberCommand,
     StrongETag,
+    TenantService,
+    TenantType,
+    UpdateMemberCommand,
+    UpdateTenantCommand,
 )
 from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.tenancy import MembershipStatus
 from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 
 
@@ -31,7 +42,10 @@ def test_idempotency_key_is_bounded_safe_ascii_and_only_a_hash_is_prepared() -> 
             key=key,
             method="post",
             canonical_route="/api/v1/tenants/",
-            body={"name": "合成律所", "tenant_type": "law_firm"},
+            body=IdempotencyFingerprintPayload(
+                values={"name": "合成律所", "tenant_type": "law_firm"},
+                business_paths=frozenset({("name",), ("tenant_type",)}),
+            ),
         )
     )
 
@@ -55,25 +69,29 @@ def test_idempotency_key_is_bounded_safe_ascii_and_only_a_hash_is_prepared() -> 
                     key=invalid,  # type: ignore[arg-type]
                     method="POST",
                     canonical_route="/api/v1/tenants",
-                    body={},
+                    body=IdempotencyFingerprintPayload(values={}, business_paths=frozenset()),
                 )
             )
 
 
-def test_fingerprint_is_canonical_and_never_depends_on_secret_fields() -> None:
+def test_fingerprint_uses_explicit_secret_paths_without_dropping_business_codes() -> None:
     service = IdempotencyService(key_hash_secret=b"k" * 32)
     first = service.prepare(
         IdempotencyRequest(
             key="canonical-key-000001",
             method="POST",
             canonical_route="/api/v1/auth/register",
-            body={
+            body=IdempotencyFingerprintPayload(values={
                 "profile": {"display_name": "甲", "password": "first-password"},
-                "verification_code": "123456",
-                "code": "one-time-code-a",
-                "token": "raw-token-value",
-                "tenant_type": "law_firm",
-            },
+                "oauth": {"code": "one-time-code-a"},
+                "role_code": "assistant",
+                "department_code": "legal",
+                "secretary_name": "甲秘书",
+                "tokenization_strategy": "legal-structure-v1",
+            }, business_paths=frozenset({
+                ("profile", "display_name"), ("role_code",), ("department_code",),
+                ("secretary_name",), ("tokenization_strategy",),
+            }), secret_paths=frozenset({("profile", "password"), ("oauth", "code")})),
         )
     )
     same_business_request = service.prepare(
@@ -81,13 +99,17 @@ def test_fingerprint_is_canonical_and_never_depends_on_secret_fields() -> None:
             key="canonical-key-000001",
             method="post",
             canonical_route="/api/v1/auth/register/",
-            body={
-                "tenant_type": "law_firm",
-                "token": "different-token",
-                "verification_code": "654321",
-                "code": "one-time-code-b",
+            body=IdempotencyFingerprintPayload(values={
+                "tokenization_strategy": "legal-structure-v1",
+                "secretary_name": "甲秘书",
+                "department_code": "legal",
+                "role_code": "assistant",
+                "oauth": {"code": "one-time-code-b"},
                 "profile": {"password": "different-password", "display_name": "甲"},
-            },
+            }, business_paths=frozenset({
+                ("profile", "display_name"), ("role_code",), ("department_code",),
+                ("secretary_name",), ("tokenization_strategy",),
+            }), secret_paths=frozenset({("profile", "password"), ("oauth", "code")})),
         )
     )
     changed_business_request = service.prepare(
@@ -95,10 +117,17 @@ def test_fingerprint_is_canonical_and_never_depends_on_secret_fields() -> None:
             key="canonical-key-000001",
             method="POST",
             canonical_route="/api/v1/auth/register",
-            body={
-                "profile": {"display_name": "乙", "password": "different-password"},
-                "tenant_type": "law_firm",
-            },
+            body=IdempotencyFingerprintPayload(values={
+                "profile": {"display_name": "甲", "password": "different-password"},
+                "oauth": {"code": "one-time-code-b"},
+                "role_code": "tenant_admin",
+                "department_code": "legal",
+                "secretary_name": "甲秘书",
+                "tokenization_strategy": "legal-structure-v1",
+            }, business_paths=frozenset({
+                ("profile", "display_name"), ("role_code",), ("department_code",),
+                ("secretary_name",), ("tokenization_strategy",),
+            }), secret_paths=frozenset({("profile", "password"), ("oauth", "code")})),
         )
     )
 
@@ -106,9 +135,67 @@ def test_fingerprint_is_canonical_and_never_depends_on_secret_fields() -> None:
     assert first.request_fingerprint != changed_business_request.request_fingerprint
 
 
+def test_fingerprint_rejects_every_unclassified_request_field() -> None:
+    service = IdempotencyService(key_hash_secret=b"k" * 32)
+
+    with pytest.raises(InvalidIdempotencyRequest, match="unclassified"):
+        service.prepare(
+            IdempotencyRequest(
+                key="canonical-key-000002",
+                method="POST",
+                canonical_route="/api/v1/auth/register",
+                body=IdempotencyFingerprintPayload(
+                    values={"display_name": "甲", "future_sensitive_value": "raw"},
+                    business_paths=frozenset({("display_name",)}),
+                ),
+            )
+        )
+
+
+def test_task_7_commands_and_raw_idempotency_material_do_not_leak_via_repr() -> None:
+    raw_key = "raw-idempotency-key-0001"
+    raw_password = "-".join(("synthetic", "password", "material"))
+    payload = IdempotencyFingerprintPayload(
+        values={"password": raw_password},
+        business_paths=frozenset(),
+        secret_paths=frozenset({("password",)}),
+    )
+    request = IdempotencyRequest(
+        key=raw_key,
+        method="POST",
+        canonical_route="/api/v1/auth/register",
+        body=payload,
+    )
+    audit = AuditContext(trace_id="trace-repr", client_ip_hash=None, user_agent_hash=None)
+    commands = (
+        CreateTenantApplicationCommand(
+            new_uuid7(), "合成律所", TenantType.LAW_FIRM, raw_key, audit
+        ),
+        UpdateTenantCommand("合成律所", 1, raw_key, audit),
+        UpdateMemberCommand(new_uuid7(), 1, raw_key, audit, status=MembershipStatus.SUSPENDED),
+        RevokeMemberCommand(new_uuid7(), 1, raw_key, audit),
+    )
+
+    assert raw_key not in repr(request)
+    assert raw_password not in repr(request)
+    assert raw_password not in repr(payload)
+    assert all(raw_key not in repr(command) for command in commands)
+    assert {field.name for field in fields(IdempotencyRequest) if not field.repr} >= {"key", "body"}
+
+
+def test_tenant_service_requires_a_production_authorization_cache_dependency() -> None:
+    with pytest.raises((TypeError, ValueError), match="authorization_cache"):
+        TenantService(  # type: ignore[call-arg]
+            uow_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            idempotency=IdempotencyService(key_hash_secret=b"k" * 32),
+            cursor_secret=b"c" * 32,
+        )
+
+
 def test_if_match_accepts_only_an_exact_strong_positive_version_etag() -> None:
     assert StrongETag.parse('"7"').version == 7
     assert StrongETag.format(7) == '"7"'
+    assert StrongETag.parse(StrongETag.format((1 << 31) - 1)).version == (1 << 31) - 1
 
     with pytest.raises(PreconditionRequired):
         StrongETag.parse(None)
@@ -125,6 +212,10 @@ def test_if_match_accepts_only_an_exact_strong_positive_version_etag() -> None:
     ):
         with pytest.raises(InvalidStrongETag):
             StrongETag.parse(invalid)
+    with pytest.raises(InvalidStrongETag):
+        StrongETag(1 << 31)
+    with pytest.raises(InvalidStrongETag):
+        StrongETag.format(1 << 31)
 
 
 def test_member_cursor_is_opaque_signed_and_bound_to_the_tenant() -> None:

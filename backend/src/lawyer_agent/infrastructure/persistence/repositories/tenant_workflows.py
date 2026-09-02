@@ -9,12 +9,13 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.tenancy import (
+    ActorSessionState,
     MemberCursor,
     MemberPageItem,
     RoleTemplateUnavailable,
     TenantAuthorizationSnapshot,
 )
-from lawyer_agent.domain.authorization import AuthorizationScope
+from lawyer_agent.domain.authorization import AuthorizationScope, Principal
 from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.domain.tenancy import (
     Membership,
@@ -452,6 +453,65 @@ class TenantRoleWorkflowRepository:
         )
         return count == len(role_ids)
 
+    async def role_codes_for_ids(
+        self,
+        *,
+        context: TenantContext,
+        role_ids: tuple[UUID, ...],
+    ) -> dict[UUID, str] | None:
+        _require_context(context)
+        for role_id in role_ids:
+            require_uuid7(role_id, field="role_id")
+        if not role_ids:
+            return {}
+        rows = (
+            await self._session.execute(
+                select(TenantRoleModel.id, TenantRoleModel.code).where(
+                    TenantRoleModel.tenant_id == context.tenant_id,
+                    TenantRoleModel.id.in_(role_ids),
+                    TenantRoleModel.status == "active",
+                )
+            )
+        ).all()
+        if len(rows) != len(role_ids):
+            return None
+        return {role_id: code for role_id, code in rows}
+
+    async def count_active_owners_locked(self, *, context: TenantContext) -> int:
+        _require_context(context)
+        owner_ids = (
+            await self._session.scalars(
+                select(TenantMembershipModel.id)
+                .join(
+                    MembershipRoleAssignmentModel,
+                    and_(
+                        MembershipRoleAssignmentModel.tenant_id
+                        == TenantMembershipModel.tenant_id,
+                        MembershipRoleAssignmentModel.membership_id
+                        == TenantMembershipModel.id,
+                    ),
+                )
+                .join(
+                    TenantRoleModel,
+                    and_(
+                        TenantRoleModel.tenant_id
+                        == MembershipRoleAssignmentModel.tenant_id,
+                        TenantRoleModel.id
+                        == MembershipRoleAssignmentModel.tenant_role_id,
+                    ),
+                )
+                .where(
+                    TenantMembershipModel.tenant_id == context.tenant_id,
+                    TenantMembershipModel.status == MembershipStatus.ACTIVE.value,
+                    TenantRoleModel.status == "active",
+                    TenantRoleModel.code == "tenant_owner",
+                )
+                .order_by(TenantMembershipModel.id)
+                .with_for_update()
+            )
+        ).all()
+        return len(owner_ids)
+
     async def replace_roles(
         self,
         *,
@@ -489,6 +549,7 @@ class TenantAuthorizationWorkflowRepository:
     async def load_snapshot(
         self,
         *,
+        principal: Principal,
         context: TenantContext,
         target_membership_ids: tuple[UUID, ...] = (),
         for_update: bool = False,
@@ -498,6 +559,20 @@ class TenantAuthorizationWorkflowRepository:
             return None
         for membership_id in target_membership_ids:
             require_uuid7(membership_id, field="target membership_id")
+        user_statement = select(UserModel).where(UserModel.id == principal.user_id)
+        if for_update:
+            user_statement = user_statement.with_for_update()
+        user = await self._session.scalar(user_statement)
+        if user is None:
+            return None
+
+        session_statement = select(AuthSessionModel).where(
+            AuthSessionModel.id == principal.session_id
+        )
+        if for_update:
+            session_statement = session_statement.with_for_update()
+        actor_session_model = await self._session.scalar(session_statement)
+
         tenant_statement = select(TenantModel).where(TenantModel.id == context.tenant_id)
         if for_update:
             tenant_statement = tenant_statement.with_for_update()
@@ -522,11 +597,6 @@ class TenantAuthorizationWorkflowRepository:
         memberships = {model.id: _membership(model) for model in membership_models}
         actor = memberships.get(context.membership_id)
         if actor is None or actor.user_id != context.membership_user_id:
-            return None
-        user = await self._session.scalar(
-            select(UserModel).where(UserModel.id == context.membership_user_id)
-        )
-        if user is None:
             return None
         role_rows = (
             await self._session.execute(
@@ -587,12 +657,65 @@ class TenantAuthorizationWorkflowRepository:
                 for membership_id, membership in memberships.items()
                 if membership_id in target_membership_ids
             },
+            actor_session=(
+                None
+                if actor_session_model is None
+                else ActorSessionState(
+                    id=actor_session_model.id,
+                    user_id=actor_session_model.user_id,
+                    tenant_id=actor_session_model.tenant_id,
+                    membership_id=actor_session_model.membership_id,
+                    auth_version_at_issue=actor_session_model.auth_version_at_issue,
+                    authz_version_at_issue=actor_session_model.authz_version_at_issue,
+                    revoked_at=_aware_optional(actor_session_model.revoked_at),
+                    expires_at=_aware(actor_session_model.expires_at),
+                )
+            ),
         )
 
 
 class TenantSessionRevocationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def lock_for_membership(
+        self,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+    ) -> None:
+        require_uuid7(tenant_id, field="tenant_id")
+        require_uuid7(membership_id, field="membership_id")
+        refresh_rows = (
+            await self._session.execute(
+                select(
+                    RefreshTokenRecordModel.id,
+                    RefreshTokenRecordModel.family_id,
+                    RefreshTokenRecordModel.session_id,
+                )
+                .where(
+                    RefreshTokenRecordModel.tenant_id == tenant_id,
+                    RefreshTokenRecordModel.membership_id == membership_id,
+                )
+                .order_by(
+                    RefreshTokenRecordModel.family_id,
+                    RefreshTokenRecordModel.id,
+                )
+                .with_for_update()
+            )
+        ).all()
+        session_ids = tuple(sorted({row.session_id for row in refresh_rows}, key=str))
+        if session_ids:
+            await self._session.execute(
+                select(AuthSessionModel.id)
+                .where(
+                    AuthSessionModel.tenant_id == tenant_id,
+                    AuthSessionModel.membership_id == membership_id,
+                    AuthSessionModel.id.in_(session_ids),
+                )
+                .order_by(AuthSessionModel.id)
+                .with_for_update()
+            )
 
     async def revoke_for_membership(
         self,
@@ -606,21 +729,6 @@ class TenantSessionRevocationRepository:
         require_uuid7(membership_id, field="membership_id")
         if reason not in {"authorization_changed", "membership_revoked"}:
             raise ValueError("unsupported tenant session revocation reason")
-        values = {
-            "revoked_at": _naive(now),
-            "revocation_reason": reason,
-            "version": AuthSessionModel.version + 1,
-            "updated_at": _naive(now),
-        }
-        await self._session.execute(
-            update(AuthSessionModel)
-            .where(
-                AuthSessionModel.tenant_id == tenant_id,
-                AuthSessionModel.membership_id == membership_id,
-                AuthSessionModel.revoked_at.is_(None),
-            )
-            .values(**values)
-        )
         await self._session.execute(
             update(RefreshTokenRecordModel)
             .where(
@@ -632,6 +740,20 @@ class TenantSessionRevocationRepository:
                 revoked_at=_naive(now),
                 revocation_reason=reason,
                 version=RefreshTokenRecordModel.version + 1,
+                updated_at=_naive(now),
+            )
+        )
+        await self._session.execute(
+            update(AuthSessionModel)
+            .where(
+                AuthSessionModel.tenant_id == tenant_id,
+                AuthSessionModel.membership_id == membership_id,
+                AuthSessionModel.revoked_at.is_(None),
+            )
+            .values(
+                revoked_at=_naive(now),
+                revocation_reason=reason,
+                version=AuthSessionModel.version + 1,
                 updated_at=_naive(now),
             )
         )

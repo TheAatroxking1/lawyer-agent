@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.idempotency import (
     AcquiredIdempotencyRecord,
+    IdempotencyMutationEffect,
     IdempotencyResultReference,
     IdempotencyScope,
     IdempotencyScopeType,
@@ -68,16 +70,30 @@ class SqlAlchemyIdempotencyRepository:
         self,
         *,
         record_id: UUID,
-        request_fingerprint: bytes,
+        old_request_fingerprint: bytes,
+        new_request_fingerprint: bytes,
+        allowed_statuses: frozenset[IdempotencyStatus],
+        expired_before: datetime | None,
         expires_at: datetime,
-    ) -> None:
+    ) -> bool:
+        if not allowed_statuses or any(
+            not isinstance(status, IdempotencyStatus) for status in allowed_statuses
+        ):
+            raise ValueError("idempotency restart statuses must be strongly typed")
+        conditions = [
+            IdempotencyRecordModel.id == record_id,
+            IdempotencyRecordModel.request_fingerprint == old_request_fingerprint,
+            IdempotencyRecordModel.status.in_(status.value for status in allowed_statuses),
+        ]
+        if expired_before is not None:
+            conditions.append(IdempotencyRecordModel.expires_at <= _naive(expired_before))
         result = cast(
             CursorResult[Any],
             await self._session.execute(
                 update(IdempotencyRecordModel)
-                .where(IdempotencyRecordModel.id == record_id)
+                .where(*conditions)
                 .values(
-                    request_fingerprint=request_fingerprint,
+                    request_fingerprint=new_request_fingerprint,
                     status=IdempotencyStatus.RESERVED.value,
                     result_type=None,
                     result_id=None,
@@ -86,8 +102,7 @@ class SqlAlchemyIdempotencyRepository:
                 )
             ),
         )
-        if result.rowcount != 1:
-            raise IdempotencyStateError("idempotency record could not be restarted")
+        return result.rowcount == 1
 
     async def complete(
         self,
@@ -108,7 +123,7 @@ class SqlAlchemyIdempotencyRepository:
                 )
                 .values(
                     status=IdempotencyStatus.COMPLETED.value,
-                    result_type=result.result_type,
+                    result_type=_serialize_result_type(result),
                     result_id=result.result_id,
                     version=IdempotencyRecordModel.version + 1,
                     updated_at=_naive(now),
@@ -151,7 +166,7 @@ def _stored(model: IdempotencyRecordModel) -> StoredIdempotencyRecord:
     if model.result_type is not None or model.result_id is not None:
         if model.result_type is None or model.result_id is None:
             raise IdempotencyStateError("idempotency result reference is incomplete")
-        result = IdempotencyResultReference(model.result_type, model.result_id)
+        result = _deserialize_result_type(model.result_type, model.result_id)
     if len(model.key_hash) != 32 or len(model.request_fingerprint) != 32:
         raise IdempotencyStateError("idempotency digests have invalid lengths")
     return StoredIdempotencyRecord(
@@ -174,3 +189,40 @@ def _naive(value: datetime) -> datetime:
 
 def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _serialize_result_type(result: IdempotencyResultReference) -> str:
+    if result.mutation_effect is None and result.cache_authz_version is None:
+        return result.result_type
+    encoded = json.dumps(
+        {
+            "a": result.cache_authz_version,
+            "e": None if result.mutation_effect is None else result.mutation_effect.value,
+            "t": result.result_type,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded) > 64:
+        raise IdempotencyStateError("idempotency result metadata is too large")
+    return encoded
+
+
+def _deserialize_result_type(value: str, result_id: UUID) -> IdempotencyResultReference:
+    if not value.startswith("{"):
+        return IdempotencyResultReference(value, result_id)
+    try:
+        decoded = json.loads(value)
+        if not isinstance(decoded, dict) or set(decoded) != {"a", "e", "t"}:
+            raise ValueError
+        raw_effect = decoded["e"]
+        effect = None if raw_effect is None else IdempotencyMutationEffect(raw_effect)
+        return IdempotencyResultReference(
+            decoded["t"],
+            result_id,
+            mutation_effect=effect,
+            cache_authz_version=decoded["a"],
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise IdempotencyStateError("idempotency result metadata is invalid") from exc
