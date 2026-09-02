@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from lawyer_agent.api.dependencies import ApplicationServices
 from lawyer_agent.application.invitations import (
     InvitationAcceptanceResult,
+    InvitationDeliveryCapability,
     InvitationResult,
 )
 from lawyer_agent.application.tenancy import (
@@ -111,12 +112,21 @@ class _Tenancy:
 
 
 class _Invitations:
-    def __init__(self, tenant: Tenant, member: Membership) -> None:
+    def __init__(
+        self,
+        tenant: Tenant,
+        member: Membership,
+        *,
+        fail_create_if_called: bool = False,
+    ) -> None:
         self.tenant = tenant
         self.member = member
         self.invitation_id = new_uuid7()
+        self.fail_create_if_called = fail_create_if_called
 
     async def create(self, actor: object, command: object) -> InvitationResult:
+        if self.fail_create_if_called:
+            raise AssertionError("invitation service must not run without delivery capability")
         assert actor.context.tenant_id == self.tenant.id
         assert command.target == "invitee@example.cn"
         return InvitationResult(
@@ -137,7 +147,14 @@ class _Invitations:
         )
 
 
-def _client() -> tuple[TestClient, Tenant, Membership]:
+class _Delivery:
+    async def deliver(self, *, invitation_id: UUID, token: str) -> None:
+        del invitation_id, token
+
+
+def _client(
+    *, delivery_available: bool = True
+) -> tuple[TestClient, Tenant, Membership]:
     now = datetime.now(UTC).replace(microsecond=0)
     user_id = new_uuid7()
     tenant_id = new_uuid7()
@@ -167,13 +184,20 @@ def _client() -> tuple[TestClient, Tenant, Membership]:
         identity=object(),
         sessions=_Sessions(user_id, tenant_id, member.id),
         tenancy=_Tenancy(tenant, member),
-        invitations=_Invitations(tenant, member),
+        invitations=_Invitations(
+            tenant,
+            member,
+            fail_create_if_called=not delivery_available,
+        ),
         platform=object(),
         rate_limiter=object(),
         step_up=object(),
         csrf=object(),
         token_service=_Tokens(),
         accounts=object(),
+        invitation_delivery=InvitationDeliveryCapability(
+            _Delivery() if delivery_available else None
+        ),
     )
 
     @asynccontextmanager
@@ -182,7 +206,14 @@ def _client() -> tuple[TestClient, Tenant, Membership]:
         yield services
 
     settings = Settings(environment="test", secret_key="x" * 32)
-    return TestClient(create_app(settings, service_factory=factory)), tenant, member
+    return (
+        TestClient(
+            create_app(settings, service_factory=factory),
+            raise_server_exceptions=False,
+        ),
+        tenant,
+        member,
+    )
 
 
 def test_tenant_member_and_invitation_http_contracts() -> None:
@@ -274,7 +305,48 @@ def test_write_bodies_forbid_unknown_fields_and_invitation_token_is_body_only() 
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             },
         )
+        blank_tenant = client.post(
+            "/api/v1/tenants",
+            headers={"Authorization": "Bearer account-token", "Idempotency-Key": "blank"},
+            json={"name": "   ", "tenant_type": "law_firm"},
+        )
+        invalid_invitation_target = client.post(
+            f"/api/v1/tenants/{tenant.id}/invitations",
+            headers={
+                "Authorization": "Bearer tenant-token",
+                "Idempotency-Key": "invalid-target",
+            },
+            json={
+                "target_kind": "email",
+                "target": "not-an-email",
+                "role_ids": [str(new_uuid7())],
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+        )
     assert extra.status_code == 422
     assert query.status_code == 422
     assert cross.status_code == 404
     assert str(tenant.id) not in cross.text
+    assert blank_tenant.status_code == 422
+    assert invalid_invitation_target.status_code == 422
+
+
+def test_invitation_creation_fails_before_service_when_delivery_is_unavailable() -> None:
+    client, tenant, _ = _client(delivery_available=False)
+    with client:
+        response = client.post(
+            f"/api/v1/tenants/{tenant.id}/invitations",
+            headers={
+                "Authorization": "Bearer tenant-token",
+                "Idempotency-Key": "provider-missing",
+            },
+            json={
+                "target_kind": "email",
+                "target": "invitee@example.cn",
+                "role_ids": [str(new_uuid7())],
+                "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "invitation_delivery_unavailable"

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Response, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from lawyer_agent.api.dependencies import (
     AccountSession,
@@ -27,6 +27,7 @@ from lawyer_agent.application.tenancy import (
     UpdateMemberCommand,
     UpdateTenantCommand,
 )
+from lawyer_agent.domain.identity import IdentityKind, normalize_identifier
 from lawyer_agent.domain.tenancy import MembershipStatus
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -81,9 +82,23 @@ class CreateTenantRequest(StrictModel):
     name: str = Field(min_length=1, max_length=255)
     tenant_type: Literal["law_firm", "enterprise", "university"]
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tenant name must not be blank")
+        return value
+
 
 class UpdateTenantRequest(StrictModel):
     name: str = Field(min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tenant name must not be blank")
+        return value
 
 
 class UpdateMemberRequest(StrictModel):
@@ -98,6 +113,28 @@ class CreateInvitationRequest(StrictModel):
     target: str = Field(min_length=1, max_length=512)
     role_ids: tuple[UUID, ...]
     expires_at: datetime
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, value: str, info: ValidationInfo) -> str:
+        kind = info.data.get("target_kind")
+        if isinstance(kind, str):
+            normalize_identifier(IdentityKind(kind), value)
+        return value
+
+    @field_validator("role_ids")
+    @classmethod
+    def validate_role_ids(cls, value: tuple[UUID, ...]) -> tuple[UUID, ...]:
+        if not value or len(set(value)) != len(value):
+            raise ValueError("invitation role_ids must be non-empty and unique")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("invitation expires_at must be UTC-aware")
+        return value
 
 
 def _tenant(value: Any) -> TenantResponse:
@@ -221,6 +258,7 @@ async def create_invitation(
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> InvitationResponse:
     require_path_tenant(tenant_id, actor)
+    services.invitation_delivery.require()
     result = await services.invitations.create(
         actor,
         CreateInvitationCommand(

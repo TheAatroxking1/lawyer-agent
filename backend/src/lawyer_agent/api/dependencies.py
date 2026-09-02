@@ -4,7 +4,7 @@ import hmac
 from base64 import b64decode
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Annotated, Any, cast
@@ -12,10 +12,13 @@ from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import Depends, Header, Request
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lawyer_agent.api.errors import ApiProblem
+from lawyer_agent.application.accounts import (
+    AccountQueryPort,
+    AccountQueryService,
+    AccountQueryUnitOfWork,
+)
 from lawyer_agent.application.idempotency import IdempotencyService
 from lawyer_agent.application.identity import (
     AuditContext,
@@ -23,13 +26,14 @@ from lawyer_agent.application.identity import (
     IdentityUnitOfWork,
 )
 from lawyer_agent.application.invitations import (
+    InvitationDeliveryCapability,
+    InvitationDeliveryPort,
     InvitationService,
     InvitationTargetFingerprintHasher,
     InvitationTokenHasher,
 )
 from lawyer_agent.application.platform import PlatformActor, PlatformReviewService
 from lawyer_agent.application.sessions import (
-    InvalidSession,
     SessionService,
     SessionUnitOfWork,
 )
@@ -42,14 +46,12 @@ from lawyer_agent.config import Settings
 from lawyer_agent.domain.authorization import AuthorizationScope, Principal, PrincipalAudience
 from lawyer_agent.domain.sessions import Audience, InvalidToken
 from lawyer_agent.domain.tenancy import MembershipStatus, TenantContext, TenantStatus
+from lawyer_agent.infrastructure.persistence.account_queries import (
+    SqlAlchemyAccountQueryUnitOfWork,
+)
 from lawyer_agent.infrastructure.persistence.engine import create_engine, create_session_factory
 from lawyer_agent.infrastructure.persistence.invitations_uow import (
     SqlAlchemyInvitationWorkflowUnitOfWork,
-)
-from lawyer_agent.infrastructure.persistence.models import (
-    TenantMembershipModel,
-    TenantModel,
-    UserModel,
 )
 from lawyer_agent.infrastructure.persistence.platform_uow import (
     SqlAlchemyPlatformWorkflowUnitOfWork,
@@ -63,6 +65,7 @@ from lawyer_agent.infrastructure.persistence.repositories.sessions import (
 from lawyer_agent.infrastructure.persistence.tenancy_uow import (
     SqlAlchemyTenantWorkflowUnitOfWork,
 )
+from lawyer_agent.infrastructure.providers.development import TestInvitationDeliveryAdapter
 from lawyer_agent.infrastructure.redis.authz_cache import AuthorizationCache
 from lawyer_agent.infrastructure.redis.client import RedisAsyncioAdapter
 from lawyer_agent.infrastructure.redis.rate_limit import RateLimiter
@@ -85,70 +88,10 @@ class ApplicationServices:
     step_up: Any
     csrf: Any
     token_service: Any
-    accounts: Any
-
-
-@dataclass(frozen=True, slots=True)
-class AccountProjection:
-    id: UUID
-    display_name: str
-    status: str
-    created_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class AccountTenantProjection:
-    tenant_id: UUID
-    membership_id: UUID
-    name: str
-    tenant_type: str
-    tenant_status: str
-    membership_status: str
-
-
-class AccountQueries:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._session_factory = session_factory
-
-    async def get(self, user_id: UUID) -> AccountProjection:
-        async with self._session_factory() as session:
-            user = await session.get(UserModel, user_id)
-        if user is None:
-            raise InvalidSession
-        created_at = user.created_at
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=UTC)
-        return AccountProjection(user.id, user.display_name, user.status, created_at)
-
-    async def list_tenants(self, user_id: UUID) -> tuple[AccountTenantProjection, ...]:
-        statement = (
-            select(TenantMembershipModel, TenantModel)
-            .join(TenantModel, TenantModel.id == TenantMembershipModel.tenant_id)
-            .where(
-                TenantMembershipModel.user_id == user_id,
-                TenantMembershipModel.status.in_(("active", "suspended", "invited")),
-            )
-            .order_by(TenantMembershipModel.created_at, TenantMembershipModel.id)
-        )
-        async with self._session_factory() as session:
-            rows = (await session.execute(statement)).all()
-        return tuple(
-            AccountTenantProjection(
-                tenant_id=tenant.id,
-                membership_id=membership.id,
-                name=tenant.name,
-                tenant_type=tenant.tenant_type,
-                tenant_status=tenant.status,
-                membership_status=membership.status,
-            )
-            for membership, tenant in rows
-        )
-
-
-class _UnavailableInvitationDelivery:
-    async def deliver(self, *, invitation_id: UUID, token: str) -> None:
-        del invitation_id, token
-        raise RuntimeError("invitation provider is not configured")
+    accounts: AccountQueryPort
+    invitation_delivery: InvitationDeliveryCapability = field(
+        default_factory=lambda: InvitationDeliveryCapability(None)
+    )
 
 
 def _derived_key(domain: bytes, key: bytes) -> bytes:
@@ -156,7 +99,11 @@ def _derived_key(domain: bytes, key: bytes) -> bytes:
 
 
 @asynccontextmanager
-async def application_services(settings: Settings) -> AsyncIterator[ApplicationServices]:
+async def application_services(
+    settings: Settings,
+    *,
+    invitation_delivery: InvitationDeliveryPort | None = None,
+) -> AsyncIterator[ApplicationServices]:
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     redis = RedisAsyncioAdapter.from_url(
@@ -164,14 +111,20 @@ async def application_services(settings: Settings) -> AsyncIterator[ApplicationS
         key_prefix=settings.redis_key_prefix,
         topology=settings.redis_security_topology,
     )
-    data_key = b64decode(settings.data_encryption_key_b64, validate=True)
-    blind_key = b64decode(settings.blind_index_key_b64, validate=True)
+    data_keys = settings.decoded_data_encryption_key_ring()
+    blind_keys = settings.decoded_blind_index_key_ring()
     refresh_key = b64decode(settings.refresh_token_key_b64, validate=True)
     csrf_key = b64decode(settings.csrf_key_b64, validate=True)
-    cipher = SensitiveValueCipher({1: data_key}, active_key_version=1)
-    blind_index = BlindIndexService({1: blind_key}, active_key_version=1)
+    cipher = SensitiveValueCipher(
+        data_keys,
+        active_key_version=settings.effective_data_encryption_active_key_version,
+    )
+    blind_index = BlindIndexService(
+        blind_keys,
+        active_key_version=settings.effective_blind_index_active_key_version,
+    )
     private_keys = {
-        kid: Ed25519PrivateKey.from_private_bytes(sha256(material.encode()).digest())
+        kid: Ed25519PrivateKey.from_private_bytes(b64decode(material, validate=True))
         for kid, material in settings.jwt_ed25519_key_ring.items()
     }
     token_service = TokenService(
@@ -185,6 +138,10 @@ async def application_services(settings: Settings) -> AsyncIterator[ApplicationS
     )
     authz_cache = AuthorizationCache(redis=redis)
     step_up = StepUpStore(redis=redis, hmac_key=_derived_key(b"step-up", csrf_key))
+    delivery = invitation_delivery
+    if delivery is None and settings.environment == "test":
+        delivery = TestInvitationDeliveryAdapter(environment="test")
+    delivery_capability = InvitationDeliveryCapability(delivery)
     identity = IdentityService(
         uow_factory=lambda: cast(
             IdentityUnitOfWork,
@@ -220,10 +177,10 @@ async def application_services(settings: Settings) -> AsyncIterator[ApplicationS
         ),
         blind_index=blind_index,
         target_fingerprint_hasher=InvitationTargetFingerprintHasher(
-            hmac_key=_derived_key(b"invitation-target", blind_key)
+            hmac_key=_derived_key(b"invitation-target", refresh_key)
         ),
         cipher=cipher,
-        delivery=_UnavailableInvitationDelivery(),
+        delivery=delivery,
     )
     platform = PlatformReviewService(
         uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(session_factory),
@@ -243,7 +200,13 @@ async def application_services(settings: Settings) -> AsyncIterator[ApplicationS
         step_up=step_up,
         csrf=CsrfService(key=csrf_key, trusted_origins=settings.trusted_origins),
         token_service=token_service,
-        accounts=AccountQueries(session_factory),
+        accounts=AccountQueryService(
+            uow_factory=lambda: cast(
+                AccountQueryUnitOfWork,
+                SqlAlchemyAccountQueryUnitOfWork(session_factory),
+            )
+        ),
+        invitation_delivery=delivery_capability,
     )
     try:
         yield active

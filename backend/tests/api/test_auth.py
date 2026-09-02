@@ -32,6 +32,7 @@ class _Identity:
     user_id = new_uuid7()
     fail_authentication = False
     internal_error = False
+    internal_value_error = False
 
     async def register(self, command: object, *, audit_context: object) -> _Result:
         del command, audit_context
@@ -43,6 +44,8 @@ class _Identity:
         del identifier, password, audit_context
         if self.internal_error:
             raise RuntimeError("SELECT secret_ciphertext FROM auth_identities")
+        if self.internal_value_error:
+            raise ValueError("cipher key invariant exposed secret-material")
         return None if self.fail_authentication else _Result(user_id=self.user_id)
 
 
@@ -65,7 +68,11 @@ class _Sessions:
         return self.session_id
 
     async def validate_access(self, encoded: str, *, audience: object) -> object:
-        del encoded, audience
+        from lawyer_agent.application.sessions import InvalidSession
+        from lawyer_agent.domain.sessions import Audience
+
+        if encoded != "account-token" or audience is not Audience.ACCOUNT:
+            raise InvalidSession
         return type(
             "Validated",
             (),
@@ -124,7 +131,10 @@ class _Csrf:
 
 class _TokenService:
     def verify(self, token: str, *, audience: object, now: datetime) -> object:
-        del token, audience
+        from lawyer_agent.domain.sessions import Audience, InvalidToken
+
+        if token != "account-token" or audience is not Audience.ACCOUNT:  # noqa: S105
+            raise InvalidToken
         return type(
             "Claims",
             (),
@@ -146,17 +156,28 @@ class _TokenService:
 class _Platform:
     deny_exchange = False
 
+    def __init__(self) -> None:
+        self.last_permission: str | None = None
+
     async def authorize_access(self, actor: object, **values: object) -> object:
         if self.deny_exchange:
             from lawyer_agent.application.platform import PlatformAuthorizationDenied
 
             raise PlatformAuthorizationDenied("permission_denied")
-        assert values["permission"] == "tenant_application.review"
+        assert values["permission"] in {
+            "tenant_application.read",
+            "tenant_application.review",
+        }
+        self.last_permission = str(values["permission"])
         return actor
 
 
 class _StepUp:
+    def __init__(self) -> None:
+        self.issue_calls = 0
+
     async def issue(self, **values: object) -> object:
+        self.issue_calls += 1
         assert str(values["action"]).startswith("tenant_application.review:")
         return type("Grant", (), {"value": "G" * 43})()
 
@@ -269,6 +290,21 @@ def test_register_login_refresh_logout_contract() -> None:
         logged_out = client.post("/api/v1/auth/logout", headers=_csrf(client))
         assert logged_out.status_code == 204
         assert sessions.revoked is True
+        deleted = logged_out.headers.get_list("set-cookie")
+        refresh_deletion = next(
+            value for value in deleted if value.startswith("__Host-lawyer_refresh=")
+        )
+        csrf_deletion = next(
+            value for value in deleted if value.startswith("__Host-lawyer_csrf=")
+        )
+        assert "HttpOnly" in refresh_deletion
+        assert "HttpOnly" not in csrf_deletion
+        for value in (refresh_deletion, csrf_deletion):
+            assert "Max-Age=0" in value
+            assert "Secure" in value
+            assert "SameSite=lax" in value
+            assert "Path=/" in value
+            assert "Domain=" not in value
 
 
 def test_account_projection_contracts_use_account_audience() -> None:
@@ -294,6 +330,25 @@ def test_cookie_issuers_require_an_exact_trusted_origin() -> None:
             assert response.json()["code"] == "csrf_origin_rejected"
 
 
+def test_register_boundary_rejects_normalized_blank_identity_and_display_name() -> None:
+    client, _ = _client()
+    with client:
+        blank_username = client.post(
+            "/api/v1/auth/register",
+            headers={"Origin": ORIGIN},
+            json={**REGISTER, "username": "   "},
+        )
+        blank_display_name = client.post(
+            "/api/v1/auth/register",
+            headers={"Origin": ORIGIN},
+            json={**REGISTER, "display_name": "   "},
+        )
+
+    assert blank_username.status_code == 422
+    assert blank_display_name.status_code == 422
+    assert blank_username.json()["code"] == "request_validation_failed"
+
+
 def test_reauth_platform_exchange_requires_all_authoritative_factors() -> None:
     client, _ = _client()
     body = {
@@ -315,6 +370,88 @@ def test_reauth_platform_exchange_requires_all_authoritative_factors() -> None:
         "token_type": "Bearer",
         "step_up_grant": "G" * 43,
     }
+
+
+def test_reauth_read_exchange_issues_platform_token_without_step_up_grant() -> None:
+    services, _ = _services()
+
+    @asynccontextmanager
+    async def service_factory(settings: Settings):
+        del settings
+        yield services
+
+    client = TestClient(
+        create_app(
+            Settings(environment="test", secret_key="x" * 32),
+            service_factory=service_factory,
+        )
+    )
+    with client:
+        response = client.post(
+            "/api/v1/auth/reauth",
+            headers={"Authorization": "Bearer account-token", "Origin": ORIGIN},
+            json={
+                "kind": "username",
+                "identifier": "synthetic-lawyer",
+                "password": "synthetic-password-0001",
+                "action": "tenant_application.read",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "access_token": "synthetic-platform-access-token",
+        "token_type": "Bearer",
+    }
+    assert services.platform.last_permission == "tenant_application.read"
+    assert services.step_up.issue_calls == 0
+
+
+def test_reauth_rejects_read_tenant_binding_and_unbound_review_confusion() -> None:
+    client, _ = _client()
+    common = {
+        "kind": "username",
+        "identifier": "synthetic-lawyer",
+        "password": "synthetic-password-0001",
+    }
+    with client:
+        bound_read = client.post(
+            "/api/v1/auth/reauth",
+            headers={"Authorization": "Bearer account-token", "Origin": ORIGIN},
+            json={
+                **common,
+                "tenant_id": str(new_uuid7()),
+                "action": "tenant_application.read",
+            },
+        )
+        unbound_review = client.post(
+            "/api/v1/auth/reauth",
+            headers={"Authorization": "Bearer account-token", "Origin": ORIGIN},
+            json={**common, "action": "tenant_application.review:approve"},
+        )
+
+    assert bound_read.status_code == 422
+    assert unbound_review.status_code == 422
+    assert bound_read.json()["code"] == "reauth_request_invalid"
+    assert unbound_review.json()["code"] == "reauth_request_invalid"
+
+
+def test_reauth_read_exchange_rejects_tenant_audience_token() -> None:
+    client, _ = _client()
+    with client:
+        response = client.post(
+            "/api/v1/auth/reauth",
+            headers={"Authorization": "Bearer tenant-token", "Origin": ORIGIN},
+            json={
+                "kind": "username",
+                "identifier": "synthetic-lawyer",
+                "password": "synthetic-password-0001",
+                "action": "tenant_application.read",
+            },
+        )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "authentication_failed"
 
 
 def test_reauth_does_not_upgrade_a_user_without_authoritative_platform_permission() -> None:
@@ -490,6 +627,35 @@ def test_request_validation_and_internal_errors_are_redacted() -> None:
     assert internal.json()["code"] == "internal_error"
     assert "select" not in internal.text.lower()
     assert "ciphertext" not in internal.text.lower()
+
+
+def test_internal_value_errors_are_redacted_as_500_not_client_422() -> None:
+    services, _ = _services()
+    services.identity.internal_value_error = True
+
+    @asynccontextmanager
+    async def failing_factory(settings: Settings):
+        del settings
+        yield services
+
+    client = TestClient(
+        create_app(
+            Settings(environment="test", secret_key="x" * 32),
+            service_factory=failing_factory,
+        ),
+        raise_server_exceptions=False,
+    )
+    with client:
+        response = client.post(
+            "/api/v1/auth/login",
+            headers={"Origin": ORIGIN},
+            json={"kind": "username", "identifier": "user", "password": "secret"},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "internal_error"
+    assert "invariant" not in response.text
+    assert "secret-material" not in response.text
 
 
 def test_api_responses_and_openapi_do_not_expose_internal_security_fields() -> None:

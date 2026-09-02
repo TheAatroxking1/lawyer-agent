@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lawyer_agent.api.dependencies import (
     AccountSession,
@@ -21,7 +21,7 @@ from lawyer_agent.application.platform import PlatformActor
 from lawyer_agent.application.sessions import SwitchTenantCommand
 from lawyer_agent.domain.authorization import Principal, PrincipalAudience
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.identity import IdentityKind, normalize_identifier
+from lawyer_agent.domain.identity import IdentityKind, normalize_identifier, normalize_username
 from lawyer_agent.domain.sessions import AccessTokenClaims, Audience, RevocationReason
 from lawyer_agent.infrastructure.redis.rate_limit import (
     LOGIN_RULE,
@@ -51,6 +51,19 @@ class RegisterRequest(StrictModel):
     password: str = Field(min_length=1, max_length=128)
     display_name: str = Field(min_length=1, max_length=255)
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        normalize_username(value)
+        return value
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("display_name must not be blank")
+        return value
+
 
 class LoginRequest(StrictModel):
     kind: Literal["username", "phone", "email", "wechat_unionid", "wechat_openid"]
@@ -68,8 +81,12 @@ class ReauthRequest(StrictModel):
     kind: Literal["username", "phone", "email", "wechat_unionid", "wechat_openid"]
     identifier: str = Field(min_length=1, max_length=512)
     password: str = Field(min_length=1, max_length=128)
-    tenant_id: UUID
-    action: str = Field(pattern=r"^[a-z][a-z0-9_.:-]{0,127}$")
+    tenant_id: UUID | None = None
+    action: Literal[
+        "tenant_application.read",
+        "tenant_application.review:approve",
+        "tenant_application.review:reject",
+    ]
     issuer: str | None = Field(default=None, max_length=255)
 
 
@@ -252,8 +269,20 @@ async def logout(
         reason=RevocationReason.LOGOUT,
         audit_context=audit,
     )
-    response.delete_cookie(REFRESH_COOKIE_NAME, path="/", secure=True)
-    response.delete_cookie(CSRF_COOKIE_NAME, path="/", secure=True)
+    response.delete_cookie(
+        REFRESH_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=False,
+        samesite="lax",
+    )
 
 
 @router.post("/switch-tenant", response_model=AccessTokenResponse)
@@ -276,7 +305,7 @@ async def switch_tenant(
     return AccessTokenResponse(access_token=result.access_token)
 
 
-@router.post("/reauth", response_model=StepUpResponse)
+@router.post("/reauth", response_model=AccessTokenResponse | StepUpResponse)
 async def reauth(
     body: ReauthRequest,
     token: Bearer,
@@ -284,10 +313,13 @@ async def reauth(
     current: AccountSession,
     audit: Audit,
     trusted_origin: TrustedOrigin,
-) -> StepUpResponse:
+) -> AccessTokenResponse | StepUpResponse:
     del trusted_origin
-    if body.action not in _PLATFORM_STEP_UP_ACTIONS:
-        raise ApiProblem(403, "step_up_action_denied", "Step-up action is not allowed")
+    read_exchange = body.action == "tenant_application.read"
+    if (read_exchange and body.tenant_id is not None) or (
+        not read_exchange and body.tenant_id is None
+    ):
+        raise ApiProblem(422, "reauth_request_invalid", "Reauthentication request is invalid")
     await _limit(services, REAUTH_RULE, {"session": current.session_id})
     authenticated = await services.identity.authenticate(
         LoginIdentifier(IdentityKind(body.kind), body.identifier, body.issuer),
@@ -321,7 +353,11 @@ async def reauth(
     )
     await services.platform.authorize_access(
         candidate,
-        permission="tenant_application.review",
+        permission=(
+            "tenant_application.read"
+            if read_exchange
+            else "tenant_application.review"
+        ),
         audit_context=audit,
     )
     platform_claims = AccessTokenClaims(
@@ -335,6 +371,10 @@ async def reauth(
         auth_version=account_claims.auth_version,
     )
     platform_token = services.token_service.issue_platform(platform_claims)
+    if read_exchange:
+        return AccessTokenResponse(access_token=platform_token)
+    assert body.tenant_id is not None
+    assert body.action in _PLATFORM_STEP_UP_ACTIONS
     grant = await services.step_up.issue(
         user_id=current.user_id,
         session_id=current.session_id,

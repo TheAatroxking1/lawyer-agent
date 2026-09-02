@@ -18,6 +18,7 @@ from lawyer_agent.application.identity import IdentityConflictError
 from lawyer_agent.application.invitations import (
     InvitationAuthorizationDenied,
     InvitationDeliveryError,
+    InvitationDeliveryUnavailable,
     InvitationRoleDenied,
     InvitationUnavailable,
 )
@@ -72,6 +73,7 @@ APPLICATION_EXCEPTIONS: tuple[type[Exception], ...] = (
     RedisDependencyError,
     PostCommitCacheInvalidationError,
     InvitationDeliveryError,
+    InvitationDeliveryUnavailable,
     PlatformCommittedWithCleanupWarning,
     TenantApplicantUnavailable,
 )
@@ -214,12 +216,13 @@ def _application_problem(exc: Exception) -> tuple[int, str, str]:
             InvalidMemberCursor,
             InvalidMemberUpdate,
             InvalidPassword,
-            ValueError,
         ),
     ):
         return 422, getattr(exc, "code", "invalid_request"), "Request is invalid"
     if isinstance(exc, (RedisDependencyError, PostCommitCacheInvalidationError)):
         return 503, "security_dependency_unavailable", "Security dependency unavailable"
+    if isinstance(exc, InvitationDeliveryUnavailable):
+        return 503, exc.code, "Invitation delivery is unavailable"
     if isinstance(exc, (InvitationDeliveryError, PlatformCommittedWithCleanupWarning)):
         return 503, exc.code, "Operation committed with a delivery warning"
     if isinstance(exc, TenantApplicantUnavailable):

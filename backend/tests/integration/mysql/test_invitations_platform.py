@@ -1160,7 +1160,10 @@ class _SingleUseStepUp:
 
 
 async def _platform_graph(
-    database: async_sessionmaker[AsyncSession], *, grant_review: bool = True
+    database: async_sessionmaker[AsyncSession],
+    *,
+    grant_review: bool = True,
+    role_code: str | None = None,
 ) -> tuple[PlatformActor, UUID]:
     reviewer = new_uuid7()
     session_id = new_uuid7()
@@ -1180,9 +1183,13 @@ async def _platform_graph(
             )
         )
         await session.flush()
-        role_code = "super_admin" if grant_review else "security_auditor"
+        selected_role_code = role_code or (
+            "super_admin" if grant_review else "security_auditor"
+        )
         role_id = await session.scalar(
-            select(PlatformRoleModel.id).where(PlatformRoleModel.code == role_code)
+            select(PlatformRoleModel.id).where(
+                PlatformRoleModel.code == selected_role_code
+            )
         )
         assert role_id is not None
         session.add(
@@ -1370,6 +1377,11 @@ async def test_platform_access_exchange_requires_authoritative_active_permission
 ) -> None:
     allowed_actor, _ = await _platform_graph(database, grant_review=True)
     denied_actor, _ = await _platform_graph(database, grant_review=False)
+    operations_actor, _ = await _platform_graph(
+        database,
+        grant_review=False,
+        role_code="operations_support",
+    )
     service = PlatformReviewService(
         uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
         idempotency=IdempotencyService(key_hash_secret=b"i" * 32),
@@ -1383,12 +1395,23 @@ async def test_platform_access_exchange_requires_authoritative_active_permission
         audit_context=_audit("trace-platform-exchange"),
     )
     assert authorized.principal == allowed_actor.principal
-    with pytest.raises(PlatformAuthorizationDenied, match="not authorized"):
-        await service.authorize_access(
-            denied_actor,
-            permission="tenant_application.review",
-            audit_context=_audit("trace-platform-exchange-denied"),
+    for index, read_actor in enumerate((denied_actor, operations_actor), start=1):
+        authorized_read = await service.authorize_access(
+            read_actor,
+            permission="tenant_application.read",
+            audit_context=_audit(f"trace-platform-read-{index}"),
         )
+        assert authorized_read.principal == read_actor.principal
+        assert await service.list(
+            read_actor,
+            audit_context=_audit(f"trace-platform-list-{index}"),
+        )
+        with pytest.raises(PlatformAuthorizationDenied, match="not authorized"):
+            await service.authorize_access(
+                read_actor,
+                permission="tenant_application.review",
+                audit_context=_audit(f"trace-platform-review-denied-{index}"),
+            )
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,4 @@
+import re
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from functools import lru_cache
@@ -19,9 +20,12 @@ DEVELOPMENT_DATA_ENCRYPTION_KEY_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBA
 DEVELOPMENT_BLIND_INDEX_KEY_B64 = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
 DEVELOPMENT_REFRESH_TOKEN_KEY_B64 = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="  # noqa: S105
 DEVELOPMENT_CSRF_KEY_B64 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="
-DEVELOPMENT_ED25519_KEY_RING = {"development": "development-only-ed25519-key"}
+DEVELOPMENT_ED25519_KEY_RING = {
+    "development": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
+}
 DEVELOPMENT_DATABASE_URL = "mysql+asyncmy://lawyer:lawyer@mysql:3306/lawyer_agent"
 DEVELOPMENT_REDIS_URL = "redis://redis:6379/0"
+_JWT_KID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}\Z", re.ASCII)
 
 
 def _decode_32_byte_key(value: str, field_name: str) -> bytes:
@@ -34,17 +38,44 @@ def _decode_32_byte_key(value: str, field_name: str) -> bytes:
     return decoded
 
 
+def _validate_versioned_key_ring(
+    value: dict[int, str] | None,
+    field_name: str,
+) -> dict[int, str] | None:
+    if value is None:
+        return None
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    decoded: list[bytes] = []
+    for version, material in value.items():
+        if type(version) is not int or not 1 <= version <= 32767:
+            raise ValueError(f"{field_name} versions must be from 1 to 32767")
+        decoded.append(_decode_32_byte_key(material, field_name))
+    if len(set(decoded)) != len(decoded):
+        raise ValueError(f"{field_name} must not repeat decoded key material")
+    return value
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="LAWYER_", env_file=".env", extra="ignore", validate_default=True
+        env_prefix="LAWYER_",
+        env_file=".env",
+        extra="ignore",
+        validate_default=True,
+        hide_input_in_errors=True,
     )
 
     environment: Literal["development", "test", "staging", "production"] = "development"
-    secret_key: str = Field(default=DEVELOPMENT_SECRET, min_length=32)
+    secret_key: str = Field(
+        default=DEVELOPMENT_SECRET,
+        min_length=32,
+        repr=False,
+        exclude=True,
+    )
     api_prefix: str = "/api/v1"
     log_level: str = "INFO"
-    database_url: str = DEVELOPMENT_DATABASE_URL
-    redis_url: str = DEVELOPMENT_REDIS_URL
+    database_url: str = Field(default=DEVELOPMENT_DATABASE_URL, repr=False, exclude=True)
+    redis_url: str = Field(default=DEVELOPMENT_REDIS_URL, repr=False, exclude=True)
     redis_key_prefix: str = Field(default="lawyer:", pattern=r"^[a-z0-9][a-z0-9:-]{0,62}:$")
     redis_security_topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE
     database_pool_size: int = Field(default=10, gt=0)
@@ -52,19 +83,49 @@ class Settings(BaseSettings):
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)
     trusted_origins: tuple[str, ...] = ("http://localhost:5173",)
     cookie_secure: bool = False
-    data_encryption_key_b64: str = DEVELOPMENT_DATA_ENCRYPTION_KEY_B64
-    blind_index_key_b64: str = DEVELOPMENT_BLIND_INDEX_KEY_B64
+    data_encryption_key_b64: str = Field(
+        default=DEVELOPMENT_DATA_ENCRYPTION_KEY_B64,
+        repr=False,
+        exclude=True,
+    )
+    data_encryption_key_ring: dict[int, str] | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    data_encryption_active_key_version: int | None = None
+    blind_index_key_b64: str = Field(
+        default=DEVELOPMENT_BLIND_INDEX_KEY_B64,
+        repr=False,
+        exclude=True,
+    )
+    blind_index_key_ring: dict[int, str] | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+    )
+    blind_index_active_key_version: int | None = None
     blind_index_rollout_phase: Literal[
         "legacy-compatible", "rotation-ready"
     ] | None = None
     blind_index_legacy_key_version: int | None = None
     blind_index_legacy_writers_drained: bool = False
-    refresh_token_key_b64: str = DEVELOPMENT_REFRESH_TOKEN_KEY_B64
-    csrf_key_b64: str = DEVELOPMENT_CSRF_KEY_B64
+    refresh_token_key_b64: str = Field(
+        default=DEVELOPMENT_REFRESH_TOKEN_KEY_B64,
+        repr=False,
+        exclude=True,
+    )
+    csrf_key_b64: str = Field(
+        default=DEVELOPMENT_CSRF_KEY_B64,
+        repr=False,
+        exclude=True,
+    )
     jwt_issuer: str = "https://identity.lawyer-agent.local"
     jwt_active_kid: str = "development"
     jwt_ed25519_key_ring: dict[str, str] = Field(
-        default_factory=lambda: DEVELOPMENT_ED25519_KEY_RING.copy()
+        default_factory=lambda: DEVELOPMENT_ED25519_KEY_RING.copy(),
+        repr=False,
+        exclude=True,
     )
 
     @field_validator(
@@ -76,6 +137,72 @@ class Settings(BaseSettings):
     @classmethod
     def validate_base64_security_key(cls, value: str, info: ValidationInfo) -> str:
         _decode_32_byte_key(value, info.field_name or "security key")
+        return value
+
+    @field_validator(
+        "data_encryption_key_ring",
+        "blind_index_key_ring",
+        mode="before",
+    )
+    @classmethod
+    def normalize_versioned_key_ring(cls, value: object) -> object:
+        if value is None or not isinstance(value, dict):
+            return value
+        normalized: dict[int, object] = {}
+        for raw_version, material in value.items():
+            if isinstance(raw_version, bool):
+                raise ValueError("security key ring versions must be integers")
+            if isinstance(raw_version, int):
+                version = raw_version
+            elif (
+                isinstance(raw_version, str)
+                and raw_version.isascii()
+                and raw_version.isdigit()
+            ):
+                version = int(raw_version)
+                if str(version) != raw_version:
+                    raise ValueError(
+                        "security key ring versions must use canonical decimal strings"
+                    )
+            else:
+                raise ValueError("security key ring versions must be integers")
+            if version in normalized:
+                raise ValueError("security key ring contains a duplicate version")
+            normalized[version] = material
+        return normalized
+
+    @field_validator("data_encryption_key_ring", "blind_index_key_ring")
+    @classmethod
+    def validate_versioned_key_ring(
+        cls,
+        value: dict[int, str] | None,
+        info: ValidationInfo,
+    ) -> dict[int, str] | None:
+        return _validate_versioned_key_ring(value, info.field_name or "security key ring")
+
+    @field_validator(
+        "data_encryption_active_key_version",
+        "blind_index_active_key_version",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_active_key_version(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("active key version must be an integer")
+        return value
+
+    @field_validator(
+        "data_encryption_active_key_version",
+        "blind_index_active_key_version",
+    )
+    @classmethod
+    def validate_active_key_version(
+        cls,
+        value: int | None,
+        info: ValidationInfo,
+    ) -> int | None:
+        if value is not None and (type(value) is not int or not 1 <= value <= 32767):
+            raise ValueError(f"{info.field_name} must be from 1 to 32767")
         return value
 
     @field_validator("trusted_origins")
@@ -104,18 +231,38 @@ class Settings(BaseSettings):
     def validate_ed25519_key_ring(cls, value: dict[str, str]) -> dict[str, str]:
         if not value:
             raise ValueError("jwt_ed25519_key_ring must not be empty")
-        if any(not key.strip() or not material.strip() for key, material in value.items()):
-            raise ValueError("jwt_ed25519_key_ring entries must not be blank")
-        if len(set(value.values())) != len(value):
-            raise ValueError("jwt_ed25519_key_ring must not repeat key material")
+        if any(
+            _JWT_KID_PATTERN.fullmatch(key) is None or not material.strip()
+            for key, material in value.items()
+        ):
+            raise ValueError("jwt_ed25519_key_ring contains an invalid JWT kid or blank seed")
+        decoded = tuple(
+            _decode_32_byte_key(material, "JWT Ed25519 seed")
+            for material in value.values()
+        )
+        if len(set(decoded)) != len(decoded):
+            raise ValueError("jwt_ed25519_key_ring must not repeat decoded key material")
         return value
 
     @model_validator(mode="after")
     def validate_active_jwt_key(self) -> "Settings":
         if (
+            len(self.jwt_ed25519_key_ring) > 1
+            and "jwt_active_kid" not in self.model_fields_set
+        ):
+            raise ValueError("multi-key JWT rings require an explicit jwt_active_kid")
+        if (
+            self.environment in {"staging", "production"}
+            and "jwt_active_kid" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "staging and production require an explicit jwt_active_kid"
+            )
+        if (
             self.jwt_active_kid == "development"
             and self.jwt_active_kid not in self.jwt_ed25519_key_ring
             and len(self.jwt_ed25519_key_ring) == 1
+            and self.environment in {"development", "test"}
         ):
             # A single externally configured key is unambiguous. Rotation rings
             # still require an explicit active kid and therefore fail closed.
@@ -125,6 +272,33 @@ class Settings(BaseSettings):
         parsed = urlparse(self.jwt_issuer)
         if parsed.scheme != "https" or not parsed.netloc or "*" in self.jwt_issuer:
             raise ValueError("jwt_issuer must be an explicit HTTPS origin")
+        return self
+
+    @model_validator(mode="after")
+    def validate_versioned_key_ring_actives(self) -> "Settings":
+        pairs = (
+            (
+                "data-encryption key ring",
+                self.data_encryption_key_ring,
+                self.data_encryption_active_key_version,
+            ),
+            (
+                "blind-index key ring",
+                self.blind_index_key_ring,
+                self.blind_index_active_key_version,
+            ),
+        )
+        for name, ring, active_version in pairs:
+            if (ring is None) != (active_version is None):
+                raise ValueError(f"{name} and active key version must be configured together")
+            if ring is not None and active_version not in ring:
+                raise ValueError(f"{name} active key version is not configured")
+        if (
+            self.blind_index_key_ring is not None
+            and self.blind_index_legacy_key_version is not None
+            and self.blind_index_legacy_key_version not in self.blind_index_key_ring
+        ):
+            raise ValueError("blind-index legacy key version must remain in the key ring")
         return self
 
     @field_validator("blind_index_legacy_key_version")
@@ -153,6 +327,16 @@ class Settings(BaseSettings):
                 "staging and production require an explicit blind-index rollout phase "
                 "and legacy key version"
             )
+        if self.environment in {"staging", "production"} and not {
+            "data_encryption_key_ring",
+            "data_encryption_active_key_version",
+            "blind_index_key_ring",
+            "blind_index_active_key_version",
+        }.issubset(self.model_fields_set):
+            raise ValueError(
+                "staging and production require explicit versioned security key rings "
+                "and active versions"
+            )
         self.identity_rollout_policy()
         if self.environment not in {"staging", "production"}:
             return self
@@ -160,28 +344,39 @@ class Settings(BaseSettings):
         if self.secret_key == DEVELOPMENT_SECRET:
             raise ValueError("LAWYER_SECRET_KEY must be replaced outside development and test")
 
-        encoded_key_pairs = (
-            (self.data_encryption_key_b64, DEVELOPMENT_DATA_ENCRYPTION_KEY_B64),
-            (self.blind_index_key_b64, DEVELOPMENT_BLIND_INDEX_KEY_B64),
-            (self.refresh_token_key_b64, DEVELOPMENT_REFRESH_TOKEN_KEY_B64),
-            (self.csrf_key_b64, DEVELOPMENT_CSRF_KEY_B64),
+        decoded_keys = (
+            tuple(self.decoded_data_encryption_key_ring().values())
+            + tuple(self.decoded_blind_index_key_ring().values())
+            + tuple(
+                _decode_32_byte_key(material, "deployment JWT seed")
+                for material in self.jwt_ed25519_key_ring.values()
+            )
+            + (
+            _decode_32_byte_key(self.refresh_token_key_b64, "deployment security key"),
+            _decode_32_byte_key(self.csrf_key_b64, "deployment security key"),
+                self.secret_key.encode("utf-8"),
+            )
         )
-        decoded_keys = tuple(
-            _decode_32_byte_key(value, "deployment security key")
-            for value, _ in encoded_key_pairs
-        )
+        try:
+            decoded_application_secret = b64decode(self.secret_key, validate=True)
+        except BinasciiError:
+            decoded_application_secret = b""
+        if len(decoded_application_secret) == 32:
+            decoded_keys += (decoded_application_secret,)
         if len(set(decoded_keys)) != len(decoded_keys):
             raise ValueError("deployment security keys must be distinct")
-        if any(
-            key == _decode_32_byte_key(default, "development security key")
-            for key, (_, default) in zip(decoded_keys, encoded_key_pairs, strict=True)
-        ):
+        development_keys = {
+            _decode_32_byte_key(DEVELOPMENT_DATA_ENCRYPTION_KEY_B64, "development key"),
+            _decode_32_byte_key(DEVELOPMENT_BLIND_INDEX_KEY_B64, "development key"),
+            _decode_32_byte_key(DEVELOPMENT_REFRESH_TOKEN_KEY_B64, "development key"),
+            _decode_32_byte_key(DEVELOPMENT_CSRF_KEY_B64, "development key"),
+            _decode_32_byte_key(
+                DEVELOPMENT_ED25519_KEY_RING["development"],
+                "development key",
+            ),
+        }
+        if any(key in development_keys for key in decoded_keys):
             raise ValueError("deployment security keys must replace every development key")
-        if any(
-            material in DEVELOPMENT_ED25519_KEY_RING.values()
-            for material in self.jwt_ed25519_key_ring.values()
-        ):
-            raise ValueError("deployment Ed25519 key ring must replace development key material")
         if self.database_url == DEVELOPMENT_DATABASE_URL:
             raise ValueError("database_url must be replaced outside development and test")
         if self.redis_url == DEVELOPMENT_REDIS_URL:
@@ -209,6 +404,40 @@ class Settings(BaseSettings):
             legacy_key_version=legacy_key_version,
             legacy_writers_drained=self.blind_index_legacy_writers_drained,
         )
+
+    def decoded_data_encryption_key_ring(self) -> dict[int, bytes]:
+        if self.data_encryption_key_ring is None:
+            return {
+                1: _decode_32_byte_key(
+                    self.data_encryption_key_b64,
+                    "data_encryption_key_b64",
+                )
+            }
+        return {
+            version: _decode_32_byte_key(material, "data_encryption_key_ring")
+            for version, material in self.data_encryption_key_ring.items()
+        }
+
+    def decoded_blind_index_key_ring(self) -> dict[int, bytes]:
+        if self.blind_index_key_ring is None:
+            return {
+                1: _decode_32_byte_key(
+                    self.blind_index_key_b64,
+                    "blind_index_key_b64",
+                )
+            }
+        return {
+            version: _decode_32_byte_key(material, "blind_index_key_ring")
+            for version, material in self.blind_index_key_ring.items()
+        }
+
+    @property
+    def effective_data_encryption_active_key_version(self) -> int:
+        return self.data_encryption_active_key_version or 1
+
+    @property
+    def effective_blind_index_active_key_version(self) -> int:
+        return self.blind_index_active_key_version or 1
 
 
 @lru_cache

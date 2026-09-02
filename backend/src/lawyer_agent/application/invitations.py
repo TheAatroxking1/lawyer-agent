@@ -115,6 +115,13 @@ class InvitationDeliveryError(RuntimeError):
         super().__init__("invitation was created but delivery failed")
 
 
+class InvitationDeliveryUnavailable(RuntimeError):
+    code = "invitation_delivery_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__("invitation delivery capability is unavailable")
+
+
 @dataclass(frozen=True, slots=True)
 class CreateInvitationCommand:
     target_kind: InvitationTargetKind
@@ -342,6 +349,20 @@ class InvitationDeliveryPort(Protocol):
     async def deliver(self, *, invitation_id: UUID, token: str) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class InvitationDeliveryCapability:
+    port: InvitationDeliveryPort | None
+
+    @property
+    def available(self) -> bool:
+        return self.port is not None
+
+    def require(self) -> InvitationDeliveryPort:
+        if self.port is None:
+            raise InvitationDeliveryUnavailable
+        return self.port
+
+
 class InvitationWorkflowUnitOfWork(Protocol):
     invitations: InvitationRepositoryPort
     authorization: TenantAuthorizationWorkflowRepositoryPort
@@ -369,7 +390,7 @@ class InvitationService:
         blind_index: BlindIndexPort,
         target_fingerprint_hasher: InvitationTargetFingerprintHasher,
         cipher: SensitiveValueCipherPort,
-        delivery: InvitationDeliveryPort,
+        delivery: InvitationDeliveryPort | None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         policy: PolicyEngine | None = None,
     ) -> None:
@@ -443,6 +464,9 @@ class InvitationService:
             command, CreateInvitationCommand
         ):
             raise ValueError("invitation creation inputs must be strongly typed")
+        if self._delivery is None:
+            raise InvitationDeliveryUnavailable
+        delivery = self._delivery
         now = self._now()
         if command.expires_at <= now:
             raise ValueError("invitation expiry must be in the future")
@@ -577,7 +601,7 @@ class InvitationService:
         assert raw_token is not None
         delivery_error: InvitationDeliveryError | None = None
         try:
-            await self._delivery.deliver(
+            await delivery.deliver(
                 invitation_id=result.invitation_id,
                 token=raw_token,
             )
