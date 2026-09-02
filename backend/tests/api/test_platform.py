@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import inspect
+import io
 from dataclasses import fields
 
 import pytest
 
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.platform import (
+    BootstrapCommittedWithCleanupWarning,
     BootstrapPlatformAdminCommand,
     BootstrapSecretVerifier,
     PlatformActor,
+    PlatformReviewService,
     ReviewDecision,
     ReviewTenantApplicationCommand,
 )
@@ -89,6 +92,32 @@ def test_bootstrap_cli_exposes_no_secret_value_argument() -> None:
     assert {"--secret-stdin", "--secret-file"} <= option_strings
 
 
+def test_bootstrap_cli_treats_committed_cleanup_warning_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import lawyer_agent.cli.bootstrap_platform_admin as bootstrap_cli
+
+    raw_secret = "K" * 32
+
+    async def committed_with_cleanup_warning(**_: object) -> None:
+        raise BootstrapCommittedWithCleanupWarning
+
+    monkeypatch.setattr(bootstrap_cli, "_bootstrap", committed_with_cleanup_warning)
+    monkeypatch.setenv("LAWYER_BOOTSTRAP_ADMIN_SECRET_DIGEST", "0" * 64)
+    monkeypatch.setattr(bootstrap_cli.sys, "stdin", io.StringIO(raw_secret))
+
+    exit_code = bootstrap_cli.main(
+        ["--user-id", str(new_uuid7()), "--secret-stdin"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "completed" in captured.out
+    assert "warning" in captured.out
+    assert raw_secret not in captured.out + captured.err
+
+
 def test_platform_actor_requires_platform_audience() -> None:
     actor = PlatformActor(_principal())
     assert actor.principal.audience is PrincipalAudience.PLATFORM
@@ -136,3 +165,13 @@ def test_platform_list_projection_and_repository_do_not_join_tenant_content() ->
     list_source = inspect.getsource(PlatformRepository.list_applications).lower()
     assert ".join(" not in list_source
     assert "tenantmodel" in list_source
+
+
+@pytest.mark.asyncio
+async def test_platform_review_entrypoints_validate_command_type_before_fields() -> None:
+    service = object.__new__(PlatformReviewService)
+
+    with pytest.raises(ValueError, match="strongly typed"):
+        await service.approve(object(), object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="strongly typed"):
+        await service.reject(object(), object())  # type: ignore[arg-type]

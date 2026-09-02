@@ -10,6 +10,7 @@ from uuid import UUID
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.platform import (
     BootstrapAuthenticationFailed,
+    BootstrapCommittedWithCleanupWarning,
     BootstrapPlatformAdminCommand,
     BootstrapSecretVerifier,
     BootstrapUnavailable,
@@ -55,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(_bootstrap(user_id=user_id, secret=secret, verifier=verifier))
+    except BootstrapCommittedWithCleanupWarning:
+        print("platform administrator bootstrap completed with cleanup warning")
+        return 0
     except BootstrapAuthenticationFailed:
         print("bootstrap authentication failed", file=sys.stderr)
         return 3

@@ -16,7 +16,9 @@ from lawyer_agent.domain.authorization import Principal
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.infrastructure.persistence.models import (
     AuditEventModel,
+    AuthIdentityModel,
     AuthSessionModel,
+    PasswordCredentialModel,
     PermissionModel,
     PlatformRoleAssignmentModel,
     PlatformRoleModel,
@@ -24,6 +26,7 @@ from lawyer_agent.infrastructure.persistence.models import (
     TenantModel,
     UserModel,
 )
+from lawyer_agent.infrastructure.persistence.seed_authz import PERMISSIONS, PLATFORM_ROLES
 
 
 class PlatformRepository:
@@ -50,6 +53,7 @@ class PlatformRepository:
         user = await self._session.scalar(user_statement)
         if user is None:
             return None
+        catalog_valid = await self._platform_catalog_is_valid(for_update=for_update)
         role_statement = (
             select(PlatformRoleModel.code, PermissionModel.code)
             .join(
@@ -95,7 +99,59 @@ class PlatformRepository:
             session_expires_at=_aware(auth_session.expires_at),
             permissions=frozenset(row[1] for row in rows if row[1] is not None),
             role_codes=frozenset(row[0] for row in rows),
+            catalog_valid=catalog_valid,
         )
+
+    async def _platform_catalog_is_valid(self, *, for_update: bool) -> bool:
+        permission_statement = select(PermissionModel).order_by(PermissionModel.id)
+        role_statement = select(PlatformRoleModel).order_by(PlatformRoleModel.id)
+        mapping_statement = select(
+            PlatformRolePermissionModel.platform_role_id,
+            PlatformRolePermissionModel.permission_id,
+        ).order_by(
+            PlatformRolePermissionModel.platform_role_id,
+            PlatformRolePermissionModel.permission_id,
+        )
+        if for_update:
+            permission_statement = permission_statement.with_for_update()
+            role_statement = role_statement.with_for_update()
+            mapping_statement = mapping_statement.with_for_update()
+        permissions = (await self._session.scalars(permission_statement)).all()
+        roles = (await self._session.scalars(role_statement)).all()
+        mappings = (await self._session.execute(mapping_statement)).all()
+
+        expected_permissions = {
+            item.code: (item.resource, item.action, item.risk_level, "active")
+            for item in PERMISSIONS
+        }
+        actual_permissions = {
+            item.code: (item.resource, item.action, item.risk_level, item.status)
+            for item in permissions
+        }
+        if actual_permissions != expected_permissions:
+            return False
+        permission_codes_by_id = {item.id: item.code for item in permissions}
+
+        expected_roles = {
+            item.code: (item.name, item.description, "active", item.permission_codes)
+            for item in PLATFORM_ROLES
+        }
+        role_permissions: dict[UUID, set[str]] = {item.id: set() for item in roles}
+        for role_id, permission_id in mappings:
+            permission_code = permission_codes_by_id.get(permission_id)
+            if role_id not in role_permissions or permission_code is None:
+                return False
+            role_permissions[role_id].add(permission_code)
+        actual_roles = {
+            item.code: (
+                item.name,
+                item.description,
+                item.status,
+                frozenset(role_permissions[item.id]),
+            )
+            for item in roles
+        }
+        return actual_roles == expected_roles
 
     async def list_applications(
         self, *, limit: int
@@ -163,6 +219,24 @@ class PlatformRepository:
         user = await self._session.scalar(
             select(UserModel).where(UserModel.id == user_id).with_for_update()
         )
+        identities = (
+            await self._session.scalars(
+                select(AuthIdentityModel)
+                .where(
+                    AuthIdentityModel.user_id == user_id,
+                    AuthIdentityModel.status == "active",
+                    AuthIdentityModel.verified_at.is_not(None),
+                )
+                .order_by(AuthIdentityModel.id)
+                .with_for_update()
+            )
+        ).all()
+        credential = await self._session.scalar(
+            select(PasswordCredentialModel)
+            .where(PasswordCredentialModel.user_id == user_id)
+            .with_for_update()
+        )
+        database_now = _naive(now)
         role = await self._session.scalar(
             select(PlatformRoleModel)
             .where(
@@ -185,7 +259,6 @@ class PlatformRepository:
                     .with_for_update()
                 )
             ).all()
-            database_now = _naive(now)
             current = any(
                 assignment.status == "active"
                 and assignment.revoked_at is None
@@ -209,6 +282,15 @@ class PlatformRepository:
         )
         return BootstrapState(
             user_is_active=user is not None and user.status == "active",
+            target_can_reauthenticate=(
+                bool(identities)
+                and credential is not None
+                and credential.status == "active"
+                and (
+                    credential.locked_until is None
+                    or credential.locked_until <= database_now
+                )
+            ),
             super_admin_role_id=role_id,
             has_current_super_admin=current,
             was_bootstrapped=was_bootstrapped,

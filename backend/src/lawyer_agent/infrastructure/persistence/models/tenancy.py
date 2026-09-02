@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    SmallInteger,
     String,
     UniqueConstraint,
 )
@@ -117,12 +118,24 @@ class TenantInvitationModel(VersionMixin, TimestampMixin, Base):
             ["tenant_memberships.tenant_id", "tenant_memberships.id"],
         ),
         Index("ix_tenant_invitations_target", "tenant_id", "target_blind_index"),
+        Index(
+            "ix_tenant_invitations_blind_key_version",
+            "target_blind_index_key_version",
+        ),
+        CheckConstraint(
+            "target_blind_index_key_version BETWEEN 1 AND 32767",
+            name="tenant_invitation_blind_key_version",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(UuidBinary(), primary_key=True)
     tenant_id: Mapped[UUID] = mapped_column(UuidBinary(), ForeignKey("tenants.id"), nullable=False)
     target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     target_blind_index: Mapped[bytes] = mapped_column(BINARY(32), nullable=False)
+    target_blind_index_key_version: Mapped[int | None] = mapped_column(
+        SmallInteger,
+        nullable=True,
+    )
     token_hash: Mapped[bytes] = mapped_column(BINARY(32), nullable=False)
     invited_by_membership_id: Mapped[UUID] = mapped_column(UuidBinary(), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(UTC_DATETIME, nullable=False)

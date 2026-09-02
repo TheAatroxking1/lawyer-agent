@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.invitations import (
@@ -65,6 +65,27 @@ class InvitationRepository:
         )
         return value if isinstance(value, str) else None
 
+    async def count_pending_unexpired_by_blind_index_versions(
+        self, *, key_versions: tuple[int, ...], now: datetime
+    ) -> int:
+        if not key_versions or any(
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or not 1 <= version <= 32767
+            for version in key_versions
+        ):
+            raise ValueError("blind-index key versions are invalid")
+        value = await self._session.scalar(
+            select(func.count())
+            .select_from(TenantInvitationModel)
+            .where(
+                TenantInvitationModel.target_blind_index_key_version.in_(key_versions),
+                TenantInvitationModel.status == "pending",
+                TenantInvitationModel.expires_at > _naive(now),
+            )
+        )
+        return int(value or 0)
+
     async def add(self, invitation: InvitationRecord) -> None:
         _require_invitation_record(invitation)
         self._session.add(
@@ -73,6 +94,9 @@ class InvitationRepository:
                 tenant_id=invitation.tenant_id,
                 target_kind=invitation.target_kind.value,
                 target_blind_index=invitation.target_blind_index,
+                target_blind_index_key_version=(
+                    invitation.target_blind_index_key_version
+                ),
                 token_hash=invitation.token_hash,
                 invited_by_membership_id=invitation.invited_by_membership_id,
                 expires_at=_naive(invitation.expires_at),
@@ -322,6 +346,7 @@ def _invitation(model: TenantInvitationModel) -> InvitationRecord:
         tenant_id=model.tenant_id,
         target_kind=InvitationTargetKind(model.target_kind),
         target_blind_index=model.target_blind_index,
+        target_blind_index_key_version=model.target_blind_index_key_version,
         token_hash=model.token_hash,
         invited_by_membership_id=model.invited_by_membership_id,
         expires_at=_aware(model.expires_at),
@@ -367,6 +392,12 @@ def _require_invitation_record(invitation: InvitationRecord) -> None:
         invitation.invited_by_membership_id,
     )
     _require_digest(invitation.token_hash)
+    if (
+        isinstance(invitation.target_blind_index_key_version, bool)
+        or not isinstance(invitation.target_blind_index_key_version, int)
+        or not 1 <= invitation.target_blind_index_key_version <= 32767
+    ):
+        raise ValueError("invitation blind-index key version is invalid")
 
 
 def _aware(value: datetime) -> datetime:

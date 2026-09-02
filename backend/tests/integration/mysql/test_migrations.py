@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from alembic.config import Config
@@ -182,6 +183,181 @@ def test_seed_is_idempotent_rejects_drift_and_creates_no_admin(mysql_url: URL) -
 def test_account_refresh_cannot_reference_tenant_session(mysql_url: URL) -> None:
     command.upgrade(_alembic_config(mysql_url), "head")
     asyncio.run(_reject_cross_context_refresh(mysql_url))
+
+
+def test_invitation_blind_index_migration_revokes_unknown_legacy_pending_rows(
+    mysql_url: URL,
+) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "20260902_03")
+    invitation_id = asyncio.run(_insert_legacy_pending_invitation(mysql_url))
+
+    command.upgrade(config, "head")
+    migrated = asyncio.run(_read_migrated_invitation(mysql_url, invitation_id))
+    assert migrated == ("revoked", True, None, 2)
+    asyncio.run(_delete_legacy_invitation_graph(mysql_url, invitation_id))
+
+    command.downgrade(config, "20260902_03")
+    columns = asyncio.run(_invitation_columns(mysql_url))
+    assert "target_blind_index_key_version" not in columns
+    command.upgrade(config, "head")
+    assert "target_blind_index_key_version" in asyncio.run(
+        _invitation_columns(mysql_url)
+    )
+
+
+async def _insert_legacy_pending_invitation(mysql_url: URL) -> UUID:
+    engine = create_async_engine(mysql_url)
+    user_id = new_uuid7()
+    tenant_id = new_uuid7()
+    membership_id = new_uuid7()
+    invitation_id = new_uuid7()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO users "
+                    "(id,status,display_name,auth_version,version) "
+                    "VALUES (:id,'active','Legacy User',1,1)"
+                ),
+                {"id": user_id.bytes},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants "
+                    "(id,name,normalized_name,tenant_type,status,created_by_user_id,"
+                    "review_status,version) VALUES "
+                    "(:id,'Legacy Tenant','legacy-tenant','enterprise','active',"
+                    ":user_id,'approved',1)"
+                ),
+                {"id": tenant_id.bytes, "user_id": user_id.bytes},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO tenant_memberships "
+                    "(id,tenant_id,user_id,member_type,status,valid_from,authz_version,version) "
+                    "VALUES (:id,:tenant_id,:user_id,'owner','active',:now,1,1)"
+                ),
+                {
+                    "id": membership_id.bytes,
+                    "tenant_id": tenant_id.bytes,
+                    "user_id": user_id.bytes,
+                    "now": now,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO tenant_invitations "
+                    "(id,tenant_id,target_kind,target_blind_index,token_hash,"
+                    "invited_by_membership_id,expires_at,status,version) VALUES "
+                    "(:id,:tenant_id,'email',:target,:token,:membership_id,:expires,'pending',1)"
+                ),
+                {
+                    "id": invitation_id.bytes,
+                    "tenant_id": tenant_id.bytes,
+                    "target": b"b" * 32,
+                    "token": b"t" * 32,
+                    "membership_id": membership_id.bytes,
+                    "expires": now + timedelta(days=1),
+                },
+            )
+        return invitation_id
+    finally:
+        await engine.dispose()
+
+
+async def _read_migrated_invitation(
+    mysql_url: URL, invitation_id: UUID
+) -> tuple[str, bool, int | None, int]:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT status, revoked_at, target_blind_index_key_version, version "
+                        "FROM tenant_invitations WHERE id = :id"
+                    ),
+                    {"id": invitation_id.bytes},
+                )
+            ).one()
+            return (
+                row.status,
+                row.revoked_at is not None,
+                row.target_blind_index_key_version,
+                row.version,
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _invitation_columns(mysql_url: URL) -> set[str]:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns(
+                        "tenant_invitations"
+                    )
+                }
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _delete_legacy_invitation_graph(
+    mysql_url: URL, invitation_id: UUID
+) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT tenant_id, invited_by_membership_id "
+                        "FROM tenant_invitations WHERE id = :id"
+                    ),
+                    {"id": invitation_id.bytes},
+                )
+            ).one()
+            user_id = await connection.scalar(
+                text(
+                    "SELECT user_id FROM tenant_memberships "
+                    "WHERE tenant_id = :tenant_id AND id = :membership_id"
+                ),
+                {
+                    "tenant_id": row.tenant_id,
+                    "membership_id": row.invited_by_membership_id,
+                },
+            )
+            await connection.execute(
+                text("DELETE FROM tenant_invitations WHERE id = :id"),
+                {"id": invitation_id.bytes},
+            )
+            await connection.execute(
+                text(
+                    "DELETE FROM tenant_memberships "
+                    "WHERE tenant_id = :tenant_id AND id = :membership_id"
+                ),
+                {
+                    "tenant_id": row.tenant_id,
+                    "membership_id": row.invited_by_membership_id,
+                },
+            )
+            await connection.execute(
+                text("DELETE FROM tenants WHERE id = :tenant_id"),
+                {"tenant_id": row.tenant_id},
+            )
+            await connection.execute(
+                text("DELETE FROM users WHERE id = :user_id"),
+                {"user_id": user_id},
+            )
+    finally:
+        await engine.dispose()
 
 
 async def _reject_cross_context_refresh(mysql_url: URL) -> None:

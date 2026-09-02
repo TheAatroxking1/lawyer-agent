@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import (
 
 from lawyer_agent.application.idempotency import IdempotencyRepositoryPort
 from lawyer_agent.application.platform import (
+    BootstrapCommittedWithCleanupWarning,
     PlatformRepositoryPort,
 )
 from lawyer_agent.application.security_locks import SecurityWriteLockRepositoryPort
@@ -76,20 +77,30 @@ class SqlAlchemyPlatformWorkflowUnitOfWork:
         del exc_value, traceback
         if self._session is None:
             raise RuntimeError("unit of work has not been entered")
+        committed = False
         try:
             if exc_type is None:
                 await self._session.commit()
+                committed = True
             else:
                 await self._session.rollback()
         except BaseException:
             await self._session.rollback()
             raise
         finally:
+            cleanup_failed = False
             try:
                 await self._release_bootstrap_lock()
-            finally:
+            except BaseException:
+                cleanup_failed = True
+            try:
                 await self._session.close()
+            except BaseException:
+                cleanup_failed = True
+            finally:
                 self._session = None
+            if committed and cleanup_failed:
+                raise BootstrapCommittedWithCleanupWarning from None
 
     async def acquire_bootstrap_lock(self) -> None:
         if self._session is None:
@@ -97,14 +108,22 @@ class SqlAlchemyPlatformWorkflowUnitOfWork:
         if self._lock_connection is not None:
             raise RuntimeError("bootstrap lock is already held")
         connection = await self._lock_engine.connect()
-        acquired = await connection.scalar(
-            select(text("GET_LOCK(:lock_name, :lock_timeout)")).params(
-                lock_name=_BOOTSTRAP_LOCK_NAME,
-                lock_timeout=self._lock_timeout_seconds,
+        acquisition_failed = False
+        acquired: object = None
+        try:
+            acquired = await connection.scalar(
+                select(text("GET_LOCK(:lock_name, :lock_timeout)")).params(
+                    lock_name=_BOOTSTRAP_LOCK_NAME,
+                    lock_timeout=self._lock_timeout_seconds,
+                )
             )
-        )
-        if acquired != 1:
-            await connection.close()
+        except BaseException:
+            acquisition_failed = True
+        if acquisition_failed or acquired != 1:
+            try:
+                await connection.close()
+            except BaseException:
+                acquisition_failed = True
             raise TimeoutError("platform bootstrap lock is unavailable")
         self._lock_connection = connection
 

@@ -10,21 +10,33 @@ import pytest
 from alembic.config import Config
 from sqlalchemy import delete, func, select
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from alembic import command
-from lawyer_agent.application.idempotency import IdempotencyService
+from lawyer_agent.application.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyService,
+)
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.invitations import (
     AcceptInvitationCommand,
     CreateInvitationCommand,
+    InvitationBlindIndexRetirementBlocked,
+    InvitationRoleDenied,
     InvitationService,
+    InvitationTargetFingerprintHasher,
     InvitationTargetKind,
     InvitationTokenHasher,
     InvitationUnavailable,
 )
 from lawyer_agent.application.platform import (
     BootstrapAuthenticationFailed,
+    BootstrapCommittedWithCleanupWarning,
     BootstrapPlatformAdminCommand,
     BootstrapSecretVerifier,
     BootstrapUnavailable,
@@ -50,8 +62,11 @@ from lawyer_agent.infrastructure.persistence.models import (
     AuthSessionModel,
     IdempotencyRecordModel,
     MembershipRoleAssignmentModel,
+    PasswordCredentialModel,
+    PermissionModel,
     PlatformRoleAssignmentModel,
     PlatformRoleModel,
+    PlatformRolePermissionModel,
     TenantInvitationModel,
     TenantInvitationRoleAssignmentModel,
     TenantMembershipModel,
@@ -74,10 +89,12 @@ from lawyer_agent.infrastructure.providers.development import TestInvitationDeli
 from lawyer_agent.infrastructure.redis.step_up import StepUpGrant
 from lawyer_agent.infrastructure.security.blind_index import BlindIndexService
 from lawyer_agent.infrastructure.security.cipher import SensitiveValueCipher
+from lawyer_agent.infrastructure.security.passwords import Argon2PasswordHasher
 
 pytestmark = [pytest.mark.integration, pytest.mark.mysql]
 
 NOW = datetime(2026, 9, 2, 8, 0, tzinfo=UTC)
+PASSWORD_HASH = Argon2PasswordHasher().hash("Synthetic-Passphrase-2026")
 
 
 def _alembic_config(mysql_url: URL) -> Config:
@@ -112,6 +129,7 @@ async def database(
             await session.execute(delete(TenantInvitationRoleAssignmentModel))
             await session.execute(delete(TenantInvitationModel))
             await session.execute(delete(AuthSessionModel))
+            await session.execute(delete(PasswordCredentialModel))
             await session.execute(delete(MembershipRoleAssignmentModel))
             await session.execute(delete(TenantRolePermissionModel))
             await session.execute(delete(TenantRoleModel))
@@ -266,6 +284,8 @@ async def _tenant_graph(
         "tenant_a": tenant_a,
         "tenant_b": tenant_b,
         "role_assistant_a": role_a["assistant"],
+        "role_owner_a": role_a["tenant_owner"],
+        "role_admin_a": role_a["tenant_admin"],
         "role_assistant_b": role_b["assistant"],
         "actor": TenantActor(principal, context),
     }
@@ -274,16 +294,157 @@ async def _tenant_graph(
 def _invitation_service(
     database: async_sessionmaker[AsyncSession],
     delivery: TestInvitationDeliveryAdapter,
+    *,
+    blind_index: BlindIndexService | None = None,
 ) -> InvitationService:
     return InvitationService(
         uow_factory=lambda: SqlAlchemyInvitationWorkflowUnitOfWork(database),
         idempotency=IdempotencyService(key_hash_secret=b"i" * 32),
         token_hasher=InvitationTokenHasher(hmac_key=b"t" * 32),
-        blind_index=_blind(),
+        blind_index=_blind() if blind_index is None else blind_index,
+        target_fingerprint_hasher=InvitationTargetFingerprintHasher(
+            hmac_key=b"f" * 32
+        ),
         cipher=_cipher(),
         delivery=delivery,
         clock=lambda: NOW,
     )
+
+
+@pytest.mark.asyncio
+async def test_invitation_bi_rotation_replays_stable_create_and_accepts_stored_v1(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    delivery_v1 = TestInvitationDeliveryAdapter(environment="test")
+    service_v1 = _invitation_service(
+        database,
+        delivery_v1,
+        blind_index=BlindIndexService({1: b"b" * 32}, active_key_version=1),
+    )
+    command = CreateInvitationCommand(
+        target_kind=InvitationTargetKind.EMAIL,
+        target="invitee@example.cn",
+        role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+        expires_at=NOW + timedelta(days=1),
+        idempotency_key="bi-rotation-create-key-0001",
+        audit_context=_audit("trace-bi-rotation-create"),
+    )
+    created = await service_v1.create(graph["actor"], command)  # type: ignore[arg-type]
+    token = delivery_v1.take(created.invitation_id)
+    assert token is not None
+
+    delivery_v2 = TestInvitationDeliveryAdapter(environment="test")
+    service_v2 = _invitation_service(
+        database,
+        delivery_v2,
+        blind_index=BlindIndexService(
+            {1: b"b" * 32, 2: b"d" * 32},
+            active_key_version=2,
+        ),
+    )
+    replay = await service_v2.create(graph["actor"], command)  # type: ignore[arg-type]
+    assert replay.replayed
+    assert delivery_v2.take(created.invitation_id) is None
+    with pytest.raises(IdempotencyConflictError):
+        await service_v2.create(
+            graph["actor"],  # type: ignore[arg-type]
+            CreateInvitationCommand(
+                target_kind=InvitationTargetKind.EMAIL,
+                target="different@example.cn",
+                role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+                expires_at=NOW + timedelta(days=1),
+                idempotency_key="bi-rotation-create-key-0001",
+                audit_context=_audit("trace-bi-rotation-conflict"),
+            ),
+        )
+    accepted = await service_v2.accept(
+        AcceptInvitationCommand(
+            actor_user_id=graph["invitee_id"],  # type: ignore[arg-type]
+            token=token,
+            idempotency_key="bi-rotation-accept-key-0001",
+            audit_context=_audit("trace-bi-rotation-accept"),
+        )
+    )
+    assert accepted.invitation_id == created.invitation_id
+    async with database() as session:
+        stored = await session.get(TenantInvitationModel, created.invitation_id)
+        assert stored is not None
+        assert stored.target_blind_index_key_version == 1
+
+
+@pytest.mark.asyncio
+async def test_invitation_missing_bi_key_fails_only_target_and_retirement_gate_blocks(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    delivery = TestInvitationDeliveryAdapter(environment="test")
+    service_v1 = _invitation_service(
+        database,
+        delivery,
+        blind_index=BlindIndexService({1: b"b" * 32}, active_key_version=1),
+    )
+    created = await service_v1.create(
+        graph["actor"],  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="invitee@example.cn",
+            role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="bi-retirement-create-key-0001",
+            audit_context=_audit("trace-bi-retirement-create"),
+        ),
+    )
+    token = delivery.take(created.invitation_id)
+    assert token is not None
+
+    service_v2_only = _invitation_service(
+        database,
+        TestInvitationDeliveryAdapter(environment="test"),
+        blind_index=BlindIndexService({2: b"d" * 32}, active_key_version=2),
+    )
+    with pytest.raises(InvitationUnavailable):
+        await service_v2_only.accept(
+            AcceptInvitationCommand(
+                actor_user_id=graph["invitee_id"],  # type: ignore[arg-type]
+                token=token,
+                idempotency_key="bi-retirement-accept-key-0001",
+                audit_context=_audit("trace-bi-retirement-accept"),
+            )
+        )
+
+    service_both = _invitation_service(
+        database,
+        TestInvitationDeliveryAdapter(environment="test"),
+        blind_index=BlindIndexService(
+            {1: b"b" * 32, 2: b"d" * 32}, active_key_version=2
+        ),
+    )
+    with pytest.raises(InvitationBlindIndexRetirementBlocked):
+        await service_both.assert_blind_index_versions_retirable((1,))
+    async with database.begin() as session:
+        stored = await session.get(TenantInvitationModel, created.invitation_id)
+        assert stored is not None
+        stored.status = "revoked"
+        stored.revoked_at = NOW.replace(tzinfo=None)
+    await service_both.assert_blind_index_versions_retirable((1,))
+
+    expired = await service_v1.create(
+        graph["actor"],  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="invitee@example.cn",
+            role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="bi-retirement-expired-key-0001",
+            audit_context=_audit("trace-bi-retirement-expired"),
+        ),
+    )
+    async with database.begin() as session:
+        stored = await session.get(TenantInvitationModel, expired.invitation_id)
+        assert stored is not None
+        stored.expires_at = (NOW - timedelta(seconds=1)).replace(tzinfo=None)
+    await service_both.assert_blind_index_versions_retirable((1,))
 
 
 @pytest.mark.asyncio
@@ -421,6 +582,70 @@ async def test_invitation_rejects_cross_tenant_role_and_identity_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_invitation_role_hierarchy_requires_strictly_lower_rank_except_owner(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    owner_service = _invitation_service(
+        database, TestInvitationDeliveryAdapter(environment="test")
+    )
+    created = await owner_service.create(
+        graph["actor"],  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="invitee@example.cn",
+            role_ids=(graph["role_admin_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="owner-invites-admin-0001",
+            audit_context=_audit("trace-owner-invites-admin"),
+        ),
+    )
+    assert created.status == "pending"
+    with pytest.raises(InvitationRoleDenied):
+        await owner_service.create(
+            graph["actor"],  # type: ignore[arg-type]
+            CreateInvitationCommand(
+                target_kind=InvitationTargetKind.EMAIL,
+                target="owner@example.cn",
+                role_ids=(graph["role_owner_a"],),  # type: ignore[arg-type]
+                expires_at=NOW + timedelta(days=1),
+                idempotency_key="owner-invites-owner-0001",
+                audit_context=_audit("trace-owner-invites-owner"),
+            ),
+        )
+
+    actor = graph["actor"]
+    async with database.begin() as session:
+        await session.execute(
+            delete(MembershipRoleAssignmentModel).where(
+                MembershipRoleAssignmentModel.tenant_id == graph["tenant_a"],
+                MembershipRoleAssignmentModel.membership_id
+                == actor.context.membership_id,  # type: ignore[union-attr]
+            )
+        )
+        session.add(
+            MembershipRoleAssignmentModel(
+                tenant_id=graph["tenant_a"],
+                membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+                tenant_role_id=graph["role_admin_a"],
+                assigned_by_membership_id=actor.context.membership_id,  # type: ignore[union-attr]
+            )
+        )
+    with pytest.raises(InvitationRoleDenied):
+        await owner_service.create(
+            actor,  # type: ignore[arg-type]
+            CreateInvitationCommand(
+                target_kind=InvitationTargetKind.EMAIL,
+                target="peer-admin@example.cn",
+                role_ids=(graph["role_admin_a"],),  # type: ignore[arg-type]
+                expires_at=NOW + timedelta(days=1),
+                idempotency_key="admin-invites-admin-0001",
+                audit_context=_audit("trace-admin-invites-admin"),
+            ),
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tenant_status", ["suspended", "closed"])
 async def test_invitation_accept_rejects_inactive_target_tenant_without_side_effects(
     database: async_sessionmaker[AsyncSession],
@@ -463,6 +688,132 @@ async def test_invitation_accept_rejects_inactive_target_tenant_without_side_eff
                 TenantMembershipModel.user_id == graph["invitee_id"]
             )
         ) == 0
+
+
+@pytest.mark.parametrize("unavailable_state", ["expired", "revoked", "disabled_user"])
+@pytest.mark.asyncio
+async def test_invitation_accept_rejects_unavailable_invitation_or_user(
+    database: async_sessionmaker[AsyncSession],
+    unavailable_state: str,
+) -> None:
+    graph = await _tenant_graph(database)
+    delivery = TestInvitationDeliveryAdapter(environment="test")
+    service = _invitation_service(database, delivery)
+    created = await service.create(
+        graph["actor"],  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="invitee@example.cn",
+            role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key=f"unavailable-{unavailable_state}-create-0001",
+            audit_context=_audit(f"trace-unavailable-{unavailable_state}-create"),
+        ),
+    )
+    token = delivery.take(created.invitation_id)
+    assert token is not None
+    async with database.begin() as session:
+        if unavailable_state == "disabled_user":
+            user = await session.get(UserModel, graph["invitee_id"])
+            assert user is not None
+            user.status = "disabled"
+        else:
+            invitation = await session.get(TenantInvitationModel, created.invitation_id)
+            assert invitation is not None
+            if unavailable_state == "expired":
+                invitation.expires_at = (NOW - timedelta(seconds=1)).replace(
+                    tzinfo=None
+                )
+            else:
+                invitation.status = "revoked"
+                invitation.revoked_at = NOW.replace(tzinfo=None)
+
+    with pytest.raises(InvitationUnavailable):
+        await service.accept(
+            AcceptInvitationCommand(
+                actor_user_id=graph["invitee_id"],  # type: ignore[arg-type]
+                token=token,
+                idempotency_key=f"unavailable-{unavailable_state}-accept-0001",
+                audit_context=_audit(
+                    f"trace-unavailable-{unavailable_state}-accept"
+                ),
+            )
+        )
+    async with database() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(TenantMembershipModel).where(
+                TenantMembershipModel.tenant_id == graph["tenant_a"],
+                TenantMembershipModel.user_id == graph["invitee_id"],
+            )
+        ) == 0
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.action == "invitation.accept"
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_invitation_accept_activates_matching_preallocated_membership(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    graph = await _tenant_graph(database)
+    membership_id = new_uuid7()
+    async with database.begin() as session:
+        session.add(
+            TenantMembershipModel(
+                id=membership_id,
+                tenant_id=graph["tenant_a"],
+                user_id=graph["invitee_id"],
+                department_id=None,
+                member_type="internal",
+                status="invited",
+                valid_from=NOW.replace(tzinfo=None),
+                valid_until=None,
+                authz_version=1,
+            )
+        )
+    delivery = TestInvitationDeliveryAdapter(environment="test")
+    service = _invitation_service(database, delivery)
+    created = await service.create(
+        graph["actor"],  # type: ignore[arg-type]
+        CreateInvitationCommand(
+            target_kind=InvitationTargetKind.EMAIL,
+            target="invitee@example.cn",
+            role_ids=(graph["role_assistant_a"],),  # type: ignore[arg-type]
+            expires_at=NOW + timedelta(days=1),
+            idempotency_key="preallocated-membership-create-0001",
+            audit_context=_audit("trace-preallocated-membership-create"),
+        ),
+    )
+    token = delivery.take(created.invitation_id)
+    assert token is not None
+
+    accepted = await service.accept(
+        AcceptInvitationCommand(
+            actor_user_id=graph["invitee_id"],  # type: ignore[arg-type]
+            token=token,
+            idempotency_key="preallocated-membership-accept-0001",
+            audit_context=_audit("trace-preallocated-membership-accept"),
+        )
+    )
+
+    assert accepted.membership.id == membership_id
+    assert accepted.membership.status is MembershipStatus.ACTIVE
+    assert accepted.membership.authz_version == 2
+    async with database() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(TenantMembershipModel).where(
+                TenantMembershipModel.tenant_id == graph["tenant_a"],
+                TenantMembershipModel.user_id == graph["invitee_id"],
+            )
+        ) == 1
+        assert await session.scalar(
+            select(func.count()).select_from(MembershipRoleAssignmentModel).where(
+                MembershipRoleAssignmentModel.tenant_id == graph["tenant_a"],
+                MembershipRoleAssignmentModel.membership_id == membership_id,
+            )
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -674,6 +1025,59 @@ async def _platform_graph(
     return PlatformActor(principal), tenant_id
 
 
+async def _add_bootstrap_target(
+    database: async_sessionmaker[AsyncSession],
+    *,
+    with_verified_identity: bool = True,
+    with_password: bool = True,
+    credential_status: str = "active",
+    locked_until: datetime | None = None,
+) -> UUID:
+    user_id = new_uuid7()
+    identity_id = new_uuid7()
+    subject = f"bootstrap-{user_id}@example.cn"
+    async with database.begin() as session:
+        await seed_authorization_catalog(session)
+        session.add(UserModel(id=user_id, status="active", display_name="首个平台管理员"))
+        await session.flush()
+        if with_verified_identity:
+            session.add(
+                AuthIdentityModel(
+                    id=identity_id,
+                    user_id=user_id,
+                    kind="email",
+                    provider="email",
+                    issuer="email",
+                    display_value=None,
+                    subject_ciphertext=_cipher().encrypt(
+                        subject,
+                        aad=f"auth_identity:{identity_id}:subject".encode("ascii"),
+                    ),
+                    subject_blind_index=_blind().digest("identity:email", subject),
+                    key_version=1,
+                    blind_index_key_version=1,
+                    verified_at=NOW.replace(tzinfo=None),
+                    status="active",
+                )
+            )
+        if with_password:
+            session.add(
+                PasswordCredentialModel(
+                    user_id=user_id,
+                    password_hash=PASSWORD_HASH,
+                    algorithm="argon2id",
+                    parameters_json=Argon2PasswordHasher().parameters,
+                    password_changed_at=NOW.replace(tzinfo=None),
+                    failed_attempt_count=0,
+                    locked_until=(
+                        None if locked_until is None else locked_until.replace(tzinfo=None)
+                    ),
+                    status=credential_status,
+                )
+            )
+    return user_id
+
+
 @pytest.mark.asyncio
 async def test_platform_review_requires_authoritative_permission_and_bound_single_use_step_up(
     database: async_sessionmaker[AsyncSession],
@@ -788,6 +1192,123 @@ async def test_platform_review_rejects_read_only_platform_role(
         )
 
 
+@pytest.mark.parametrize(
+    "catalog_drift",
+    ["unknown_role", "extra_permission", "inactive_permission", "drift_permission"],
+)
+@pytest.mark.parametrize("operation", ["list", "review"])
+@pytest.mark.asyncio
+async def test_platform_actions_fail_closed_for_any_platform_catalog_drift(
+    database: async_sessionmaker[AsyncSession],
+    catalog_drift: str,
+    operation: str,
+) -> None:
+    actor, tenant_id = await _platform_graph(database)
+    async with database.begin() as session:
+        super_admin = await session.scalar(
+            select(PlatformRoleModel).where(PlatformRoleModel.code == "super_admin")
+        )
+        assert super_admin is not None
+        if catalog_drift == "unknown_role":
+            super_admin.code = "unknown_platform_role"
+        elif catalog_drift == "extra_permission":
+            permission = PermissionModel(
+                id=new_uuid7(),
+                code="platform.unknown",
+                resource="platform",
+                action="unknown",
+                risk_level="critical",
+                status="active",
+            )
+            session.add(permission)
+            await session.flush()
+            session.add(
+                PlatformRolePermissionModel(
+                    platform_role_id=super_admin.id,
+                    permission_id=permission.id,
+                )
+            )
+        else:
+            bootstrap_permission = await session.scalar(
+                select(PermissionModel).where(
+                    PermissionModel.code == "platform_admin.bootstrap"
+                )
+            )
+            assert bootstrap_permission is not None
+            if catalog_drift == "inactive_permission":
+                bootstrap_permission.status = "disabled"
+            else:
+                bootstrap_permission.action = "drifted"
+
+    try:
+        step_up = _SingleUseStepUp()
+        service = PlatformReviewService(
+            uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
+            idempotency=IdempotencyService(key_hash_secret=b"i" * 32),
+            step_up=step_up,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(PlatformAuthorizationDenied) as captured:
+            if operation == "list":
+                await service.list(
+                    actor,
+                    audit_context=_audit(f"trace-platform-catalog-{catalog_drift}"),
+                )
+            else:
+                grant = step_up.issue(
+                    user_id=actor.principal.user_id,
+                    session_id=actor.principal.session_id,
+                    tenant_id=tenant_id,
+                    action="tenant_application.review:approve",
+                )
+                await service.approve(
+                    actor,
+                    ReviewTenantApplicationCommand(
+                        tenant_id=tenant_id,
+                        decision=ReviewDecision.APPROVE,
+                        reason_code="approved",
+                        step_up_grant=grant,
+                        idempotency_key=f"catalog-{catalog_drift}-review-0001",
+                        audit_context=_audit(
+                            f"trace-platform-catalog-review-{catalog_drift}"
+                        ),
+                    ),
+                )
+        assert captured.value.reason_code == "platform_catalog_invalid"
+    finally:
+        async with database.begin() as session:
+            if catalog_drift == "unknown_role":
+                role = await session.scalar(
+                    select(PlatformRoleModel).where(
+                        PlatformRoleModel.code == "unknown_platform_role"
+                    )
+                )
+                assert role is not None
+                role.code = "super_admin"
+            elif catalog_drift == "extra_permission":
+                permission = await session.scalar(
+                    select(PermissionModel).where(
+                        PermissionModel.code == "platform.unknown"
+                    )
+                )
+                assert permission is not None
+                await session.execute(
+                    delete(PlatformRolePermissionModel).where(
+                        PlatformRolePermissionModel.permission_id == permission.id
+                    )
+                )
+                await session.delete(permission)
+            else:
+                permission = await session.scalar(
+                    select(PermissionModel).where(
+                        PermissionModel.code == "platform_admin.bootstrap"
+                    )
+                )
+                assert permission is not None
+                permission.status = "active"
+                permission.action = "bootstrap"
+
+
 @pytest.mark.asyncio
 async def test_platform_reject_is_atomic_and_cannot_be_replayed_as_a_new_action(
     database: async_sessionmaker[AsyncSession],
@@ -849,10 +1370,7 @@ async def test_platform_reject_is_atomic_and_cannot_be_replayed_as_a_new_action(
 async def test_bootstrap_is_advisory_locked_audited_and_permanently_single_use(
     database: async_sessionmaker[AsyncSession],
 ) -> None:
-    user_id = new_uuid7()
-    async with database.begin() as session:
-        await seed_authorization_catalog(session)
-        session.add(UserModel(id=user_id, status="active", display_name="首个平台管理员"))
+    user_id = await _add_bootstrap_target(database)
     service = PlatformBootstrapService(
         uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
         verifier=BootstrapSecretVerifier.from_secret("S" * 32),
@@ -873,21 +1391,126 @@ async def test_bootstrap_is_advisory_locked_audited_and_permanently_single_use(
                 PlatformRoleAssignmentModel.user_id == user_id
             )
         ) == 1
+        audit = await session.scalar(
+            select(AuditEventModel).where(
+                AuditEventModel.action == "platform_admin.bootstrap"
+            )
+        )
+        assert audit is not None
+        assert audit.actor_user_id is None
+        assert audit.target_id == user_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_failure", ["release", "session_close"])
+async def test_bootstrap_reports_committed_when_advisory_cleanup_fails(
+    database: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    user_id = await _add_bootstrap_target(database)
+    created_uows: list[SqlAlchemyPlatformWorkflowUnitOfWork] = []
+
+    def uow_factory() -> SqlAlchemyPlatformWorkflowUnitOfWork:
+        uow = SqlAlchemyPlatformWorkflowUnitOfWork(database)
+        created_uows.append(uow)
+        return uow
+
+    if cleanup_failure == "release":
+        original_release = SqlAlchemyPlatformWorkflowUnitOfWork._release_bootstrap_lock
+
+        async def fail_after_releasing(
+            uow: SqlAlchemyPlatformWorkflowUnitOfWork,
+        ) -> None:
+            await original_release(uow)
+            raise RuntimeError("sensitive driver cleanup detail")
+
+        monkeypatch.setattr(
+            SqlAlchemyPlatformWorkflowUnitOfWork,
+            "_release_bootstrap_lock",
+            fail_after_releasing,
+        )
+    else:
+        original_session_close = AsyncSession.close
+
+        async def fail_first_uow_session_close(session: AsyncSession) -> None:
+            await original_session_close(session)
+            if session is created_uows[0]._session:
+                raise RuntimeError("sensitive session cleanup detail")
+
+        monkeypatch.setattr(AsyncSession, "close", fail_first_uow_session_close)
+    service = PlatformBootstrapService(
+        uow_factory=uow_factory,
+        verifier=BootstrapSecretVerifier.from_secret("C" * 32),
+        clock=lambda: NOW,
+    )
+    command_value = BootstrapPlatformAdminCommand(
+        user_id=user_id,
+        secret="C" * 32,
+        audit_context=_audit("trace-bootstrap-cleanup-warning"),
+    )
+
+    with pytest.raises(BootstrapCommittedWithCleanupWarning) as caught:
+        await service.bootstrap(command_value)
+
+    assert caught.value.committed is True
+    assert "sensitive" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    async with database() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(PlatformRoleAssignmentModel).where(
+                PlatformRoleAssignmentModel.user_id == user_id
+            )
+        ) == 1
         assert await session.scalar(
             select(func.count()).select_from(AuditEventModel).where(
                 AuditEventModel.action == "platform_admin.bootstrap"
             )
         ) == 1
 
+    with pytest.raises(BootstrapUnavailable):
+        await service.bootstrap(command_value)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_get_lock_error_closes_new_connection_without_detail(
+    database: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_close = AsyncConnection.close
+    closed_connections: list[AsyncConnection] = []
+
+    async def fail_scalar(
+        _connection: AsyncConnection, *args: object, **kwargs: object
+    ) -> object:
+        del args, kwargs
+        raise RuntimeError("sensitive get-lock driver detail")
+
+    async def track_close(connection: AsyncConnection) -> None:
+        closed_connections.append(connection)
+        await original_close(connection)
+
+    monkeypatch.setattr(AsyncConnection, "scalar", fail_scalar)
+    monkeypatch.setattr(AsyncConnection, "close", track_close)
+    uow = SqlAlchemyPlatformWorkflowUnitOfWork(database)
+    await uow.__aenter__()
+    try:
+        with pytest.raises(TimeoutError) as caught:
+            await uow.acquire_bootstrap_lock()
+        assert closed_connections
+        assert closed_connections[0].closed
+        assert "sensitive" not in str(caught.value)
+        assert caught.value.__context__ is None
+    finally:
+        await uow.__aexit__(TimeoutError, TimeoutError(), None)
+
 
 @pytest.mark.asyncio
 async def test_parallel_bootstrap_creates_exactly_one_super_admin(
     database: async_sessionmaker[AsyncSession],
 ) -> None:
-    user_id = new_uuid7()
-    async with database.begin() as session:
-        await seed_authorization_catalog(session)
-        session.add(UserModel(id=user_id, status="active", display_name="并发引导用户"))
+    user_id = await _add_bootstrap_target(database)
     service = PlatformBootstrapService(
         uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
         verifier=BootstrapSecretVerifier.from_secret("Q" * 32),
@@ -929,6 +1552,55 @@ async def test_bootstrap_wrong_secret_creates_no_assignment_or_audit(
                 user_id=user_id,
                 secret="W" * 32,
                 audit_context=_audit("trace-bootstrap-wrong-secret"),
+            )
+        )
+    async with database() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(PlatformRoleAssignmentModel)
+        ) == 0
+        assert await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.action == "platform_admin.bootstrap"
+            )
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    ("with_verified_identity", "with_password", "credential_status", "locked_until"),
+    [
+        (False, False, "active", None),
+        (True, False, "active", None),
+        (False, True, "active", None),
+        (True, True, "locked", None),
+        (True, True, "active", NOW + timedelta(minutes=5)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_target_that_cannot_password_reauthenticate(
+    database: async_sessionmaker[AsyncSession],
+    with_verified_identity: bool,
+    with_password: bool,
+    credential_status: str,
+    locked_until: datetime | None,
+) -> None:
+    user_id = await _add_bootstrap_target(
+        database,
+        with_verified_identity=with_verified_identity,
+        with_password=with_password,
+        credential_status=credential_status,
+        locked_until=locked_until,
+    )
+    service = PlatformBootstrapService(
+        uow_factory=lambda: SqlAlchemyPlatformWorkflowUnitOfWork(database),
+        verifier=BootstrapSecretVerifier.from_secret("X" * 32),
+        clock=lambda: NOW,
+    )
+    with pytest.raises(BootstrapUnavailable):
+        await service.bootstrap(
+            BootstrapPlatformAdminCommand(
+                user_id=user_id,
+                secret="X" * 32,
+                audit_context=_audit("trace-bootstrap-ineligible"),
             )
         )
     async with database() as session:

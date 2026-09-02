@@ -45,7 +45,11 @@ from lawyer_agent.domain.authorization import (
     ResourceState,
 )
 from lawyer_agent.domain.common import new_uuid7, require_uuid7
-from lawyer_agent.domain.identity import IdentityKind, normalize_identifier
+from lawyer_agent.domain.identity import (
+    IdentityKind,
+    VersionedBlindIndex,
+    normalize_identifier,
+)
 from lawyer_agent.domain.tenancy import (
     Membership,
     MembershipStatus,
@@ -54,6 +58,7 @@ from lawyer_agent.domain.tenancy import (
 
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
 _TOKEN_DOMAIN = b"lawyer-agent:tenant-invitation-token:v1\x00"
+_TARGET_FINGERPRINT_DOMAIN = b"lawyer-agent:invitation-target-fingerprint:v1\x00"
 _ROLE_HIERARCHY = {
     "tenant_owner": 100,
     "tenant_admin": 80,
@@ -91,6 +96,13 @@ class InvitationRoleDenied(Exception):
 
     def __init__(self) -> None:
         super().__init__("invitation roles are not allowed")
+
+
+class InvitationBlindIndexRetirementBlocked(Exception):
+    code = "invitation_blind_index_retirement_blocked"
+
+    def __init__(self) -> None:
+        super().__init__("invitation blind-index key retirement is blocked")
 
 
 class InvitationDeliveryError(RuntimeError):
@@ -163,6 +175,7 @@ class InvitationRecord:
     tenant_id: UUID
     target_kind: InvitationTargetKind
     target_blind_index: bytes = field(repr=False)
+    target_blind_index_key_version: int | None
     token_hash: bytes = field(repr=False)
     invited_by_membership_id: UUID
     expires_at: datetime
@@ -198,6 +211,29 @@ class InvitationTokenHasher:
         return hmac.digest(self._key, _TOKEN_DOMAIN + token.encode("ascii"), sha256)
 
 
+class InvitationTargetFingerprintHasher:
+    def __init__(self, *, hmac_key: bytes) -> None:
+        if len(hmac_key) != 32:
+            raise ValueError(
+                "invitation target fingerprint HMAC key must contain exactly 32 bytes"
+            )
+        self._key = hmac_key
+
+    def digest(self, kind: InvitationTargetKind, normalized_target: str) -> bytes:
+        if not isinstance(kind, InvitationTargetKind):
+            raise ValueError("invitation target kind must be strongly typed")
+        if not isinstance(normalized_target, str) or not normalized_target:
+            raise ValueError("normalized invitation target must be non-empty text")
+        return hmac.digest(
+            self._key,
+            _TARGET_FINGERPRINT_DOMAIN
+            + kind.value.encode("ascii")
+            + b"\x00"
+            + normalized_target.encode("utf-8"),
+            sha256,
+        )
+
+
 class InvitationRepositoryPort(Protocol):
     async def locate_by_token_hash(self, token_hash: bytes) -> InvitationLocator | None: ...
 
@@ -206,6 +242,10 @@ class InvitationRepositoryPort(Protocol):
     ) -> InvitationRecord | None: ...
 
     async def tenant_status_locked(self, *, tenant_id: UUID) -> str | None: ...
+
+    async def count_pending_unexpired_by_blind_index_versions(
+        self, *, key_versions: tuple[int, ...], now: datetime
+    ) -> int: ...
 
     async def add(self, invitation: InvitationRecord) -> None: ...
 
@@ -289,6 +329,7 @@ class InvitationService:
         idempotency: IdempotencyService,
         token_hasher: InvitationTokenHasher,
         blind_index: BlindIndexPort,
+        target_fingerprint_hasher: InvitationTargetFingerprintHasher,
         cipher: SensitiveValueCipherPort,
         delivery: InvitationDeliveryPort,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -298,10 +339,34 @@ class InvitationService:
         self._idempotency = idempotency
         self._token_hasher = token_hasher
         self._blind_index = blind_index
+        self._target_fingerprint_hasher = target_fingerprint_hasher
         self._cipher = cipher
         self._delivery = delivery
         self._clock = clock
         self._policy = policy or PolicyEngine()
+
+    async def assert_blind_index_versions_retirable(
+        self, key_versions: tuple[int, ...]
+    ) -> None:
+        if (
+            not key_versions
+            or key_versions != tuple(sorted(set(key_versions)))
+            or any(
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or not 1 <= version <= 32767
+                for version in key_versions
+            )
+        ):
+            raise ValueError("retiring blind-index versions must be unique and ordered")
+        now = self._now()
+        async with self._uow_factory() as uow:
+            count = await uow.invitations.count_pending_unexpired_by_blind_index_versions(
+                key_versions=key_versions,
+                now=now,
+            )
+        if count:
+            raise InvitationBlindIndexRetirementBlocked
 
     async def create(
         self, actor: TenantActor, command: CreateInvitationCommand
@@ -315,6 +380,10 @@ class InvitationService:
             raise ValueError("invitation expiry must be in the future")
         normalized = normalize_identifier(
             IdentityKind(command.target_kind.value), command.target
+        )
+        target_fingerprint = self._target_fingerprint_hasher.digest(
+            command.target_kind,
+            normalized.subject,
         )
         raw_token: str | None = None
         result: InvitationResult
@@ -360,18 +429,14 @@ class InvitationService:
                     body=IdempotencyFingerprintPayload(
                         values={
                             "target_kind": command.target_kind.value,
-                            "target_digest": _active_invite_digest(
-                                self._blind_index,
-                                command.target_kind,
-                                normalized.subject,
-                            ).hex(),
+                            "target_fingerprint": target_fingerprint.hex(),
                             "role_ids": [str(value) for value in command.role_ids],
                             "expires_at": command.expires_at.isoformat(),
                         },
                         business_paths=frozenset(
                             {
                                 ("target_kind",),
-                                ("target_digest",),
+                                ("target_fingerprint",),
                                 ("role_ids",),
                                 ("expires_at",),
                             }
@@ -393,15 +458,17 @@ class InvitationService:
                 return _invitation_result(replay, replayed=True)
 
             raw_token = secrets.token_urlsafe(32)
+            active_index = _active_invite_index(
+                self._blind_index,
+                command.target_kind,
+                normalized.subject,
+            )
             invitation = InvitationRecord(
                 id=new_uuid7(),
                 tenant_id=actor.context.tenant_id,
                 target_kind=command.target_kind,
-                target_blind_index=_active_invite_digest(
-                    self._blind_index,
-                    command.target_kind,
-                    normalized.subject,
-                ),
+                target_blind_index=active_index.digest,
+                target_blind_index_key_version=active_index.key_version,
                 token_hash=self._token_hasher.digest(raw_token),
                 invited_by_membership_id=actor.context.membership_id,
                 expires_at=command.expires_at,
@@ -614,11 +681,14 @@ class InvitationService:
                 )
             except (UnicodeError, ValueError):
                 continue
+            if invitation.target_blind_index_key_version is None:
+                continue
             for candidate in candidates:
-                matched = hmac.compare_digest(
-                    invitation.target_blind_index,
-                    candidate.digest,
-                ) or matched
+                if candidate.key_version == invitation.target_blind_index_key_version:
+                    matched = hmac.compare_digest(
+                        invitation.target_blind_index,
+                        candidate.digest,
+                    ) or matched
         return matched
 
     async def _require_tenant_snapshot(
@@ -700,24 +770,25 @@ def _validate_invitation_roles(
     ):
         raise InvitationRoleDenied
     actor_rank = max(_ROLE_HIERARCHY[role] for role in actor_roles)
-    if max(_ROLE_HIERARCHY[role] for role in invited_roles) > actor_rank:
+    invited_rank = max(_ROLE_HIERARCHY[role] for role in invited_roles)
+    if invited_rank > actor_rank or (
+        "tenant_owner" not in actor_roles and invited_rank >= actor_rank
+    ):
         raise InvitationRoleDenied
     if "tenant_admin" in actor_roles and "tenant_owner" in invited_roles:
         raise InvitationRoleDenied
     _member_type_for_roles(invited_roles)
 
 
-def _active_invite_digest(
+def _active_invite_index(
     blind_index: BlindIndexPort,
     kind: InvitationTargetKind,
     subject: str,
-) -> bytes:
+) -> VersionedBlindIndex:
     indexes = blind_index.digests(f"invite:{kind.value}", subject)
     try:
         return next(
-            item.digest
-            for item in indexes
-            if item.key_version == blind_index.active_key_version
+            item for item in indexes if item.key_version == blind_index.active_key_version
         )
     except StopIteration:
         raise RuntimeError("active invitation blind-index version is unavailable") from None

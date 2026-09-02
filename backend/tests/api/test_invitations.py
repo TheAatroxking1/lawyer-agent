@@ -12,6 +12,7 @@ from lawyer_agent.application.invitations import (
     CreateInvitationCommand,
     InvitationAcceptanceResult,
     InvitationResult,
+    InvitationTargetFingerprintHasher,
     InvitationTargetKind,
     InvitationTokenHasher,
 )
@@ -65,6 +66,18 @@ def test_invitation_token_hash_is_purpose_isolated_and_never_contains_raw_value(
     assert len(digest) == 32
     assert raw.encode() not in digest
     assert digest != InvitationTokenHasher(hmac_key=b"j" * 32).digest(raw)
+
+
+def test_invitation_target_fingerprint_is_stable_secret_and_target_sensitive() -> None:
+    hasher = InvitationTargetFingerprintHasher(hmac_key=b"f" * 32)
+
+    first = hasher.digest(InvitationTargetKind.EMAIL, "invitee@example.cn")
+
+    assert len(first) == 32
+    assert b"invitee@example.cn" not in first
+    assert first == hasher.digest(InvitationTargetKind.EMAIL, "invitee@example.cn")
+    assert first != hasher.digest(InvitationTargetKind.EMAIL, "other@example.cn")
+    assert first != hasher.digest(InvitationTargetKind.PHONE, "invitee@example.cn")
 
 
 @pytest.mark.asyncio

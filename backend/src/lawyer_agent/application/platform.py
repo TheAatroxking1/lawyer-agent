@@ -72,6 +72,16 @@ class BootstrapAuthenticationFailed(Exception):
         super().__init__("platform administrator bootstrap authentication failed")
 
 
+class BootstrapCommittedWithCleanupWarning(Exception):
+    code = "platform_admin_bootstrap_committed_cleanup_warning"
+    committed = True
+
+    def __init__(self) -> None:
+        super().__init__(
+            "platform administrator bootstrap committed but cleanup was not confirmed"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PlatformActor:
     principal: Principal
@@ -140,6 +150,7 @@ class PlatformAuthorizationSnapshot:
     session_expires_at: datetime
     permissions: frozenset[str]
     role_codes: frozenset[str]
+    catalog_valid: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +176,7 @@ class BootstrapResult:
 @dataclass(frozen=True, slots=True)
 class BootstrapState:
     user_is_active: bool
+    target_can_reauthenticate: bool
     super_admin_role_id: UUID | None
     has_current_super_admin: bool
     was_bootstrapped: bool
@@ -319,6 +331,10 @@ class PlatformReviewService:
     async def approve(
         self, actor: PlatformActor, command: ReviewTenantApplicationCommand
     ) -> PlatformReviewResult:
+        if not isinstance(actor, PlatformActor) or not isinstance(
+            command, ReviewTenantApplicationCommand
+        ):
+            raise ValueError("platform review inputs must be strongly typed")
         if command.decision is not ReviewDecision.APPROVE:
             raise ValueError("approve requires an approve command")
         return await self._review(actor, command)
@@ -326,6 +342,10 @@ class PlatformReviewService:
     async def reject(
         self, actor: PlatformActor, command: ReviewTenantApplicationCommand
     ) -> PlatformReviewResult:
+        if not isinstance(actor, PlatformActor) or not isinstance(
+            command, ReviewTenantApplicationCommand
+        ):
+            raise ValueError("platform review inputs must be strongly typed")
         if command.decision is not ReviewDecision.REJECT:
             raise ValueError("reject requires a reject command")
         return await self._review(actor, command)
@@ -446,6 +466,8 @@ class PlatformReviewService:
         )
         if snapshot is None:
             raise PlatformAuthorizationDenied("session_invalid")
+        if not snapshot.catalog_valid:
+            raise PlatformAuthorizationDenied("platform_catalog_invalid")
         principal = actor.principal
         now = self._now()
         if (
@@ -504,6 +526,7 @@ class PlatformBootstrapService:
             )
             if (
                 not state.user_is_active
+                or not state.target_can_reauthenticate
                 or state.super_admin_role_id is None
                 or state.has_current_super_admin
                 or state.was_bootstrapped
@@ -520,7 +543,7 @@ class PlatformBootstrapService:
             await uow.audit.append(
                 _audit_event(
                     command.audit_context,
-                    actor_user_id=command.user_id,
+                    actor_user_id=None,
                     tenant_id=None,
                     action="platform_admin.bootstrap",
                     reason_code="first_super_admin_created",
@@ -549,7 +572,7 @@ def _reviewable(application: PlatformApplicationProjection) -> bool:
 def _audit_event(
     context: AuditContext,
     *,
-    actor_user_id: UUID,
+    actor_user_id: UUID | None,
     tenant_id: UUID | None,
     action: str,
     reason_code: str,
