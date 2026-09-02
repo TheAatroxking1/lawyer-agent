@@ -349,6 +349,7 @@ class AuthorizationCacheInvalidationTask:
     attempt_count: int
     available_at: datetime
     processing_started_at: datetime | None = None
+    claim_token: UUID | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -373,6 +374,12 @@ class AuthorizationCacheInvalidationTask:
                 self.processing_started_at,
                 field_name="outbox processing_started_at",
             )
+        if self.status is AuthorizationCacheInvalidationStatus.PROCESSING:
+            if self.claim_token is None:
+                raise ValueError("processing outbox task requires a claim token")
+            require_uuid7(self.claim_token, field="outbox claim_token")
+        elif self.claim_token is not None:
+            raise ValueError("non-processing outbox task cannot have a claim token")
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,16 +415,25 @@ class AuthorizationCacheInvalidationOutboxPort(Protocol):
         limit: int,
     ) -> tuple[AuthorizationCacheInvalidationTask, ...]: ...
 
-    async def mark_completed(self, *, task_id: UUID, now: datetime) -> None: ...
+    async def mark_immediate_completed(self, *, task_id: UUID, now: datetime) -> bool: ...
+
+    async def mark_completed(
+        self,
+        *,
+        task_id: UUID,
+        claim_token: UUID,
+        now: datetime,
+    ) -> bool: ...
 
     async def release_failed(
         self,
         *,
         task_id: UUID,
+        claim_token: UUID,
         available_at: datetime,
         error_code: str,
         now: datetime,
-    ) -> None: ...
+    ) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1128,14 +1144,17 @@ class TenantService:
                     membership_id=membership_id,
                     authz_version=old_authz_version,
                 )
-            except Exception as exc:
-                raise PostCommitCacheInvalidationError(result) from exc
+            except Exception:
+                raise PostCommitCacheInvalidationError(result) from None
             assert cache_outbox_task_id is not None
-            async with self._uow_factory() as completion_uow:
-                await completion_uow.cache_outbox.mark_completed(
-                    task_id=cache_outbox_task_id,
-                    now=self._now(),
-                )
+            try:
+                async with self._uow_factory() as completion_uow:
+                    await completion_uow.cache_outbox.mark_immediate_completed(
+                        task_id=cache_outbox_task_id,
+                        now=self._now(),
+                    )
+            except Exception:
+                raise PostCommitCacheInvalidationError(result) from None
         return result
 
     async def _require_snapshot(
@@ -1362,6 +1381,9 @@ class AuthorizationCacheInvalidationDispatcher:
         completed = 0
         failed = 0
         for task in tasks:
+            claim_token = task.claim_token
+            if claim_token is None:
+                raise RuntimeError("claimed cache task is missing its fencing token")
             try:
                 await self._authorization_cache.invalidate(
                     tenant_id=task.tenant_id,
@@ -1369,24 +1391,28 @@ class AuthorizationCacheInvalidationDispatcher:
                     authz_version=task.authz_version,
                 )
             except Exception:
-                failed += 1
                 retry_at = now + timedelta(
                     seconds=min(300, 2 ** min(task.attempt_count, 8))
                 )
                 async with self._uow_factory() as failure_uow:
-                    await failure_uow.cache_outbox.release_failed(
+                    released = await failure_uow.cache_outbox.release_failed(
                         task_id=task.id,
+                        claim_token=claim_token,
                         available_at=retry_at,
                         error_code="cache_unavailable",
                         now=now,
                     )
+                if released:
+                    failed += 1
             else:
-                completed += 1
                 async with self._uow_factory() as completion_uow:
-                    await completion_uow.cache_outbox.mark_completed(
+                    marked = await completion_uow.cache_outbox.mark_completed(
                         task_id=task.id,
+                        claim_token=claim_token,
                         now=now,
                     )
+                if marked:
+                    completed += 1
         return AuthorizationCacheDispatchResult(len(tasks), completed, failed)
 
     def _now(self) -> datetime:

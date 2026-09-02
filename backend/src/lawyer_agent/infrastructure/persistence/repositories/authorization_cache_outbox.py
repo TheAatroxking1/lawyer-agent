@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.tenancy import (
@@ -11,7 +13,7 @@ from lawyer_agent.application.tenancy import (
     AuthorizationCacheInvalidationTask,
     NewAuthorizationCacheInvalidation,
 )
-from lawyer_agent.domain.common import require_uuid7
+from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.infrastructure.persistence.models import (
     AuthorizationCacheInvalidationOutboxModel,
 )
@@ -35,6 +37,7 @@ class AuthorizationCacheInvalidationOutboxRepository:
                 attempt_count=0,
                 available_at=_naive(task.available_at),
                 processing_started_at=None,
+                claim_token=None,
                 completed_at=None,
                 last_error_code=None,
             )
@@ -79,58 +82,101 @@ class AuthorizationCacheInvalidationOutboxRepository:
             )
         ).all()
         for row in rows:
+            claim_token = new_uuid7()
             row.status = AuthorizationCacheInvalidationStatus.PROCESSING.value
             row.attempt_count += 1
             row.processing_started_at = effective_now
+            row.claim_token = claim_token
             row.last_error_code = None
             row.version += 1
             row.updated_at = effective_now
         await self._session.flush()
         return tuple(_task(row) for row in rows)
 
-    async def mark_completed(self, *, task_id: UUID, now: datetime) -> None:
+    async def mark_immediate_completed(self, *, task_id: UUID, now: datetime) -> bool:
         require_uuid7(task_id, field="outbox task_id")
-        row = await self._session.scalar(
-            select(AuthorizationCacheInvalidationOutboxModel)
-            .where(AuthorizationCacheInvalidationOutboxModel.id == task_id)
-            .with_for_update()
-        )
-        if row is None:
-            raise RuntimeError("cache invalidation outbox task disappeared")
-        if row.status == AuthorizationCacheInvalidationStatus.COMPLETED.value:
-            return
         effective_now = _naive(now)
-        row.status = AuthorizationCacheInvalidationStatus.COMPLETED.value
-        row.completed_at = effective_now
-        row.processing_started_at = None
-        row.last_error_code = None
-        row.version += 1
-        row.updated_at = effective_now
+        result = await self._session.execute(
+            update(AuthorizationCacheInvalidationOutboxModel)
+            .where(
+                AuthorizationCacheInvalidationOutboxModel.id == task_id,
+                AuthorizationCacheInvalidationOutboxModel.status
+                == AuthorizationCacheInvalidationStatus.PENDING.value,
+            )
+            .values(
+                status=AuthorizationCacheInvalidationStatus.COMPLETED.value,
+                completed_at=effective_now,
+                processing_started_at=None,
+                claim_token=None,
+                last_error_code=None,
+                version=AuthorizationCacheInvalidationOutboxModel.version + 1,
+                updated_at=effective_now,
+            )
+        )
+        return cast(CursorResult[tuple[object]], result).rowcount == 1
+
+    async def mark_completed(
+        self,
+        *,
+        task_id: UUID,
+        claim_token: UUID,
+        now: datetime,
+    ) -> bool:
+        require_uuid7(task_id, field="outbox task_id")
+        require_uuid7(claim_token, field="outbox claim_token")
+        effective_now = _naive(now)
+        result = await self._session.execute(
+            update(AuthorizationCacheInvalidationOutboxModel)
+            .where(
+                AuthorizationCacheInvalidationOutboxModel.id == task_id,
+                AuthorizationCacheInvalidationOutboxModel.status
+                == AuthorizationCacheInvalidationStatus.PROCESSING.value,
+                AuthorizationCacheInvalidationOutboxModel.claim_token == claim_token,
+            )
+            .values(
+                status=AuthorizationCacheInvalidationStatus.COMPLETED.value,
+                completed_at=effective_now,
+                processing_started_at=None,
+                claim_token=None,
+                last_error_code=None,
+                version=AuthorizationCacheInvalidationOutboxModel.version + 1,
+                updated_at=effective_now,
+            )
+        )
+        return cast(CursorResult[tuple[object]], result).rowcount == 1
 
     async def release_failed(
         self,
         *,
         task_id: UUID,
+        claim_token: UUID,
         available_at: datetime,
         error_code: str,
         now: datetime,
-    ) -> None:
+    ) -> bool:
         require_uuid7(task_id, field="outbox task_id")
+        require_uuid7(claim_token, field="outbox claim_token")
         if error_code != "cache_unavailable":
             raise ValueError("cache invalidation outbox error code is invalid")
-        row = await self._session.scalar(
-            select(AuthorizationCacheInvalidationOutboxModel)
-            .where(AuthorizationCacheInvalidationOutboxModel.id == task_id)
-            .with_for_update()
+        result = await self._session.execute(
+            update(AuthorizationCacheInvalidationOutboxModel)
+            .where(
+                AuthorizationCacheInvalidationOutboxModel.id == task_id,
+                AuthorizationCacheInvalidationOutboxModel.status
+                == AuthorizationCacheInvalidationStatus.PROCESSING.value,
+                AuthorizationCacheInvalidationOutboxModel.claim_token == claim_token,
+            )
+            .values(
+                status=AuthorizationCacheInvalidationStatus.PENDING.value,
+                available_at=_naive(available_at),
+                processing_started_at=None,
+                claim_token=None,
+                last_error_code=error_code,
+                version=AuthorizationCacheInvalidationOutboxModel.version + 1,
+                updated_at=_naive(now),
+            )
         )
-        if row is None or row.status != AuthorizationCacheInvalidationStatus.PROCESSING.value:
-            raise RuntimeError("cache invalidation outbox task is not processing")
-        row.status = AuthorizationCacheInvalidationStatus.PENDING.value
-        row.available_at = _naive(available_at)
-        row.processing_started_at = None
-        row.last_error_code = error_code
-        row.version += 1
-        row.updated_at = _naive(now)
+        return cast(CursorResult[tuple[object]], result).rowcount == 1
 
 
 def _task(model: AuthorizationCacheInvalidationOutboxModel) -> AuthorizationCacheInvalidationTask:
@@ -144,6 +190,7 @@ def _task(model: AuthorizationCacheInvalidationOutboxModel) -> AuthorizationCach
         attempt_count=model.attempt_count,
         available_at=_aware(model.available_at),
         processing_started_at=_aware_optional(model.processing_started_at),
+        claim_token=model.claim_token,
     )
 
 

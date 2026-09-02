@@ -99,6 +99,12 @@ async def _inspect_schema(mysql_url: URL) -> dict[str, object]:
                     "cache_outbox_uniques": inspect(sync_connection).get_unique_constraints(
                         "authz_cache_invalidation_outbox"
                     ),
+                    "cache_outbox_columns": {
+                        column["name"]
+                        for column in inspect(sync_connection).get_columns(
+                            "authz_cache_invalidation_outbox"
+                        )
+                    },
                 }
             )
     finally:
@@ -146,6 +152,7 @@ def test_baseline_round_trip_and_tenant_constraints(mysql_url: URL) -> None:
         ("tenant_id", "membership_id", "authz_version"),
         ("tenant_id", "idempotency_record_id"),
     } <= _column_sets(schema["cache_outbox_uniques"])
+    assert "claim_token" in schema["cache_outbox_columns"]
     refresh_indexes = _column_sets(schema["refresh_indexes"])
     assert {("family_id",), ("replaced_by_id",), ("token_hash",)} <= refresh_indexes
 

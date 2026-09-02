@@ -59,5 +59,6 @@ class AuthorizationCacheInvalidationOutboxModel(VersionMixin, TimestampMixin, Ba
     attempt_count: Mapped[int] = mapped_column(nullable=False, server_default="0")
     available_at: Mapped[datetime] = mapped_column(UTC_DATETIME, nullable=False)
     processing_started_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+    claim_token: Mapped[UUID | None] = mapped_column(UuidBinary())
     completed_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
     last_error_code: Mapped[str | None] = mapped_column(String(64))

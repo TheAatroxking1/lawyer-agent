@@ -12,7 +12,9 @@ from lawyer_agent.application.sessions import (
     LockedRefreshToken,
     NewRefreshToken,
     NewSession,
+    RefreshLockLocator,
     SessionAuditEvent,
+    SessionLockLocator,
     SessionValidationState,
     TenantSessionState,
     UserSessionState,
@@ -41,12 +43,34 @@ class SessionRepository:
             return None
         return UserSessionState(user.id, user.status, user.auth_version)
 
-    async def peek_refresh_tenant(self, token_hash: bytes) -> UUID | None:
-        return await self._session.scalar(
-            select(RefreshTokenRecordModel.tenant_id).where(
-                RefreshTokenRecordModel.token_hash == token_hash
+    async def locate_refresh(self, token_hash: bytes) -> RefreshLockLocator | None:
+        row = (
+            await self._session.execute(
+                select(
+                    RefreshTokenRecordModel.id,
+                    RefreshTokenRecordModel.family_id,
+                    RefreshTokenRecordModel.session_id,
+                    RefreshTokenRecordModel.tenant_id,
+                ).where(RefreshTokenRecordModel.token_hash == token_hash)
             )
-        )
+        ).one_or_none()
+        if row is None:
+            return None
+        return RefreshLockLocator(row.id, row.family_id, row.session_id, row.tenant_id)
+
+    async def locate_session(self, session_id: UUID) -> SessionLockLocator | None:
+        row = (
+            await self._session.execute(
+                select(
+                    AuthSessionModel.id,
+                    AuthSessionModel.current_family_id,
+                    AuthSessionModel.tenant_id,
+                ).where(AuthSessionModel.id == session_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return SessionLockLocator(row.id, row.current_family_id, row.tenant_id)
 
     async def get_tenant_context(
         self,

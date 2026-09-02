@@ -37,6 +37,7 @@ def upgrade() -> None:
         sa.Column("attempt_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("available_at", _DATETIME, nullable=False),
         sa.Column("processing_started_at", _DATETIME, nullable=True),
+        sa.Column("claim_token", sa.BINARY(16), nullable=True),
         sa.Column("completed_at", _DATETIME, nullable=True),
         sa.Column("last_error_code", sa.String(64), nullable=True),
         sa.Column("version", sa.Integer(), server_default="1", nullable=False),

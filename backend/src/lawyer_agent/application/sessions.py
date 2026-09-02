@@ -14,9 +14,9 @@ from uuid import UUID
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.security_locks import (
     SecurityWriteLockRepositoryPort,
-    SessionSecurityWriteLockRequest,
+    SessionFamilyWriteLockRequest,
 )
-from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.domain.sessions import (
     AccessTokenClaims,
     Audience,
@@ -114,6 +114,37 @@ class LockedRefreshToken:
 
 
 @dataclass(frozen=True, slots=True)
+class RefreshLockLocator:
+    token_id: UUID
+    family_id: UUID
+    session_id: UUID
+    tenant_id: UUID | None
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.token_id, "refresh locator token_id"),
+            (self.family_id, "refresh locator family_id"),
+            (self.session_id, "refresh locator session_id"),
+        ):
+            require_uuid7(value, field=name)
+        if self.tenant_id is not None:
+            require_uuid7(self.tenant_id, field="refresh locator tenant_id")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLockLocator:
+    session_id: UUID
+    family_id: UUID
+    tenant_id: UUID | None
+
+    def __post_init__(self) -> None:
+        require_uuid7(self.session_id, field="session locator session_id")
+        require_uuid7(self.family_id, field="session locator family_id")
+        if self.tenant_id is not None:
+            require_uuid7(self.tenant_id, field="session locator tenant_id")
+
+
+@dataclass(frozen=True, slots=True)
 class NewSession:
     id: UUID
     user_id: UUID
@@ -189,7 +220,9 @@ class SwitchTenantCommand:
 
 
 class SessionRepositoryPort(Protocol):
-    async def peek_refresh_tenant(self, token_hash: bytes) -> UUID | None: ...
+    async def locate_refresh(self, token_hash: bytes) -> RefreshLockLocator | None: ...
+
+    async def locate_session(self, session_id: UUID) -> SessionLockLocator | None: ...
 
     async def get_user(self, user_id: UUID) -> UserSessionState | None: ...
 
@@ -376,16 +409,23 @@ class SessionService:
         invalid = False
         invalidated_session_id: UUID | None = None
         async with self._uow_factory() as uow:
-            refresh_tenant_id = await uow.sessions.peek_refresh_tenant(token_hash)
-            tenant_gate_available = (
-                refresh_tenant_id is None
-                or await uow.security_locks.acquire_tenant_gate(refresh_tenant_id)
-            )
+            locator = await uow.sessions.locate_refresh(token_hash)
             current = (
                 await uow.sessions.lock_refresh(token_hash)
-                if tenant_gate_available
+                if locator is not None
+                and await uow.security_locks.acquire_session_family(
+                    _session_family_lock(
+                        session_id=locator.session_id,
+                        family_id=locator.family_id,
+                        tenant_ids=_ordered_tenant_ids(locator.tenant_id),
+                    )
+                )
                 else None
             )
+            if current is not None:
+                assert locator is not None
+                if not _refresh_matches_locator(current, locator):
+                    current = None
             if current is None:
                 await uow.audit.append(
                     _audit_event(
@@ -559,12 +599,17 @@ class SessionService:
             raise InvalidRevocationReason
         now = self._now()
         async with self._uow_factory() as uow:
-            if not await uow.security_locks.acquire_session_revoke(
-                SessionSecurityWriteLockRequest(session_id)
+            locator = await uow.sessions.locate_session(session_id)
+            if locator is None or not await uow.security_locks.acquire_session_family(
+                _session_family_lock(
+                    session_id=locator.session_id,
+                    family_id=locator.family_id,
+                    tenant_ids=_ordered_tenant_ids(locator.tenant_id),
+                )
             ):
                 return
             state = await uow.sessions.get_validation_state(session_id)
-            if state is None:
+            if state is None or not _session_matches_locator(state, locator):
                 return
             await uow.sessions.revoke_family(state.current_family_id, reason=reason, now=now)
             await uow.sessions.revoke_session(session_id, reason=reason, now=now)
@@ -592,8 +637,21 @@ class SessionService:
     ) -> SessionResult:
         now = self._now()
         async with self._uow_factory() as uow:
+            locator = await uow.sessions.locate_session(command.session_id)
+            if locator is None or not await uow.security_locks.acquire_session_family(
+                _session_family_lock(
+                    session_id=locator.session_id,
+                    family_id=locator.family_id,
+                    tenant_ids=_ordered_tenant_ids(locator.tenant_id, command.tenant_id),
+                )
+            ):
+                raise InvalidSession
             current = await uow.sessions.lock_session(command.session_id)
-            if current is None or not _state_is_authoritative(current, None, now):
+            if (
+                current is None
+                or not _session_matches_locator(current, locator)
+                or not _state_is_authoritative(current, None, now)
+            ):
                 raise InvalidSession
             tenant = await uow.sessions.get_tenant_context(
                 user_id=current.user_id,
@@ -831,6 +889,46 @@ def _refresh_matches_state(
         and token.family_id == state.current_family_id
         and token.tenant_id == state.session_tenant_id
         and token.membership_id == state.session_membership_id
+    )
+
+
+def _refresh_matches_locator(
+    token: LockedRefreshToken,
+    locator: RefreshLockLocator,
+) -> bool:
+    return (
+        token.id == locator.token_id
+        and token.family_id == locator.family_id
+        and token.session_id == locator.session_id
+        and token.tenant_id == locator.tenant_id
+    )
+
+
+def _session_matches_locator(
+    state: SessionValidationState,
+    locator: SessionLockLocator,
+) -> bool:
+    return (
+        state.session_id == locator.session_id
+        and state.current_family_id == locator.family_id
+        and state.session_tenant_id == locator.tenant_id
+    )
+
+
+def _ordered_tenant_ids(*values: UUID | None) -> tuple[UUID, ...]:
+    return tuple(sorted({value for value in values if value is not None}, key=str))
+
+
+def _session_family_lock(
+    *,
+    session_id: UUID,
+    family_id: UUID,
+    tenant_ids: tuple[UUID, ...],
+) -> SessionFamilyWriteLockRequest:
+    return SessionFamilyWriteLockRequest(
+        session_id=session_id,
+        family_id=family_id,
+        tenant_ids=tenant_ids,
     )
 
 

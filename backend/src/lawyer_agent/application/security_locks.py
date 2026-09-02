@@ -32,11 +32,18 @@ class TenantSecurityWriteLockRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class SessionSecurityWriteLockRequest:
+class SessionFamilyWriteLockRequest:
     session_id: UUID
+    family_id: UUID
+    tenant_ids: tuple[UUID, ...] = ()
 
     def __post_init__(self) -> None:
         require_uuid7(self.session_id, field="session security lock session_id")
+        require_uuid7(self.family_id, field="session security lock family_id")
+        for tenant_id in self.tenant_ids:
+            require_uuid7(tenant_id, field="session security lock tenant_id")
+        if self.tenant_ids != tuple(sorted(set(self.tenant_ids), key=str)):
+            raise ValueError("session security lock tenants must be unique and ordered")
 
 
 class SecurityWriteLockRepositoryPort(Protocol):
@@ -44,6 +51,6 @@ class SecurityWriteLockRepositoryPort(Protocol):
 
     async def acquire_tenant_write(self, request: TenantSecurityWriteLockRequest) -> bool: ...
 
-    async def acquire_session_revoke(
-        self, request: SessionSecurityWriteLockRequest
+    async def acquire_session_family(
+        self, request: SessionFamilyWriteLockRequest
     ) -> bool: ...

@@ -28,7 +28,12 @@ from lawyer_agent.application.idempotency import (
     IdempotencyStatus,
 )
 from lawyer_agent.application.identity import AuditContext
-from lawyer_agent.application.sessions import SessionService, SwitchTenantCommand
+from lawyer_agent.application.sessions import (
+    InvalidRefreshToken,
+    RefreshReplayDetected,
+    SessionService,
+    SwitchTenantCommand,
+)
 from lawyer_agent.application.tenancy import (
     AuthorizationCacheInvalidationDispatcher,
     CreateTenantApplicationCommand,
@@ -261,6 +266,22 @@ class _PauseAfterRefreshLockRepository:
         return result
 
 
+class _PauseAfterFamilySecurityLockRepository:
+    def __init__(self, inner: object, locked: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._locked = locked
+        self._release = release
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def acquire_session_family(self, request: object) -> object:
+        result = await self._inner.acquire_session_family(request)  # type: ignore[attr-defined,no-any-return]
+        self._locked.set()
+        await self._release.wait()
+        return result
+
+
 class _PauseAfterRefreshLockUow:
     def __init__(
         self,
@@ -277,7 +298,9 @@ class _PauseAfterRefreshLockUow:
         self.sessions = _PauseAfterRefreshLockRepository(
             self._inner.sessions, self._locked, self._release
         )
-        self.security_locks = self._inner.security_locks
+        self.security_locks = _PauseAfterFamilySecurityLockRepository(
+            self._inner.security_locks, self._locked, self._release
+        )
         self.audit = self._inner.audit
         return self
 
@@ -288,6 +311,122 @@ class _PauseAfterRefreshLockUow:
         traceback: TracebackType | None,
     ) -> None:
         await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+class _TwoRefreshBarrier:
+    def __init__(self) -> None:
+        self._arrivals = 0
+        self._mutex = asyncio.Lock()
+        self._release = asyncio.Event()
+
+    async def arrive(self) -> None:
+        async with self._mutex:
+            self._arrivals += 1
+            if self._arrivals == 2:
+                self._release.set()
+        await self._release.wait()
+
+
+class _BarrierAfterTokenRepository:
+    def __init__(self, inner: object, barrier: _TwoRefreshBarrier) -> None:
+        self._inner = inner
+        self._barrier = barrier
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def lock_refresh(self, token_hash: bytes) -> object:
+        result = await self._inner.lock_refresh(token_hash)  # type: ignore[attr-defined,no-any-return]
+        await self._barrier.arrive()
+        return result
+
+
+class _BarrierBeforeFamilySecurityLockRepository:
+    def __init__(self, inner: object, barrier: _TwoRefreshBarrier) -> None:
+        self._inner = inner
+        self._barrier = barrier
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def acquire_session_family(self, request: object) -> object:
+        await self._barrier.arrive()
+        return await self._inner.acquire_session_family(request)  # type: ignore[attr-defined,no-any-return]
+
+
+class _TwoRefreshBarrierUow:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        barrier: _TwoRefreshBarrier,
+    ) -> None:
+        self._inner = SqlAlchemySessionUnitOfWork(factory)
+        self._barrier = barrier
+
+    async def __aenter__(self) -> Self:
+        await self._inner.__aenter__()
+        self.sessions = _BarrierAfterTokenRepository(self._inner.sessions, self._barrier)
+        self.security_locks = _BarrierBeforeFamilySecurityLockRepository(
+            self._inner.security_locks, self._barrier
+        )
+        self.audit = self._inner.audit
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+class _FailingCompletionOutbox:
+    def __init__(self, stage: str) -> None:
+        self._stage = stage
+
+    async def mark_immediate_completed(self, **kwargs: object) -> None:
+        del kwargs
+        if self._stage == "read":
+            raise RuntimeError("sensitive-completion-material")
+
+
+class _FailingCompletionUow:
+    def __init__(self, stage: str) -> None:
+        self._stage = stage
+
+    async def __aenter__(self) -> Self:
+        if self._stage == "enter":
+            raise RuntimeError("sensitive-completion-material")
+        self.cache_outbox = _FailingCompletionOutbox(self._stage)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        if self._stage == "commit":
+            raise RuntimeError("sensitive-completion-material")
+
+
+class _FailingCompletionUowFactory:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        stage: str,
+    ) -> None:
+        self._factory = factory
+        self._stage = stage
+        self._calls = 0
+
+    def __call__(self) -> object:
+        self._calls += 1
+        if self._calls == 1:
+            return SqlAlchemyTenantWorkflowUnitOfWork(self._factory)
+        return _FailingCompletionUow(self._stage)
 
 
 class _PauseBeforeSecurityLockRepository:
@@ -1363,6 +1502,70 @@ async def test_cache_invalidation_failure_is_explicit_after_committed_fact(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["enter", "read", "commit"])
+async def test_cache_completion_failure_is_stable_and_worker_recoverable(
+    database: async_sessionmaker[AsyncSession],
+    failure_stage: str,
+) -> None:
+    owner = await _add_active_user(database)
+    created = await _tenant_service(database).create_application(_create_command(owner))
+    _, target, _, _ = await _add_internal_member_with_session(
+        database,
+        tenant_id=created.tenant.id,
+    )
+    cache = _RecordingAuthorizationCache()
+    service = _tenant_service(
+        database,
+        uow_factory=_FailingCompletionUowFactory(database, failure_stage),  # type: ignore[arg-type]
+        cache=cache,
+    )
+
+    with pytest.raises(PostCommitCacheInvalidationError) as caught:
+        await service.revoke_member(
+            await _actor_with_session(database, created, owner),
+            RevokeMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key=f"cache-completion-{failure_stage}-01",
+                audit_context=_audit_context(),
+            ),
+        )
+    assert caught.value.committed is True
+    assert str(caught.value) == "authorization cache invalidation failed after commit"
+    assert caught.value.__cause__ is None
+
+    dispatched = await AuthorizationCacheInvalidationDispatcher(
+        uow_factory=lambda: SqlAlchemyTenantWorkflowUnitOfWork(database),
+        authorization_cache=cache,
+        clock=lambda: NOW + timedelta(minutes=1),
+    ).run_once(limit=10)
+    assert dispatched.completed == 1 and dispatched.failed == 0
+    assert cache.invalidations == [
+        (created.tenant.id, target, 1),
+        (created.tenant.id, target, 1),
+    ]
+    async with database() as session:
+        membership = await session.get(TenantMembershipModel, target)
+        outbox = await session.scalar(select(AuthorizationCacheInvalidationOutboxModel))
+        audit_count = await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.tenant_id == created.tenant.id,
+                AuditEventModel.action == "membership.revoke",
+            )
+        )
+        session_count = await session.scalar(
+            select(func.count()).select_from(AuthSessionModel).where(
+                AuthSessionModel.membership_id == target,
+                AuthSessionModel.version > 2,
+            )
+        )
+    assert membership is not None and membership.status == "revoked" and membership.version == 2
+    assert outbox is not None and outbox.status == "completed"
+    assert audit_count == 1
+    assert session_count == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["suspend", "revoke", "remove_owner"])
 async def test_durable_cache_outbox_recovers_self_mutation_without_actor_retry(
     database: async_sessionmaker[AsyncSession],
@@ -1509,6 +1712,115 @@ async def test_cache_outbox_recovers_expired_processing_claim_and_uses_skip_lock
         ).all()
         assert len(rows) == 2 and all(row.status == "completed" for row in rows)
         assert sorted(row.attempt_count for row in rows) == [1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("late_a_action", "current_b_action", "expected_status"),
+    [
+        ("fail", "complete", "completed"),
+        ("complete", "fail", "pending"),
+        ("fail", "fail", "pending"),
+    ],
+)
+async def test_cache_outbox_claim_fencing_rejects_late_worker_results(
+    database: async_sessionmaker[AsyncSession],
+    late_a_action: str,
+    current_b_action: str,
+    expected_status: str,
+) -> None:
+    owner = await _add_active_user(database)
+    cache = _RecordingAuthorizationCache(fail=True)
+    service = _tenant_service(database, cache=cache)
+    created = await service.create_application(_create_command(owner))
+    _, target, _, _ = await _add_internal_member_with_session(
+        database,
+        tenant_id=created.tenant.id,
+    )
+    with pytest.raises(PostCommitCacheInvalidationError):
+        await service.update_member(
+            await _actor_with_session(database, created, owner),
+            UpdateMemberCommand(
+                membership_id=target,  # type: ignore[arg-type]
+                expected_version=1,
+                idempotency_key=f"fencing-{late_a_action}-{current_b_action}-01",
+                audit_context=_audit_context(),
+                status=MembershipStatus.SUSPENDED,
+            ),
+        )
+
+    async with SqlAlchemyTenantWorkflowUnitOfWork(database) as uow_a:
+        claim_a = (
+            await uow_a.cache_outbox.claim_batch(
+                now=NOW + timedelta(minutes=1),
+                processing_expired_before=NOW,
+                limit=1,
+            )
+        )[0]
+    async with SqlAlchemyTenantWorkflowUnitOfWork(database) as uow_b:
+        claim_b = (
+            await uow_b.cache_outbox.claim_batch(
+                now=NOW + timedelta(minutes=10),
+                processing_expired_before=NOW + timedelta(minutes=5),
+                limit=1,
+            )
+        )[0]
+    assert claim_a.claim_token != claim_b.claim_token
+
+    async with SqlAlchemyTenantWorkflowUnitOfWork(database) as stale_uow:
+        if late_a_action == "complete":
+            stale_applied = await stale_uow.cache_outbox.mark_completed(
+                task_id=claim_a.id,
+                claim_token=claim_a.claim_token,
+                now=NOW + timedelta(minutes=11),
+            )
+        else:
+            stale_applied = await stale_uow.cache_outbox.release_failed(
+                task_id=claim_a.id,
+                claim_token=claim_a.claim_token,
+                available_at=NOW + timedelta(minutes=12),
+                error_code="cache_unavailable",
+                now=NOW + timedelta(minutes=11),
+            )
+    assert stale_applied is False
+
+    async with SqlAlchemyTenantWorkflowUnitOfWork(database) as current_uow:
+        if current_b_action == "complete":
+            current_applied = await current_uow.cache_outbox.mark_completed(
+                task_id=claim_b.id,
+                claim_token=claim_b.claim_token,
+                now=NOW + timedelta(minutes=11),
+            )
+        else:
+            current_applied = await current_uow.cache_outbox.release_failed(
+                task_id=claim_b.id,
+                claim_token=claim_b.claim_token,
+                available_at=NOW + timedelta(minutes=12),
+                error_code="cache_unavailable",
+                now=NOW + timedelta(minutes=11),
+            )
+    assert current_applied is True
+    async with database() as session:
+        row = await session.scalar(select(AuthorizationCacheInvalidationOutboxModel))
+        assert row is not None and row.status == expected_status
+
+    if expected_status == "pending":
+        async with SqlAlchemyTenantWorkflowUnitOfWork(database) as recovery_uow:
+            recovered = (
+                await recovery_uow.cache_outbox.claim_batch(
+                    now=NOW + timedelta(minutes=13),
+                    processing_expired_before=NOW + timedelta(minutes=12),
+                    limit=1,
+                )
+            )[0]
+            assert await recovery_uow.cache_outbox.mark_completed(
+                task_id=recovered.id,
+                claim_token=recovered.claim_token,
+                now=NOW + timedelta(minutes=13),
+            )
+        async with database() as session:
+            row = await session.scalar(select(AuthorizationCacheInvalidationOutboxModel))
+            assert row is not None and row.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -2012,7 +2324,11 @@ async def test_concurrent_owner_revocations_never_remove_the_last_active_owner(
         return_exceptions=True,
     )
 
+    assert not any(isinstance(value, OperationalError) for value in outcomes), outcomes
     assert sum(not isinstance(value, BaseException) for value in outcomes) == 1
+    failures = [value for value in outcomes if isinstance(value, BaseException)]
+    assert len(failures) == 1
+    assert isinstance(failures[0], (TenantAuthorizationDenied, MembershipMutationDenied))
     async with database() as session:
         active_owners = await session.scalar(
             select(func.count()).select_from(TenantMembershipModel).join(
@@ -2493,6 +2809,7 @@ async def test_refresh_and_explicit_revoke_use_refresh_then_session_lock_order(
         normalized = " ".join(statement.casefold().split())
         if (
             normalized.startswith("update refresh_token_records")
+            or ("from tenants" in normalized and "for update" in normalized)
             or (
                 "from refresh_token_records" in normalized
                 and "for update" in normalized
@@ -2510,7 +2827,7 @@ async def test_refresh_and_explicit_revoke_use_refresh_then_session_lock_order(
         revoke_task = asyncio.create_task(
             sessions.revoke(
                 tenant_session.session_id,
-                    reason=RevocationReason.ADMIN_REVOKED,
+                reason=RevocationReason.ADMIN_REVOKED,
                 audit_context=_audit_context(),
             )
         )
@@ -2538,3 +2855,273 @@ async def test_refresh_and_explicit_revoke_use_refresh_then_session_lock_order(
         ).all()
         assert auth_session is not None and auth_session.revoked_at is not None
         assert refresh_rows and all(row.revoked_at is not None for row in refresh_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_context", ["account", "tenant"])
+async def test_refresh_and_switch_tenant_share_complete_family_lock_order(
+    database: async_sessionmaker[AsyncSession],
+    source_context: str,
+) -> None:
+    owner = await _add_active_user(database)
+    created = await _tenant_service(database).create_application(_create_command(owner))
+    target_user, target_membership = await _add_member(
+        database, tenant_id=created.tenant.id, member_type="internal"
+    )
+    async with database.begin() as session:
+        await session.execute(
+            update(TenantModel)
+            .where(TenantModel.id == created.tenant.id)
+            .values(status="active", review_status="approved")
+        )
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-switch-lock-key",
+        signing_keys={"task7-switch-lock-key": private_key},
+        verification_keys={"task7-switch-lock-key": private_key.public_key()},
+    )
+    sessions = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"w" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    account = await sessions.start(
+        user_id=target_user,  # type: ignore[arg-type]
+        audit_context=_audit_context(),
+    )
+    source = account
+    if source_context == "tenant":
+        source = await sessions.switch_tenant(
+            SwitchTenantCommand(
+                account.session_id,
+                created.tenant.id,
+                target_membership,  # type: ignore[arg-type]
+            ),
+            audit_context=_audit_context(),
+        )
+
+    family_locked, release_family = asyncio.Event(), asyncio.Event()
+    paused_refresh = SessionService(
+        uow_factory=lambda: _PauseAfterRefreshLockUow(
+            database, family_locked, release_family
+        ),  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"w" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    competing_lock_started = asyncio.Event()
+    engine = database.kw["bind"]
+
+    def observe_switch_lock(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        normalized = " ".join(statement.casefold().split())
+        if (
+            "for update" in normalized
+            and ("from refresh_token_records" in normalized or "from tenants" in normalized)
+        ) or normalized.startswith("update refresh_token_records"):
+            competing_lock_started.set()
+
+    refresh_task = asyncio.create_task(
+        paused_refresh.refresh(source.refresh_token, audit_context=_audit_context())
+    )
+    await asyncio.wait_for(family_locked.wait(), timeout=5)
+    event.listen(engine.sync_engine, "before_cursor_execute", observe_switch_lock)
+    try:
+        switch_task = asyncio.create_task(
+            sessions.switch_tenant(
+                SwitchTenantCommand(
+                    source.session_id,
+                    created.tenant.id,
+                    target_membership,  # type: ignore[arg-type]
+                ),
+                audit_context=_audit_context(),
+            )
+        )
+        await asyncio.wait_for(competing_lock_started.wait(), timeout=5)
+        release_family.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(refresh_task, switch_task, return_exceptions=True),
+            timeout=10,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe_switch_lock)
+        release_family.set()
+    assert not any(isinstance(value, OperationalError) for value in outcomes), outcomes
+    assert not any(isinstance(value, BaseException) for value in outcomes), outcomes
+    async with database() as session:
+        old_session = await session.get(AuthSessionModel, source.session_id)
+        old_family = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.family_id == source.family_id
+                )
+            )
+        ).all()
+    assert old_session is not None and old_session.revoked_at is not None
+    assert old_family and all(row.revoked_at is not None for row in old_family)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_state", ["used", "expired"])
+async def test_used_or_expired_refresh_and_explicit_revoke_lock_whole_family(
+    database: async_sessionmaker[AsyncSession],
+    refresh_state: str,
+) -> None:
+    user = await _add_active_user(database)
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-replay-revoke-key",
+        signing_keys={"task7-replay-revoke-key": private_key},
+        verification_keys={"task7-replay-revoke-key": private_key.public_key()},
+    )
+    sessions = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"e" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    started = await sessions.start(user_id=user, audit_context=_audit_context())  # type: ignore[arg-type]
+    rotated = await sessions.refresh(started.refresh_token, audit_context=_audit_context())
+    raw_token = started.refresh_token
+    if refresh_state == "expired":
+        raw_token = rotated.refresh_token
+        async with database.begin() as session:
+            replacement = await session.scalar(
+                select(RefreshTokenRecordModel)
+                .where(RefreshTokenRecordModel.family_id == started.family_id)
+                .order_by(RefreshTokenRecordModel.id.desc())
+                .limit(1)
+            )
+            assert replacement is not None
+            replacement.idle_expires_at = (NOW - timedelta(seconds=1)).replace(tzinfo=None)
+
+    family_locked, release_family = asyncio.Event(), asyncio.Event()
+    paused_refresh = SessionService(
+        uow_factory=lambda: _PauseAfterRefreshLockUow(
+            database, family_locked, release_family
+        ),  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"e" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    revoke_lock_started = asyncio.Event()
+    engine = database.kw["bind"]
+
+    def observe_revoke_lock(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, context, executemany
+        normalized = " ".join(statement.casefold().split())
+        if "from refresh_token_records" in normalized and "for update" in normalized:
+            revoke_lock_started.set()
+
+    refresh_task = asyncio.create_task(
+        paused_refresh.refresh(raw_token, audit_context=_audit_context())
+    )
+    await asyncio.wait_for(family_locked.wait(), timeout=5)
+    event.listen(engine.sync_engine, "before_cursor_execute", observe_revoke_lock)
+    try:
+        revoke_task = asyncio.create_task(
+            sessions.revoke(
+                started.session_id,
+                reason=RevocationReason.ADMIN_REVOKED,
+                audit_context=_audit_context(),
+            )
+        )
+        await asyncio.wait_for(revoke_lock_started.wait(), timeout=5)
+        release_family.set()
+        refresh_outcome, revoke_outcome = await asyncio.wait_for(
+            asyncio.gather(refresh_task, revoke_task, return_exceptions=True),
+            timeout=10,
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", observe_revoke_lock)
+        release_family.set()
+    assert not isinstance(refresh_outcome, OperationalError), refresh_outcome
+    assert not isinstance(revoke_outcome, OperationalError), revoke_outcome
+    assert isinstance(refresh_outcome, (RefreshReplayDetected, InvalidRefreshToken))
+    assert not isinstance(revoke_outcome, BaseException), revoke_outcome
+    async with database() as session:
+        auth_session = await session.get(AuthSessionModel, started.session_id)
+        family = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.family_id == started.family_id
+                )
+            )
+        ).all()
+    assert auth_session is not None and auth_session.revoked_at is not None
+    assert family and all(row.revoked_at is not None for row in family)
+
+
+@pytest.mark.asyncio
+async def test_two_used_family_tokens_replay_without_deadlock_or_partial_revocation(
+    database: async_sessionmaker[AsyncSession],
+) -> None:
+    user = await _add_active_user(database)
+    private_key = Ed25519PrivateKey.generate()
+    tokens = TokenService(
+        issuer="https://identity.task7.test",
+        active_kid="task7-two-replay-key",
+        signing_keys={"task7-two-replay-key": private_key},
+        verification_keys={"task7-two-replay-key": private_key.public_key()},
+    )
+    base = SessionService(
+        uow_factory=lambda: SqlAlchemySessionUnitOfWork(database),
+        token_service=tokens,
+        refresh_hash_key=b"z" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+    started = await base.start(user_id=user, audit_context=_audit_context())  # type: ignore[arg-type]
+    first = await base.refresh(started.refresh_token, audit_context=_audit_context())
+    await base.refresh(first.refresh_token, audit_context=_audit_context())
+    barrier = _TwoRefreshBarrier()
+    concurrent = SessionService(
+        uow_factory=lambda: _TwoRefreshBarrierUow(database, barrier),  # type: ignore[arg-type]
+        token_service=tokens,
+        refresh_hash_key=b"z" * 32,
+        clock=lambda: NOW,
+        validation_cache=None,
+    )
+
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(
+            concurrent.refresh(started.refresh_token, audit_context=_audit_context()),
+            concurrent.refresh(first.refresh_token, audit_context=_audit_context()),
+            return_exceptions=True,
+        ),
+        timeout=10,
+    )
+    assert not any(isinstance(value, OperationalError) for value in outcomes), outcomes
+    assert all(isinstance(value, RefreshReplayDetected) for value in outcomes), outcomes
+    async with database() as session:
+        auth_session = await session.get(AuthSessionModel, started.session_id)
+        family = (
+            await session.scalars(
+                select(RefreshTokenRecordModel).where(
+                    RefreshTokenRecordModel.family_id == started.family_id
+                )
+            )
+        ).all()
+    assert auth_session is not None and auth_session.revoked_at is not None
+    assert family and all(row.revoked_at is not None for row in family)

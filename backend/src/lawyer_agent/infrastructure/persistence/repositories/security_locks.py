@@ -6,7 +6,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.security_locks import (
-    SessionSecurityWriteLockRequest,
+    SessionFamilyWriteLockRequest,
     TenantSecurityWriteLockRequest,
 )
 from lawyer_agent.domain.common import require_uuid7
@@ -116,20 +116,27 @@ class SecurityWriteLockRepository:
         )
         return True
 
-    async def acquire_session_revoke(
-        self, request: SessionSecurityWriteLockRequest
+    async def acquire_session_family(
+        self, request: SessionFamilyWriteLockRequest
     ) -> bool:
-        if not isinstance(request, SessionSecurityWriteLockRequest):
-            raise ValueError("session security lock request must be strongly typed")
-        await self._session.execute(
-            select(RefreshTokenRecordModel.id)
-            .where(RefreshTokenRecordModel.session_id == request.session_id)
-            .order_by(
-                RefreshTokenRecordModel.family_id,
-                RefreshTokenRecordModel.id,
+        if not isinstance(request, SessionFamilyWriteLockRequest):
+            raise ValueError("session family lock request must be strongly typed")
+        for tenant_id in request.tenant_ids:
+            if not await self.acquire_tenant_gate(tenant_id):
+                return False
+        refresh_ids = (
+            await self._session.scalars(
+                select(RefreshTokenRecordModel.id)
+                .where(
+                    RefreshTokenRecordModel.session_id == request.session_id,
+                    RefreshTokenRecordModel.family_id == request.family_id,
+                )
+                .order_by(RefreshTokenRecordModel.id)
+                .with_for_update()
             )
-            .with_for_update()
-        )
+        ).all()
+        if not refresh_ids:
+            return False
         session_id = await self._session.scalar(
             select(AuthSessionModel.id)
             .where(AuthSessionModel.id == request.session_id)
