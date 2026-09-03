@@ -121,6 +121,22 @@ scripts/
 
 ## 里程碑 A：Schema、状态机、Job 授权与 Permission Rollout
 
+里程碑 A 的每个 PowerShell `Run`/`Commit` 代码块先定义并使用以下检查函数；任何 Native Command 后都立即检查 `$LASTEXITCODE`，不得让后续命令覆盖失败码：
+
+```powershell
+function Assert-LastExitCode {
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+本里程碑新建或修改的每个 `backend/tests/integration/mysql/test_*.py` 文件都必须在 import 后声明下面的模块级双 Marker，禁止只给少数测试加 Marker：
+
+```python
+pytestmark = [pytest.mark.integration, pytest.mark.mysql]
+```
+
+任务依赖顺序为：纯领域 → Expand Schema → 结构化 Audit Contract/Repository → Job Repository/UoW → Job 授权 → Feature Lock Port → Manifest/Expand → Activation/Deactivation → 身份 Writer 锁接入 → 身份 Audit Writer 迁移 → A 总门禁。Audit 和 Feature Lock 都必须先于任何 Rollout Service 实现。
+
 ### Task 1: 纯 AI Job 领域状态、租约和安全上下文
 
 **Files:**
@@ -266,7 +282,7 @@ async def test_audit_message_cannot_reference_other_job(session: AsyncSession) -
         await session.commit()
 ```
 
-Migration 测试预置并逐行比对四类旧 Audit：Global User、Tenant Membership、Anonymous、`platform_admin.bootstrap` 与 `invitation.blind_index_legacy_reconcile`；升级后旧 Writer 仍能让所有真正新增列为 NULL，同时保留既有 Tenant/Actor 列。
+Migration 测试预置并逐行比对五类旧 Audit：Global User、Tenant Membership、Anonymous、`platform_admin.bootstrap` 与 `invitation.blind_index_legacy_reconcile`；升级后旧 Writer 仍能让所有真正新增列为 NULL，同时保留既有 Tenant/Actor 列。
 
 - [ ] **Step 2: 运行测试并确认失败**
 
@@ -329,7 +345,7 @@ git commit -m "feat: add durable ai job schema"
 @pytest.mark.mysql
 async def test_repository_never_loads_job_from_other_tenant(ai_job_uow_factory) -> None:
     async with ai_job_uow_factory() as uow:
-        assert await uow.jobs.get(TenantContext.for_test(TENANT_A), JOB_B) is None
+        assert await uow.jobs.get(tenant_context(TENANT_A), JOB_B) is None
 
 
 @pytest.mark.mysql
@@ -408,10 +424,17 @@ def test_custom_or_unknown_role_fails_closed() -> None:
         JobAuthorizationResolver().resolve(authority(role_codes=frozenset({"custom_partner"})), AIJobPermission.READ)
 
 
-async def test_logout_does_not_invalidate_grant_but_authz_bump_does(loader, policy) -> None:
-    logged_out = await loader.load(TENANT, JOB, for_update=False)
-    assert policy.authorize(logged_out.with_session_revoked(), NOW).allowed
-    assert not policy.authorize(logged_out.with_authz_version(logged_out.authz_version + 1), NOW).allowed
+async def test_logout_does_not_enter_worker_authority(loader, policy, session_repository_spy) -> None:
+    await revoke_browser_session_externally(SESSION)
+    authority = await loader.load(TENANT, JOB, for_update=False)
+    assert policy.authorize(authority, now=NOW).allowed
+    assert session_repository_spy.calls == []
+
+
+async def test_authz_version_bump_invalidates_durable_grant(loader, policy) -> None:
+    authority = await loader.load(TENANT, JOB, for_update=False)
+    changed = authority.with_current_authz_version(authority.authz_version + 1)
+    assert not policy.authorize(changed, now=NOW).allowed
 ```
 
 - [ ] **Step 2: 运行测试并确认失败**
@@ -438,14 +461,26 @@ JOB_SCOPE_BY_ROLE: Final[Mapping[str, JobAuthorizationScope]] = MappingProxyType
 class DurableGrantPolicy:
     def authorize(self, snapshot: JobAuthoritySnapshot, *, now: datetime) -> AuthorizationDecision:
         checks = (
+            snapshot.job.tenant_id == snapshot.grant.tenant_id,
+            snapshot.job.id == snapshot.grant.job_id,
+            snapshot.job.created_by_user_id == snapshot.grant.user_id,
+            snapshot.job.created_by_membership_id == snapshot.grant.membership_id,
             snapshot.job.expires_at > now,
             snapshot.grant.revoked_at is None,
             snapshot.user_active,
             snapshot.tenant_active,
             snapshot.membership_active_at(now),
+            snapshot.membership_user_id == snapshot.grant.user_id,
+            snapshot.membership_tenant_id == snapshot.grant.tenant_id,
             snapshot.grant.auth_version_at_submit == snapshot.auth_version,
             snapshot.grant.authz_version_at_submit == snapshot.authz_version,
+            snapshot.grant.permission_code == AIJobPermission.CREATE,
+            snapshot.grant.policy_version == JOB_POLICY_VERSION,
+            snapshot.grant.job_scope_manifest_version == JOB_SCOPE_MANIFEST_VERSION,
+            snapshot.grant.job_scope_code == snapshot.resolved_scope_code,
             AIJobPermission.CREATE.value in snapshot.permission_codes,
+            not snapshot.unknown_or_mixed_role_codes,
+            snapshot.resolved_scope == snapshot.granted_scope,
         )
         return decision_from_fixed_order(checks, snapshot)
 ```
@@ -464,6 +499,27 @@ Expected: Owner/Shared/Tenant-wide 与 Shared 不可 Cancel 全矩阵通过；�
 git add backend/src/lawyer_agent/application/ai_jobs.py backend/src/lawyer_agent/application/ai_job_runtime.py backend/src/lawyer_agent/infrastructure/persistence/repositories/ai_jobs.py backend/tests/unit/test_ai_job_authorization.py backend/tests/integration/mysql/test_ai_job_authorization.py
 git commit -m "feat: enforce durable ai job authorization"
 ```
+
+### Task 4A: 先交付结构化 Audit 与 Feature Lock Ports
+
+**Files:**
+- Create: `backend/src/lawyer_agent/application/audit.py`
+- Modify: `backend/src/lawyer_agent/application/security_locks.py`
+- Modify: `backend/src/lawyer_agent/application/tenancy.py`
+- Modify: `backend/src/lawyer_agent/infrastructure/persistence/repositories/audit.py`
+- Modify: `backend/src/lawyer_agent/infrastructure/persistence/repositories/security_locks.py`
+- Modify: `backend/src/lawyer_agent/infrastructure/persistence/tenancy_uow.py`
+- Create: `backend/tests/unit/test_structured_audit.py`
+- Create: `backend/tests/integration/mysql/test_feature_security_locks.py`
+
+**Interfaces:**
+- Consumes: Task 2 Audit Expand/Feature 表和现有 `TenantSecurityWriteLockRequest`。
+- Produces: `AuditActorKind`、`StructuredAuditEvent`、扩展 `AuditRepositoryPort`、`lock_global_feature_for_tenant_create()`、`lock_tenant_feature_shared(tenant_id)`。
+
+- [ ] **Step 1: 先写失败测试**：穷举规格 7.10 Actor Kind/Action 矩阵；证明 Global/Tenant Feature Lock 的 Share/Exclusive 冲突，且锁返回的 Snapshot 含 Applied Manifest/Generation/Version。
+- [ ] **Step 2: 运行并确认类型和方法不存在而失败**：`cd backend; uv run pytest tests/unit/test_structured_audit.py tests/integration/mysql/test_feature_security_locks.py -v; Assert-LastExitCode`
+- [ ] **Step 3: 最小实现**：Audit 构造时执行公共成组规则和精确 Action Allowlist；Repository 逐列写强类型关系，不把安全关系塞入 Metadata；Feature Lock Repository 只按固定 Global → Tenant Feature → Role → Membership → Session 顺序取得行锁，缺行/未知 Phase Fail Closed。
+- [ ] **Step 4: 验证并提交**：运行上述测试、`uv run ruff check .`、`uv run mypy src`，逐条 `Assert-LastExitCode`；随后 `git add` 本任务文件并提交 `feat: add structured audit and feature locks`。
 
 ### Task 5: Permission Feature Manifest、Activation 与 Deactivation
 
@@ -486,9 +542,9 @@ git commit -m "feat: enforce durable ai job authorization"
 @pytest.mark.mysql
 async def test_same_manifest_can_activate_deactivate_and_activate_again(service) -> None:
     assert await service.begin_activation(DRAIN_EVIDENCE) == 1
-    await service.finish_activation(1)
+    await service.finalize(direction=RolloutDirection.ACTIVATE, generation=1)
     assert await service.begin_deactivation() == 2
-    await service.finish_deactivation(2)
+    await service.finalize(direction=RolloutDirection.DEACTIVATE, generation=2)
     assert await service.begin_activation(DRAIN_EVIDENCE_2) == 3
 
 
@@ -533,12 +589,17 @@ Run: `cd backend; uv run pytest tests/integration/mysql/test_permission_feature_
 
 Expected: Expand 补齐、count/hash、同 Manifest 三代启停、崩溃同代恢复、旧 Fence 0 行、Custom/漂移 Role 阻断、新租户所有 Phase 精确集合和 Deactivation 最终模板收敛全部通过。
 
-Commit: `git commit -m "feat: add ai job permission rollout"`
+```powershell
+git add backend/src/lawyer_agent/application/permission_rollout.py backend/src/lawyer_agent/infrastructure/persistence/repositories/permission_rollout.py backend/src/lawyer_agent/infrastructure/persistence/permission_rollout_uow.py backend/src/lawyer_agent/infrastructure/persistence/seed_authz.py backend/src/lawyer_agent/infrastructure/persistence/repositories/tenant_workflows.py backend/tests/integration/mysql/test_permission_feature_rollout.py backend/tests/integration/mysql/test_permission_rollout_concurrency.py
+Assert-LastExitCode
+git commit -m "feat: add ai job permission rollout"
+Assert-LastExitCode
+```
 
-### Task 6: 身份 Writer 统一锁序与结构化 Audit Writer
+### Task 6: 身份 Writer 统一锁序与结构化 Audit Writer 迁移
 
 **Files:**
-- Create: `backend/src/lawyer_agent/application/audit.py`
+- Modify: `backend/src/lawyer_agent/application/audit.py`
 - Modify: `backend/src/lawyer_agent/application/security_locks.py`
 - Modify: `backend/src/lawyer_agent/application/identity.py`
 - Modify: `backend/src/lawyer_agent/application/tenancy.py`
@@ -556,7 +617,7 @@ Commit: `git commit -m "feat: add ai job permission rollout"`
 
 **Interfaces:**
 - Consumes: Task 5 Tenant Feature State 锁与 Applied Manifest；现有安全写事务。
-- Produces: `AuditActorKind`、`StructuredAuditEvent`、`AuditRepositoryPort`、扩展后的 `SecurityWriteLockRepositoryPort`。
+- Produces: 所有现有身份 Writer 到 Task 4A 强类型 Audit/Feature Lock Port 的迁移结果。
 
 - [ ] **Step 1: 写旧 Writer 并发、Kind Allowlist 和统一锁序测试**
 
@@ -568,8 +629,10 @@ async def test_membership_writer_waits_for_rollout_and_reloads_generation(concur
     pending = asyncio.create_task(invitation.accept(INVITATION_COMMAND))
     assert not pending.done()
     await rollout.commit_feature_generation(2)
-    membership = await pending
-    assert membership.role_manifest_generation == 2
+    await pending
+    state = await load_tenant_feature_state(TENANT)
+    assert state.applied_rollout_generation == 2
+    assert await load_ai_job_permissions_for_membership(TENANT, MEMBERSHIP) == EXPECTED_FEATURE_PERMISSIONS
 
 
 def test_global_maintenance_writer_cannot_claim_bootstrap_kind() -> None:
@@ -614,7 +677,12 @@ Run: `cd backend; uv run pytest tests/integration/mysql/test_permission_rollout_
 
 Expected: 普通 Writer 先/后 Rollout 两种调度结果均精确、无漏撤 Session；所有新 Writer Actor Kind 合法，旧 Writer/旧数据仍兼容；现有身份 API 回归通过。
 
-Commit: `git commit -m "feat: coordinate identity writers with ai job rollout"`
+```powershell
+git add backend/src/lawyer_agent/application/audit.py backend/src/lawyer_agent/application/security_locks.py backend/src/lawyer_agent/application/identity.py backend/src/lawyer_agent/application/tenancy.py backend/src/lawyer_agent/application/invitations.py backend/src/lawyer_agent/application/sessions.py backend/src/lawyer_agent/application/platform.py backend/src/lawyer_agent/infrastructure/persistence/repositories/audit.py backend/src/lawyer_agent/infrastructure/persistence/repositories/security_locks.py backend/src/lawyer_agent/infrastructure/persistence/repositories/tenant_workflows.py backend/src/lawyer_agent/infrastructure/persistence/tenancy_uow.py backend/src/lawyer_agent/infrastructure/persistence/invitations_uow.py backend/src/lawyer_agent/infrastructure/persistence/platform_uow.py backend/tests/integration/mysql/test_permission_rollout_concurrency.py backend/tests/integration/mysql/test_audit_expand_compatibility.py
+Assert-LastExitCode
+git commit -m "feat: coordinate identity writers with ai job rollout"
+Assert-LastExitCode
+```
 
 ### Task 7: 里程碑 A 总门禁与独立审查
 
