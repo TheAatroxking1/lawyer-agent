@@ -11,6 +11,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from lawyer_agent.application.audit import AuditActorKind, StructuredAuditEvent
 from lawyer_agent.application.idempotency import (
     IdempotencyFingerprintPayload,
     IdempotencyRepositoryPort,
@@ -22,7 +23,7 @@ from lawyer_agent.application.idempotency import (
 )
 from lawyer_agent.application.identity import AuditContext
 from lawyer_agent.application.security_locks import SecurityWriteLockRepositoryPort
-from lawyer_agent.application.tenancy import TenantAuditEvent, TenantAuditRepositoryPort
+from lawyer_agent.application.tenancy import TenantAuditRepositoryPort
 from lawyer_agent.domain.authorization import Principal, PrincipalAudience
 from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.domain.sessions import StepUpGrant
@@ -325,7 +326,7 @@ class PlatformReviewService:
         async with self._uow_factory() as uow:
             snapshot = await self._require_actor(uow, actor, for_update=False)
             self._require_permission(snapshot, permission)
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     audit_context,
                     actor_user_id=actor.principal.user_id,
@@ -357,7 +358,7 @@ class PlatformReviewService:
             snapshot = await self._require_actor(uow, actor, for_update=False)
             self._require_permission(snapshot, "tenant_application.read")
             applications = await uow.platform.list_applications(limit=limit)
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     audit_context,
                     actor_user_id=actor.principal.user_id,
@@ -475,7 +476,7 @@ class PlatformReviewService:
                 reason_code=command.reason_code,
                 now=now,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     command.audit_context,
                     actor_user_id=actor.principal.user_id,
@@ -595,7 +596,7 @@ class PlatformBootstrapService:
                 role_id=state.super_admin_role_id,
                 now=now,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     command.audit_context,
                     actor_user_id=None,
@@ -634,12 +635,17 @@ def _audit_event(
     target_type: str | None,
     target_id: UUID | None,
     now: datetime,
-) -> TenantAuditEvent:
-    return TenantAuditEvent(
+) -> StructuredAuditEvent:
+    kind = (
+        AuditActorKind.SYSTEM_IDENTITY_BOOTSTRAP
+        if action == "platform_admin.bootstrap"
+        else AuditActorKind.PLATFORM_OPERATOR
+    )
+    return StructuredAuditEvent(
         id=new_uuid7(),
+        actor_kind=kind,
         actor_user_id=actor_user_id,
         tenant_id=tenant_id,
-        actor_membership_id=None,
         action=action,
         result="success",
         reason_code=reason_code,

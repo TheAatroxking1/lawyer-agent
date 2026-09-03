@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from lawyer_agent.application.audit import AuditActorKind, StructuredAuditEvent
 from lawyer_agent.application.idempotency import (
     IdempotencyFingerprintPayload,
     IdempotencyRepositoryPort,
@@ -32,7 +33,6 @@ from lawyer_agent.application.security_locks import (
 )
 from lawyer_agent.application.tenancy import (
     TenantActor,
-    TenantAuditEvent,
     TenantAuditRepositoryPort,
     TenantAuthorizationSnapshot,
     TenantAuthorizationWorkflowRepositoryPort,
@@ -437,7 +437,7 @@ class InvitationService:
             raise ValueError("writers-drained acknowledgement cannot be in the future")
         async with self._uow_factory() as uow:
             revoked_count = await uow.invitations.revoke_unversioned_pending(now=now)
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     command.audit_context,
                     actor_user_id=None,
@@ -576,7 +576,7 @@ class InvitationService:
                 invitation_id=invitation.id,
                 role_ids=command.role_ids,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     command.audit_context,
                     actor_user_id=actor.principal.user_id,
@@ -726,7 +726,7 @@ class InvitationService:
                 now=now,
             )
             await uow.invitations.consume(invitation=invitation, now=now)
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     command.audit_context,
                     actor_user_id=command.actor_user_id,
@@ -926,9 +926,15 @@ def _audit_event(
     target_type: str | None,
     target_id: UUID | None,
     now: datetime,
-) -> TenantAuditEvent:
-    return TenantAuditEvent(
+) -> StructuredAuditEvent:
+    kind = (
+        AuditActorKind.SYSTEM_GLOBAL_MAINTENANCE
+        if action == "invitation.blind_index_legacy_reconcile"
+        else AuditActorKind.TENANT_USER
+    )
+    return StructuredAuditEvent(
         id=new_uuid7(),
+        actor_kind=kind,
         actor_user_id=actor_user_id,
         tenant_id=tenant_id,
         actor_membership_id=actor_membership_id,

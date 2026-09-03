@@ -14,7 +14,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
-from lawyer_agent.application.audit import StructuredAuditEvent
+from lawyer_agent.application.audit import AuditActorKind, StructuredAuditEvent
 from lawyer_agent.application.idempotency import (
     IdempotencyFingerprintPayload,
     IdempotencyMutationEffect,
@@ -709,7 +709,7 @@ class TenantService:
                 owner_role_id=owner_role_id,
                 now=now,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _tenant_audit_event(
                     command.audit_context,
                     actor_user_id=command.actor_user_id,
@@ -804,7 +804,7 @@ class TenantService:
                 if stored is None:
                     raise VersionConflict
                 updated = stored
-                await uow.audit.append(
+                await uow.audit.append_structured(
                     _tenant_audit_event(
                         command.audit_context,
                         actor_user_id=actor.principal.user_id,
@@ -1097,7 +1097,7 @@ class TenantService:
                     reason=revocation_reason,
                     now=now,
                 )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _tenant_audit_event(
                     audit_context,
                     actor_user_id=actor.principal.user_id,
@@ -1441,9 +1441,10 @@ def _tenant_audit_event(
     target_type: str | None,
     target_id: UUID | None,
     now: datetime,
-) -> TenantAuditEvent:
-    return TenantAuditEvent(
+) -> StructuredAuditEvent:
+    return StructuredAuditEvent(
         id=new_uuid7(),
+        actor_kind=AuditActorKind.TENANT_USER,
         actor_user_id=actor_user_id,
         tenant_id=tenant_id,
         actor_membership_id=actor_membership_id,

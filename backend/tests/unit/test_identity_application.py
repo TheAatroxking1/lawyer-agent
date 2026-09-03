@@ -9,6 +9,7 @@ from uuid import UUID
 import pytest
 
 import lawyer_agent.application.identity as identity_application
+from lawyer_agent.application.audit import StructuredAuditEvent
 from lawyer_agent.application.identity import (
     AuditContext,
     AuditEvent,
@@ -143,10 +144,15 @@ class FakeIdentityRepository:
 class FakeAuditRepository:
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
-        self.events: list[AuditEvent] = []
+        self.events: list[StructuredAuditEvent] = []
         self.failure: Exception | None = None
 
     async def append(self, event: AuditEvent) -> None:
+        self.calls.append(f"audit:{event.action}")
+        if self.failure is not None:
+            raise self.failure
+
+    async def append_structured(self, event: StructuredAuditEvent) -> None:
         self.calls.append(f"audit:{event.action}")
         if self.failure is not None:
             raise self.failure
@@ -338,7 +344,7 @@ async def test_register_uses_ports_in_transactional_order_with_real_audit_contex
     assert event.trace_id == "trace-123"
     assert event.client_ip_hash == b"i" * 32
     assert event.user_agent_hash == b"u" * 32
-    assert event.metadata is None
+    assert event.actor_kind.value == "global_user"
 
 
 @pytest.mark.asyncio

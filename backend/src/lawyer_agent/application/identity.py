@@ -10,6 +10,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from lawyer_agent.application.audit import AuditActorKind, StructuredAuditEvent
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.identity import (
     CiphertextAuthenticationError,
@@ -265,6 +266,8 @@ class IdentityRepositoryPort(Protocol):
 class AuditRepositoryPort(Protocol):
     async def append(self, event: AuditEvent) -> None: ...
 
+    async def append_structured(self, event: StructuredAuditEvent) -> None: ...
+
 
 class IdentityUnitOfWork(Protocol):
     identities: IdentityRepositoryPort
@@ -376,7 +379,7 @@ class IdentityService:
                 now,
             )
         )
-        await uow.audit.append(
+        await uow.audit.append_structured(
             _audit_event(
                 audit_context,
                 actor_user_id=user_id,
@@ -418,7 +421,7 @@ class IdentityService:
             if await uow.identities.has_unsupported_blind_index_versions(
                 self._blind_index.key_versions
             ):
-                await uow.audit.append(
+                await uow.audit.append_structured(
                     _audit_event(
                         audit_context,
                         actor_user_id=None,
@@ -515,7 +518,7 @@ class IdentityService:
                 parameters=self._password_hasher.parameters,
                 now=now,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     audit_context,
                     actor_user_id=record.user_id,
@@ -533,7 +536,7 @@ class IdentityService:
                 blind_index=_active_index(indexes, self._blind_index.active_key_version),
                 now=now,
             )
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     audit_context,
                     actor_user_id=record.user_id,
@@ -555,7 +558,7 @@ class IdentityService:
         reason_code: str,
     ) -> None:
         async with self._uow_factory() as uow:
-            await uow.audit.append(
+            await uow.audit.append_structured(
                 _audit_event(
                     audit_context,
                     actor_user_id=None,
@@ -576,7 +579,7 @@ class IdentityService:
         user_id: UUID | None,
         succeeded: bool,
     ) -> None:
-        await uow.audit.append(
+        await uow.audit.append_structured(
             _audit_event(
                 audit_context,
                 actor_user_id=user_id if succeeded else None,
@@ -652,9 +655,15 @@ def _audit_event(
     target_type: str | None,
     target_id: UUID | None,
     now: datetime,
-) -> AuditEvent:
-    return AuditEvent(
+) -> StructuredAuditEvent:
+    occurred_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    return StructuredAuditEvent(
         id=new_uuid7(),
+        actor_kind=(
+            AuditActorKind.ANONYMOUS
+            if actor_user_id is None
+            else AuditActorKind.GLOBAL_USER
+        ),
         actor_user_id=actor_user_id,
         action=action,
         result=result,
@@ -664,8 +673,7 @@ def _audit_event(
         trace_id=context.trace_id,
         client_ip_hash=context.client_ip_hash,
         user_agent_hash=context.user_agent_hash,
-        metadata=None,
-        occurred_at=now,
+        occurred_at=occurred_at,
     )
 
 

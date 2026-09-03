@@ -545,7 +545,7 @@ async def test_legacy_invitation_reconcile_rolls_back_when_audit_fails(
     async def fail_audit(*_: object, **__: object) -> None:
         raise RuntimeError("synthetic reconciliation audit failure")
 
-    monkeypatch.setattr(AuditRepository, "append", fail_audit)
+    monkeypatch.setattr(AuditRepository, "append_structured", fail_audit)
     service = _invitation_service(
         database, TestInvitationDeliveryAdapter(environment="test")
     )

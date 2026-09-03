@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64encode
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from math import isfinite
 from types import TracebackType
 from typing import Self
@@ -12,6 +12,7 @@ from sqlalchemy import and_, exists, not_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
+from lawyer_agent.application.audit import StructuredAuditEvent
 from lawyer_agent.application.identity import (
     AuditEvent,
     AuthenticationRecord,
@@ -203,6 +204,27 @@ class AuditRepository:
             )
         )
 
+    async def append_structured(self, event: StructuredAuditEvent) -> None:
+        self._session.add(
+            AuditEventModel(
+                id=event.id,
+                actor_user_id=event.actor_user_id,
+                tenant_id=event.tenant_id,
+                actor_membership_id=event.actor_membership_id,
+                actor_kind=event.actor_kind.value,
+                action=event.action,
+                result=event.result,
+                reason_code=event.reason_code,
+                target_type=event.target_type,
+                target_id=event.target_id,
+                trace_id=event.trace_id,
+                client_ip_hash=event.client_ip_hash,
+                user_agent_hash=event.user_agent_hash,
+                metadata_json=None,
+                occurred_at=_naive(event.occurred_at),
+            )
+        )
+
 
 class SqlAlchemyIdentityUnitOfWork:
     def __init__(
@@ -323,3 +345,9 @@ def _authentication_record(
         credential_status=credential.status,
         locked_until=credential.locked_until,
     )
+
+
+def _naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)

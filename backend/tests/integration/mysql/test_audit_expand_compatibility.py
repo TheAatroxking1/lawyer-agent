@@ -263,3 +263,42 @@ def test_outbox_message_id_is_unique_per_tenant(mysql_url) -> None:
     asyncio.run(
         _exercise_outbox_message_candidate_key(mysql_url.render_as_string(hide_password=False))
     )
+
+
+async def _exercise_structured_writer(mysql_url: str) -> None:
+    from sqlalchemy import select as sa_select
+
+    from lawyer_agent.application.audit import AuditActorKind, StructuredAuditEvent
+    from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
+
+    engine = create_async_engine(mysql_url)
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    event = StructuredAuditEvent(
+        id=new_uuid7(),
+        actor_kind=AuditActorKind.SYSTEM_IDENTITY_BOOTSTRAP,
+        action="platform_admin.bootstrap",
+        result="success",
+        reason_code="test",
+        trace_id="trace",
+        occurred_at=datetime.now(UTC),
+    )
+    try:
+        async with factory() as session:
+            await AuditRepository(session).append_structured(event)
+            await session.commit()
+        async with factory() as session:
+            row = await session.scalar(
+                sa_select(AuditEventModel).where(AuditEventModel.id == event.id)
+            )
+            assert row is not None
+            assert row.actor_kind == "system_identity_bootstrap"
+    finally:
+        await engine.dispose()
+
+
+def test_structured_writer_persists_non_null_actor_kind(mysql_url) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    asyncio.run(
+        _exercise_structured_writer(mysql_url.render_as_string(hide_password=False))
+    )

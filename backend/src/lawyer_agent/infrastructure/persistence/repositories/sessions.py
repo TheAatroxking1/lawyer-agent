@@ -328,12 +328,23 @@ class SessionAuditRepository:
         self._session = session
 
     async def append(self, event: SessionAuditEvent) -> None:
+        if (
+            event.tenant_id is not None
+            and event.actor_user_id is not None
+            and event.actor_membership_id is not None
+        ):
+            actor_kind = "tenant_user"
+        elif event.actor_user_id is not None:
+            actor_kind = "global_user"
+        else:
+            actor_kind = "anonymous"
         self._session.add(
             AuditEventModel(
                 id=event.id,
                 actor_user_id=event.actor_user_id,
                 tenant_id=event.tenant_id,
                 actor_membership_id=event.actor_membership_id,
+                actor_kind=actor_kind,
                 action=event.action,
                 result=event.result,
                 reason_code=event.reason_code,
