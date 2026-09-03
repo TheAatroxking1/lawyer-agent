@@ -4,12 +4,18 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.application.ai_jobs import (
+    JOB_SCOPE_BY_ROLE,
+    JobAuthoritySnapshot,
+    scope_from_code,
+)
 from lawyer_agent.domain.ai_jobs import (
     AIJob,
+    AIJobPermission,
     AIJobStatus,
     ClaimedExecution,
     ClaimJobRequest,
@@ -17,19 +23,34 @@ from lawyer_agent.domain.ai_jobs import (
     FencedFinalizeSuccess,
     FencedHeartbeat,
     JobAccess,
+    JobAuthorizationScope,
+    JobExecutionGrant,
+    JobScopeCode,
     JobVisibility,
     NewAIJobGraph,
     ReleaseState,
     RiskClass,
 )
 from lawyer_agent.domain.common import require_uuid7
-from lawyer_agent.domain.tenancy import TenantContext
+from lawyer_agent.domain.tenancy import (
+    Membership,
+    MembershipStatus,
+    MemberType,
+    TenantContext,
+)
 from lawyer_agent.infrastructure.persistence.models import (
     AIJobAccessGrantModel,
     AIJobAttemptModel,
     AIJobExecutionGrantModel,
     AIJobModel,
     AIJobOutboxModel,
+    MembershipRoleAssignmentModel,
+    PermissionModel,
+    TenantMembershipModel,
+    TenantModel,
+    TenantRoleModel,
+    TenantRolePermissionModel,
+    UserModel,
 )
 
 _CLAIMABLE_STATUSES = (AIJobStatus.QUEUED.value, AIJobStatus.RETRY_SCHEDULED.value)
@@ -347,6 +368,172 @@ def _access(model: AIJobAccessGrantModel) -> JobAccess:
         access_level=model.access_level,
         generation=model.generation,
         revoked_at=_aware_optional(model.revoked_at),
+    )
+
+
+def _grant(model: AIJobExecutionGrantModel) -> JobExecutionGrant:
+    return JobExecutionGrant(
+        id=model.id,
+        tenant_id=model.tenant_id,
+        job_id=model.job_id,
+        user_id=model.user_id,
+        membership_id=model.membership_id,
+        permission_code=AIJobPermission(model.permission_code),
+        auth_version_at_submit=model.auth_version_at_submit,
+        authz_version_at_submit=model.authz_version_at_submit,
+        policy_version=model.policy_version,
+        job_scope_manifest_version=model.job_scope_manifest_version,
+        job_scope_code=JobScopeCode(model.job_scope_code),
+        issued_at=_aware(model.issued_at),
+        revoked_at=_aware_optional(model.revoked_at),
+        revocation_reason_code=model.revocation_reason_code,
+        version=model.version,
+    )
+
+
+def _membership(model: TenantMembershipModel) -> Membership:
+    return Membership(
+        id=model.id,
+        tenant_id=model.tenant_id,
+        user_id=model.user_id,
+        department_id=model.department_id,
+        member_type=MemberType(model.member_type),
+        status=MembershipStatus(model.status),
+        valid_from=_aware(model.valid_from),
+        valid_until=_aware_optional(model.valid_until),
+        authz_version=model.authz_version,
+        version=model.version,
+    )
+
+
+class SqlAlchemyAIJobAuthorityLoader:
+    """Reloads the durable execution authority from MySQL without any browser session."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def load(
+        self,
+        tenant_id: UUID,
+        job_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> JobAuthoritySnapshot:
+        require_uuid7(tenant_id, field="authority tenant_id")
+        require_uuid7(job_id, field="authority job_id")
+        job_statement = select(AIJobModel).where(
+            AIJobModel.tenant_id == tenant_id,
+            AIJobModel.id == job_id,
+        )
+        if for_update:
+            job_statement = job_statement.with_for_update()
+        job_model = await self._session.scalar(job_statement)
+        if job_model is None:
+            raise JobAuthorityUnavailable("job_unavailable")
+        grant_statement = select(AIJobExecutionGrantModel).where(
+            AIJobExecutionGrantModel.tenant_id == tenant_id,
+            AIJobExecutionGrantModel.job_id == job_id,
+        )
+        if for_update:
+            grant_statement = grant_statement.with_for_update()
+        grant_model = await self._session.scalar(grant_statement)
+        if grant_model is None:
+            raise JobAuthorityUnavailable("grant_unavailable")
+
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == grant_model.user_id)
+        )
+        tenant = await self._session.scalar(
+            select(TenantModel).where(TenantModel.id == tenant_id)
+        )
+        membership_model = await self._session.scalar(
+            select(TenantMembershipModel).where(
+                TenantMembershipModel.tenant_id == tenant_id,
+                TenantMembershipModel.id == grant_model.membership_id,
+            )
+        )
+        if user is None or tenant is None or membership_model is None:
+            raise JobAuthorityUnavailable("authority_unavailable")
+
+        role_rows = (
+            await self._session.execute(
+                select(TenantRoleModel.code, PermissionModel.code)
+                .join(
+                    MembershipRoleAssignmentModel,
+                    and_(
+                        MembershipRoleAssignmentModel.tenant_id == TenantRoleModel.tenant_id,
+                        MembershipRoleAssignmentModel.tenant_role_id == TenantRoleModel.id,
+                    ),
+                )
+                .outerjoin(
+                    TenantRolePermissionModel,
+                    and_(
+                        TenantRolePermissionModel.tenant_id == TenantRoleModel.tenant_id,
+                        TenantRolePermissionModel.tenant_role_id == TenantRoleModel.id,
+                    ),
+                )
+                .outerjoin(
+                    PermissionModel,
+                    and_(
+                        PermissionModel.id == TenantRolePermissionModel.permission_id,
+                        PermissionModel.status == "active",
+                    ),
+                )
+                .where(
+                    TenantRoleModel.tenant_id == tenant_id,
+                    TenantRoleModel.status == "active",
+                    MembershipRoleAssignmentModel.membership_id == grant_model.membership_id,
+                )
+            )
+        ).all()
+        role_codes = frozenset(row[0] for row in role_rows)
+        permission_codes = frozenset(row[1] for row in role_rows if row[1] is not None)
+        resolved_scope, resolved_scope_code, unknown_or_mixed = _resolve_scope(role_codes)
+        return JobAuthoritySnapshot(
+            job=_job(job_model),
+            grant=_grant(grant_model),
+            user_active=user.status == "active",
+            tenant_active=tenant.status == "active",
+            membership=_membership(membership_model),
+            role_codes=role_codes,
+            permission_codes=permission_codes,
+            auth_version=user.auth_version,
+            authz_version=membership_model.authz_version,
+            resolved_scope=resolved_scope,
+            resolved_scope_code=resolved_scope_code,
+            granted_scope=scope_from_code(JobScopeCode(grant_model.job_scope_code)),
+            unknown_or_mixed_role_codes=unknown_or_mixed,
+        )
+
+
+class JobAuthorityUnavailable(Exception):
+    code = "job_authority_unavailable"
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__("job authority is unavailable")
+
+
+def _resolve_scope(
+    role_codes: frozenset[str],
+) -> tuple[JobAuthorizationScope, JobScopeCode, bool]:
+    known_scopes = [
+        JOB_SCOPE_BY_ROLE[role] for role in role_codes if role in JOB_SCOPE_BY_ROLE
+    ]
+    unknown_or_mixed = not role_codes or any(
+        role not in JOB_SCOPE_BY_ROLE for role in role_codes
+    )
+    if known_scopes:
+        resolved = JobAuthorizationScope(
+            owner=any(scope.owner for scope in known_scopes),
+            shared=any(scope.shared for scope in known_scopes),
+            tenant_wide=any(scope.tenant_wide for scope in known_scopes),
+        )
+        return resolved, resolved.scope_code(), unknown_or_mixed
+    return (
+        JobAuthorizationScope(False, False, False),
+        JobScopeCode.OWNER_SHARED,
+        unknown_or_mixed,
     )
 
 
