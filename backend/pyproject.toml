@@ -8,6 +8,7 @@ dependencies = [
   "SQLAlchemy[asyncio]>=2.0.52,<2.1",
   "alembic>=1.19.1,<2",
   "asyncmy>=0.2.11,<1",
+  "aio-pika>=10.0.1,<11",
   "redis>=8.1,<9",
   "argon2-cffi>=25.1,<26",
   "cryptography>=48,<50",
