@@ -1,3 +1,15 @@
+from lawyer_agent.infrastructure.persistence.models.ai_jobs import (
+    AIJobAccessGrantModel,
+    AIJobAttemptModel,
+    AIJobExecutionGrantModel,
+    AIJobInboxModel,
+    AIJobModel,
+    AIJobOutboxModel,
+    AIJobStepEffectModel,
+    MessageSecurityRejectionModel,
+    PermissionFeatureRolloutModel,
+    PermissionFeatureTenantStateModel,
+)
 from lawyer_agent.infrastructure.persistence.models.audit import (
     AuditEventModel,
     IdempotencyRecordModel,
@@ -35,6 +47,13 @@ from lawyer_agent.infrastructure.persistence.models.tenancy import (
 )
 
 __all__ = [
+    "AIJobAccessGrantModel",
+    "AIJobAttemptModel",
+    "AIJobExecutionGrantModel",
+    "AIJobInboxModel",
+    "AIJobModel",
+    "AIJobOutboxModel",
+    "AIJobStepEffectModel",
     "AuditEventModel",
     "AuthorizationCacheInvalidationOutboxModel",
     "AuthIdentityModel",
@@ -43,7 +62,10 @@ __all__ = [
     "IdempotencyRecordModel",
     "IdentityVerificationChallengeModel",
     "MembershipRoleAssignmentModel",
+    "MessageSecurityRejectionModel",
     "PasswordCredentialModel",
+    "PermissionFeatureRolloutModel",
+    "PermissionFeatureTenantStateModel",
     "PermissionModel",
     "PlatformRoleAssignmentModel",
     "PlatformRoleModel",

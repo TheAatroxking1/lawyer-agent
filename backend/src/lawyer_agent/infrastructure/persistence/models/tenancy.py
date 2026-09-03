@@ -86,6 +86,9 @@ class TenantMembershipModel(VersionMixin, TimestampMixin, Base):
         UniqueConstraint(
             "tenant_id", "user_id", "id", name="uq_tenant_memberships_tenant_id_user_id"
         ),
+        UniqueConstraint(
+            "tenant_id", "id", "user_id", name="uq_tenant_memberships_tenant_id_id_user"
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "department_id"], ["departments.tenant_id", "departments.id"]
         ),

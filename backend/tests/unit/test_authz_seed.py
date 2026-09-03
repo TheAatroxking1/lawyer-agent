@@ -25,6 +25,9 @@ def test_permission_catalog_is_stable_and_complete() -> None:
         "tenant_application.read",
         "tenant_application.review",
         "platform_admin.bootstrap",
+        "ai_job.create",
+        "ai_job.read",
+        "ai_job.cancel",
     )
     assert len({permission.code for permission in PERMISSIONS}) == len(PERMISSIONS)
 

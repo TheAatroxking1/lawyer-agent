@@ -50,6 +50,9 @@ PERMISSIONS = (
     PermissionSeed("tenant_application.read", "tenant_application", "read", "high"),
     PermissionSeed("tenant_application.review", "tenant_application", "review", "critical"),
     PermissionSeed("platform_admin.bootstrap", "platform_admin", "bootstrap", "critical"),
+    PermissionSeed("ai_job.create", "ai_job", "create", "medium"),
+    PermissionSeed("ai_job.read", "ai_job", "read", "medium"),
+    PermissionSeed("ai_job.cancel", "ai_job", "cancel", "high"),
 )
 
 TENANT_ROLE_TEMPLATES = (
@@ -187,6 +190,9 @@ _PERMISSION_IDS = {
     "tenant_application.read": UUID("01a05a43-fc0b-7e93-accf-c44aaa047bbc"),
     "tenant_application.review": UUID("01a05a43-fc0c-7a7e-8984-a2d33422d48c"),
     "platform_admin.bootstrap": UUID("01a05a43-fc0d-7e1d-80bb-a8fc52c8d9ef"),
+    "ai_job.create": UUID("01a05a44-fc00-7000-8000-0000000000c1"),
+    "ai_job.read": UUID("01a05a44-fc01-7000-8000-0000000000c2"),
+    "ai_job.cancel": UUID("01a05a44-fc02-7000-8000-0000000000c3"),
 }
 
 _TENANT_ROLE_TEMPLATE_IDS = {

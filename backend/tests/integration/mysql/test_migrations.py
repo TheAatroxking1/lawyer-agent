@@ -405,6 +405,21 @@ async def _delete_legacy_invitation_graph(
                     "membership_id": row.invited_by_membership_id,
                 },
             )
+            feature_table_exists = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() "
+                    "AND table_name = 'permission_feature_tenant_states'"
+                )
+            )
+            if feature_table_exists:
+                await connection.execute(
+                    text(
+                        "DELETE FROM permission_feature_tenant_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": row.tenant_id},
+                )
             await connection.execute(
                 text("DELETE FROM tenants WHERE id = :tenant_id"),
                 {"tenant_id": row.tenant_id},

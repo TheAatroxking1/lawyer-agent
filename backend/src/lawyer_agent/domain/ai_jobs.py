@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from typing import Final, Protocol
 from uuid import UUID
 
@@ -23,6 +24,25 @@ JOB_POLICY_VERSION: Final[str] = "ai-job-policy-v1"
 JOB_SCOPE_MANIFEST_VERSION: Final[str] = "ai-job-scope-v1"
 SYNTHETIC_HANDLER_KIND: Final[str] = "synthetic.v1"
 SYNTHETIC_INPUT_SCHEMA_VERSION: Final[str] = "synthetic-input-v1"
+
+AI_JOB_FEATURE_CODE: Final[str] = "ai_job_runtime_v1"
+AI_JOB_BASE_MANIFEST_VERSION: Final[str] = "ai-job-base-v1"
+AI_JOB_FEATURE_MANIFEST_VERSION: Final[str] = "ai-job-feature-v1"
+AI_JOB_PERMISSION_CODES: Final[tuple[str, ...]] = (
+    "ai_job.create",
+    "ai_job.read",
+    "ai_job.cancel",
+)
+
+
+def ai_job_manifest_digest(version: str, permission_codes: tuple[str, ...]) -> bytes:
+    """Deterministic SHA-256 digest of a permission feature manifest."""
+    if not isinstance(version, str) or not version:
+        raise ValueError("manifest version must be a non-empty string")
+    if not isinstance(permission_codes, tuple):
+        raise ValueError("manifest permission codes must be a tuple")
+    canonical = "|".join((version, *sorted(permission_codes)))
+    return sha256(f"ai-job-manifest:v1:{canonical}".encode()).digest()
 
 
 class AIJobStatus(StrEnum):

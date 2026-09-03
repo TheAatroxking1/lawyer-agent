@@ -32,6 +32,13 @@ class AuthSessionModel(VersionMixin, TimestampMixin, Base):
         ),
         UniqueConstraint("tenant_id", "id"),
         UniqueConstraint("user_id", "id"),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            "user_id",
+            "membership_id",
+            name="uq_auth_sessions_tenant_id_id_user_membership",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "membership_id"],
             ["tenant_memberships.tenant_id", "tenant_memberships.id"],

@@ -406,6 +406,7 @@ def test_legacy_v7_identity_upgrades_with_trigger_compatibility_and_authenticate
             and "32767" in str(check["sqltext"])
             for check in state["checks"]
         )
+        command.upgrade(config, "head")
         asyncio.run(
             _exercise_authentication_and_conflict(mysql_url, username, legacy_user_id)
         )
@@ -452,6 +453,7 @@ def test_legacy_v7_identity_upgrades_with_trigger_compatibility_and_authenticate
             legacy_user_id.bytes: 7,
             old_binary_user_id.bytes: 7,
         }
+        command.upgrade(config, "head")
         asyncio.run(
             _exercise_authentication_and_conflict(mysql_url, username, legacy_user_id)
         )
