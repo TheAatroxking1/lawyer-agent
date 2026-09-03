@@ -6,12 +6,16 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.security_locks import (
+    PermissionFeatureSnapshot,
     SessionFamilyWriteLockRequest,
+    TenantFeatureSnapshot,
     TenantSecurityWriteLockRequest,
 )
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.infrastructure.persistence.models import (
     AuthSessionModel,
+    PermissionFeatureRolloutModel,
+    PermissionFeatureTenantStateModel,
     RefreshTokenRecordModel,
     TenantMembershipModel,
     TenantModel,
@@ -141,3 +145,43 @@ class SecurityWriteLockRepository:
             .with_for_update()
         )
         return session_id is not None
+
+    async def lock_global_feature_for_tenant_create(self) -> PermissionFeatureSnapshot:
+        model = await self._session.scalar(
+            select(PermissionFeatureRolloutModel)
+            .where(PermissionFeatureRolloutModel.feature_code == "ai_job_runtime_v1")
+            .with_for_update(read=True)
+        )
+        if model is None:
+            raise ValueError("global permission feature row is missing")
+        return PermissionFeatureSnapshot(
+            feature_code=model.feature_code,
+            phase=model.phase,
+            manifest_version=model.manifest_version,
+            manifest_digest=bytes(model.manifest_digest),
+            rollout_generation=model.rollout_generation,
+            version=model.version,
+        )
+
+    async def lock_tenant_feature_shared(self, tenant_id: UUID) -> TenantFeatureSnapshot:
+        require_uuid7(tenant_id, field="tenant feature lock tenant_id")
+        model = await self._session.scalar(
+            select(PermissionFeatureTenantStateModel)
+            .where(
+                PermissionFeatureTenantStateModel.feature_code == "ai_job_runtime_v1",
+                PermissionFeatureTenantStateModel.tenant_id == tenant_id,
+            )
+            .with_for_update(read=True)
+        )
+        if model is None:
+            raise ValueError("tenant permission feature state is missing")
+        return TenantFeatureSnapshot(
+            tenant_id=model.tenant_id,
+            feature_code=model.feature_code,
+            phase=model.phase,
+            applied_manifest_version=model.applied_manifest_version,
+            applied_rollout_generation=model.applied_rollout_generation,
+            target_manifest_version=model.target_manifest_version,
+            target_rollout_generation=model.target_rollout_generation,
+            version=model.version,
+        )

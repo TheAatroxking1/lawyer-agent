@@ -14,6 +14,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from lawyer_agent.application.audit import StructuredAuditEvent
 from lawyer_agent.application.idempotency import (
     IdempotencyFingerprintPayload,
     IdempotencyMutationEffect,
@@ -583,6 +584,8 @@ class TenantSessionRevocationRepositoryPort(Protocol):
 
 class TenantAuditRepositoryPort(Protocol):
     async def append(self, event: TenantAuditEvent) -> None: ...
+
+    async def append_structured(self, event: StructuredAuditEvent) -> None: ...
 
 
 class TenantWorkflowUnitOfWork(Protocol):
