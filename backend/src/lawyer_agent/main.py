@@ -39,6 +39,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with service_factory(active_settings) as services:
             app.state.services = services
+            app.state.readiness = services.readiness
             yield
 
     app = FastAPI(

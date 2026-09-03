@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -12,6 +13,11 @@ from lawyer_agent.infrastructure.persistence import models as persistence_models
 from lawyer_agent.infrastructure.persistence.base import Base
 
 config = context.config
+deployment_url = os.getenv("LAWYER_DATABASE_URL")
+if deployment_url:
+    config.set_main_option("sqlalchemy.url", deployment_url.replace("%", "%%"))
+elif not config.get_main_option("sqlalchemy.url").strip():
+    raise RuntimeError("an explicit migration database URL is required")
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 

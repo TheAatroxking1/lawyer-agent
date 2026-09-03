@@ -45,6 +45,8 @@ class RedisDependencyInvalidResponse(RedisDependencyError):
 
 
 class RedisPort(Protocol):
+    async def ping(self) -> None: ...
+
     async def eval(
         self,
         script: str,
@@ -69,6 +71,8 @@ class RedisPort(Protocol):
 
 
 class _RedisSdkPort(Protocol):
+    async def ping(self) -> object: ...
+
     async def eval(
         self,
         script: str,
@@ -155,6 +159,17 @@ class RedisAsyncioAdapter:
         if translated_error is not None:
             raise translated_error
         return result
+
+    async def ping(self) -> None:
+        translated_error: RedisDependencyError | None = None
+        try:
+            result = await self._client.ping()
+        except RedisError as exc:
+            translated_error = _translate_sdk_error(exc)
+        if translated_error is not None:
+            raise translated_error
+        if result is not True:
+            raise RedisDependencyInvalidResponse
 
     async def get(self, key: str) -> bytes | None:
         translated_error: RedisDependencyError | None = None

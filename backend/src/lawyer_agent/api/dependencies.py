@@ -12,8 +12,10 @@ from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import Depends, Header, Request
+from sqlalchemy import text
 
 from lawyer_agent.api.errors import ApiProblem
+from lawyer_agent.api.router import ConcurrentReadinessProbe
 from lawyer_agent.application.accounts import (
     AccountQueryPort,
     AccountQueryService,
@@ -92,6 +94,7 @@ class ApplicationServices:
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
+    readiness: ConcurrentReadinessProbe | None = None
 
 
 def _derived_key(domain: bytes, key: bytes) -> bytes:
@@ -142,6 +145,15 @@ async def application_services(
     if delivery is None and settings.environment == "test":
         delivery = TestInvitationDeliveryAdapter(environment="test")
     delivery_capability = InvitationDeliveryCapability(delivery)
+
+    async def mysql_readiness() -> None:
+        async with engine.connect() as connection:
+            if await connection.scalar(text("SELECT 1")) != 1:
+                raise RuntimeError("database readiness check failed")
+
+    async def redis_readiness() -> None:
+        await redis.ping()
+
     identity = IdentityService(
         uow_factory=lambda: cast(
             IdentityUnitOfWork,
@@ -207,6 +219,10 @@ async def application_services(
             )
         ),
         invitation_delivery=delivery_capability,
+        readiness=ConcurrentReadinessProbe(
+            checks=(mysql_readiness, redis_readiness),
+            timeout_seconds=2.0,
+        ),
     )
     try:
         yield active

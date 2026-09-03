@@ -1,4 +1,5 @@
 from base64 import b64encode
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -17,6 +18,79 @@ from lawyer_agent.infrastructure.redis.client import SecurityRedisTopology
 
 def encoded_key(byte: int) -> str:
     return b64encode(bytes([byte]) * 32).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("file_field", "active_fields"),
+    [
+        (
+            "data_encryption_key_ring_file",
+            {"data_encryption_active_key_version": 7},
+        ),
+        (
+            "blind_index_key_ring_file",
+            {"blind_index_active_key_version": 7},
+        ),
+        ("jwt_ed25519_key_ring_file", {"jwt_active_kid": "active"}),
+    ],
+)
+def test_json_secret_ring_files_reject_duplicate_raw_keys(
+    tmp_path: Path,
+    file_field: str,
+    active_fields: dict[str, object],
+) -> None:
+    path = tmp_path / f"{file_field}.json"
+    raw_key = "active" if file_field.startswith("jwt_") else "7"
+    path.write_text(
+        '{"'
+        + raw_key
+        + '":"'
+        + encoded_key(21)
+        + '","'
+        + raw_key
+        + '":"'
+        + encoded_key(22)
+        + '"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="duplicate"):
+        Settings(
+            environment="test",
+            **{file_field: path, **active_fields},
+        )
+
+
+def test_secret_file_loader_uses_bounded_stream_instead_of_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_path = tmp_path / "app-secret"
+    secret_path.write_text("s" * 32, encoding="utf-8")
+
+    def reject_unbounded_read(_path: Path) -> bytes:
+        raise AssertionError("Path.read_bytes performs an unbounded read")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_unbounded_read)
+
+    settings = Settings(environment="test", secret_key_file=secret_path)
+
+    assert settings.secret_key == "s" * 32
+
+
+def test_secret_file_loader_rejects_non_regular_files(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="regular file"):
+        Settings(environment="test", secret_key_file=tmp_path)
+
+
+def test_secret_file_loader_rejects_content_over_the_bounded_limit(
+    tmp_path: Path,
+) -> None:
+    secret_path = tmp_path / "oversized-secret"
+    secret_path.write_bytes(b"s" * 65_537)
+
+    with pytest.raises(ValidationError, match="invalid size"):
+        Settings(environment="test", secret_key_file=secret_path)
 
 
 def deployment_values(environment: str = "production") -> dict[str, object]:

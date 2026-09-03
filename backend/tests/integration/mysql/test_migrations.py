@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import shutil
+import subprocess
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -162,6 +166,51 @@ def test_baseline_round_trip_and_tenant_constraints(mysql_url: URL) -> None:
     command.upgrade(config, "head")
     assert REQUIRED_TABLES <= asyncio.run(_inspect_table_names(mysql_url))
     command.check(config)
+
+
+def test_explicit_migration_script_upgrades_strict_random_database(
+    mysql_url: URL,
+    tmp_path: Path,
+) -> None:
+    database_name = mysql_url.database or ""
+    assert re.fullmatch(r"lawyer_test_[a-f0-9]{32}", database_name)
+    command.downgrade(_alembic_config(mysql_url), "base")
+
+    environment_file = tmp_path / "migration.env"
+    rendered_url = mysql_url.render_as_string(hide_password=False)
+    environment_file.write_text(
+        f"LAWYER_DATABASE_URL={rendered_url}\n",
+        encoding="utf-8",
+    )
+    executable = shutil.which("pwsh") or shutil.which("powershell.exe")
+    if executable is None:
+        pytest.skip("PowerShell is required to verify scripts/migrate.ps1")
+    repository_root = Path(__file__).parents[4]
+    child_environment = os.environ.copy()
+    child_environment.pop("LAWYER_DATABASE_URL", None)
+    completed = subprocess.run(  # noqa: S603 - executable is resolved locally
+        [
+            executable,
+            "-NoProfile",
+            "-File",
+            str(repository_root / "scripts/migrate.ps1"),
+            "-EnvironmentFile",
+            str(environment_file),
+        ],
+        cwd=repository_root,
+        env=child_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert rendered_url not in combined_output
+    assert (mysql_url.password or "") not in combined_output
+    assert REQUIRED_TABLES <= asyncio.run(_inspect_table_names(mysql_url))
 
 
 async def _inspect_table_names(mysql_url: URL) -> set[str]:

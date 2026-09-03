@@ -1,6 +1,7 @@
 .superpowers/
 .worktrees/
 deploy/.env
+deploy/secrets/
 .env
 .venv/
 __pycache__/

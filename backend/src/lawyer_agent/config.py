@@ -1,7 +1,10 @@
+import json
 import re
+import stat
 from base64 import b64decode
 from binascii import Error as BinasciiError
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -26,6 +29,28 @@ DEVELOPMENT_ED25519_KEY_RING = {
 DEVELOPMENT_DATABASE_URL = "mysql+asyncmy://lawyer:lawyer@mysql:3306/lawyer_agent"
 DEVELOPMENT_REDIS_URL = "redis://redis:6379/0"
 _JWT_KID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}\Z", re.ASCII)
+_MAX_SECRET_FILE_BYTES = 65_536
+_SECURITY_SECRET_FILES = {
+    "secret_key_file": ("secret_key", False),
+    "data_encryption_key_b64_file": ("data_encryption_key_b64", False),
+    "data_encryption_key_ring_file": ("data_encryption_key_ring", True),
+    "blind_index_key_b64_file": ("blind_index_key_b64", False),
+    "blind_index_key_ring_file": ("blind_index_key_ring", True),
+    "refresh_token_key_b64_file": ("refresh_token_key_b64", False),
+    "csrf_key_b64_file": ("csrf_key_b64", False),
+    "jwt_ed25519_key_ring_file": ("jwt_ed25519_key_ring", True),
+}
+
+
+def _reject_duplicate_json_object_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError("security key ring JSON contains a duplicate key")
+        parsed[key] = value
+    return parsed
 
 
 def _decode_32_byte_key(value: str, field_name: str) -> bytes:
@@ -72,6 +97,7 @@ class Settings(BaseSettings):
         repr=False,
         exclude=True,
     )
+    secret_key_file: Path | None = Field(default=None, repr=False, exclude=True)
     api_prefix: str = "/api/v1"
     log_level: str = "INFO"
     database_url: str = Field(default=DEVELOPMENT_DATABASE_URL, repr=False, exclude=True)
@@ -88,10 +114,16 @@ class Settings(BaseSettings):
         repr=False,
         exclude=True,
     )
+    data_encryption_key_b64_file: Path | None = Field(
+        default=None, repr=False, exclude=True
+    )
     data_encryption_key_ring: dict[int, str] | None = Field(
         default=None,
         repr=False,
         exclude=True,
+    )
+    data_encryption_key_ring_file: Path | None = Field(
+        default=None, repr=False, exclude=True
     )
     data_encryption_active_key_version: int | None = None
     blind_index_key_b64: str = Field(
@@ -99,10 +131,16 @@ class Settings(BaseSettings):
         repr=False,
         exclude=True,
     )
+    blind_index_key_b64_file: Path | None = Field(
+        default=None, repr=False, exclude=True
+    )
     blind_index_key_ring: dict[int, str] | None = Field(
         default=None,
         repr=False,
         exclude=True,
+    )
+    blind_index_key_ring_file: Path | None = Field(
+        default=None, repr=False, exclude=True
     )
     blind_index_active_key_version: int | None = None
     blind_index_rollout_phase: Literal[
@@ -115,11 +153,15 @@ class Settings(BaseSettings):
         repr=False,
         exclude=True,
     )
+    refresh_token_key_b64_file: Path | None = Field(
+        default=None, repr=False, exclude=True
+    )
     csrf_key_b64: str = Field(
         default=DEVELOPMENT_CSRF_KEY_B64,
         repr=False,
         exclude=True,
     )
+    csrf_key_b64_file: Path | None = Field(default=None, repr=False, exclude=True)
     jwt_issuer: str = "https://identity.lawyer-agent.local"
     jwt_active_kid: str = "development"
     jwt_ed25519_key_ring: dict[str, str] = Field(
@@ -127,6 +169,57 @@ class Settings(BaseSettings):
         repr=False,
         exclude=True,
     )
+    jwt_ed25519_key_ring_file: Path | None = Field(
+        default=None, repr=False, exclude=True
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def load_security_secret_files(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        loaded = dict(value)
+        for file_field, (target_field, parse_json) in _SECURITY_SECRET_FILES.items():
+            raw_path = loaded.get(file_field)
+            if raw_path is None:
+                continue
+            if target_field in loaded:
+                raise ValueError(
+                    f"{target_field} and {file_field} cannot both be configured"
+                )
+            path = Path(raw_path)
+            if not path.is_absolute():
+                raise ValueError(f"{file_field} must be an absolute path")
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(f"{file_field} cannot be read") from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"{file_field} must be a regular file")
+            try:
+                with path.open("rb") as secret_stream:
+                    payload = secret_stream.read(_MAX_SECRET_FILE_BYTES + 1)
+            except OSError as exc:
+                raise ValueError(f"{file_field} cannot be read") from exc
+            if not payload or len(payload) > _MAX_SECRET_FILE_BYTES:
+                raise ValueError(f"{file_field} has an invalid size")
+            try:
+                text_value = payload.decode("utf-8").rstrip("\r\n")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{file_field} must contain UTF-8 text") from exc
+            if not text_value or "\x00" in text_value:
+                raise ValueError(f"{file_field} has invalid content")
+            if parse_json:
+                try:
+                    loaded[target_field] = json.loads(
+                        text_value,
+                        object_pairs_hook=_reject_duplicate_json_object_pairs,
+                    )
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{file_field} must contain valid JSON") from exc
+            else:
+                loaded[target_field] = text_value
+        return loaded
 
     @field_validator(
         "data_encryption_key_b64",
