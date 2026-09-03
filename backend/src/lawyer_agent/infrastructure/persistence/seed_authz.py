@@ -7,11 +7,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.infrastructure.persistence.models import (
+    PermissionFeatureRolloutModel,
     PermissionModel,
     PlatformRoleModel,
     PlatformRolePermissionModel,
     RoleTemplateModel,
     RoleTemplatePermissionModel,
+)
+
+_FEATURE_PERMISSION_CODES = frozenset({"ai_job.create", "ai_job.read", "ai_job.cancel"})
+_FEATURE_TARGET_ROLES = frozenset(
+    {"tenant_owner", "tenant_admin", "department_admin", "lawyer_or_legal", "assistant", "teacher"}
 )
 
 
@@ -260,6 +266,7 @@ async def _seed_role_templates(
     session: AsyncSession,
     permissions: dict[str, PermissionModel],
 ) -> None:
+    feature_active = await _feature_is_active(session)
     expected_codes = {seed.code.casefold() for seed in TENANT_ROLE_TEMPLATES}
     existing: dict[str, RoleTemplateModel] = {}
     for model in await session.scalars(select(RoleTemplateModel)):
@@ -313,8 +320,20 @@ async def _seed_role_templates(
                 )
             ).all()
         )
-        if actual_permission_codes != seed.permission_codes:
+        expected_permissions = seed.permission_codes
+        if feature_active and seed.code in _FEATURE_TARGET_ROLES:
+            expected_permissions = seed.permission_codes | _FEATURE_PERMISSION_CODES
+        if actual_permission_codes != expected_permissions:
             raise SeedDriftError(f"role permission drift: {seed.code}")
+
+
+async def _feature_is_active(session: AsyncSession) -> bool:
+    rollout = await session.scalar(
+        select(PermissionFeatureRolloutModel).where(
+            PermissionFeatureRolloutModel.feature_code == "ai_job_runtime_v1"
+        )
+    )
+    return rollout is not None and rollout.phase in {"activating", "activated"}
 
 
 async def _seed_platform_roles(

@@ -30,6 +30,7 @@ from lawyer_agent.infrastructure.persistence.models import (
     AuthSessionModel,
     DepartmentModel,
     MembershipRoleAssignmentModel,
+    PermissionFeatureRolloutModel,
     PermissionModel,
     RefreshTokenRecordModel,
     RoleTemplateModel,
@@ -41,6 +42,18 @@ from lawyer_agent.infrastructure.persistence.models import (
     UserModel,
 )
 from lawyer_agent.infrastructure.persistence.seed_authz import TENANT_ROLE_TEMPLATES
+
+_FEATURE_PERMISSION_CODES = frozenset({"ai_job.create", "ai_job.read", "ai_job.cancel"})
+_FEATURE_TARGET_ROLES = frozenset(
+    {
+        "tenant_owner",
+        "tenant_admin",
+        "department_admin",
+        "lawyer_or_legal",
+        "assistant",
+        "teacher",
+    }
+)
 
 
 class TenantApplicationRepository:
@@ -326,6 +339,9 @@ class TenantRoleWorkflowRepository:
 
     async def clone_templates_for_tenant(self, tenant_id: UUID) -> dict[str, UUID]:
         require_uuid7(tenant_id, field="tenant_id")
+        feature_phase = await self._feature_phase()
+        template_has_feature = feature_phase in {"activating", "activated", "deactivating"}
+        filter_feature = feature_phase in {"catalog_only", "deactivating"}
         templates = (
             await self._session.scalars(
                 select(RoleTemplateModel)
@@ -361,15 +377,20 @@ class TenantRoleWorkflowRepository:
                 (permission_id, permission_code)
             )
         expected_by_code = {seed.code: seed for seed in TENANT_ROLE_TEMPLATES}
+        feature_codes = _FEATURE_PERMISSION_CODES
+        target_roles = _FEATURE_TARGET_ROLES
         for template in templates:
             expected = expected_by_code[template.code]
+            actual_codes = frozenset(
+                code for _, code in permissions_by_template.get(template.id, [])
+            )
+            expected_permissions = expected.permission_codes
+            if template_has_feature and template.code in target_roles:
+                expected_permissions = expected.permission_codes | feature_codes
             if (
                 template.name != expected.name
                 or template.description != expected.description
-                or frozenset(
-                    code for _, code in permissions_by_template.get(template.id, [])
-                )
-                != expected.permission_codes
+                or actual_codes != expected_permissions
             ):
                 raise RoleTemplateUnavailable
         role_ids: dict[str, UUID] = {}
@@ -389,7 +410,9 @@ class TenantRoleWorkflowRepository:
             )
         await self._session.flush()
         for template in templates:
-            for permission_id, _ in permissions_by_template.get(template.id, []):
+            for permission_id, permission_code in permissions_by_template.get(template.id, []):
+                if filter_feature and permission_code in feature_codes:
+                    continue
                 self._session.add(
                     TenantRolePermissionModel(
                         tenant_id=tenant_id,
@@ -399,6 +422,14 @@ class TenantRoleWorkflowRepository:
                 )
         await self._session.flush()
         return role_ids
+
+    async def _feature_phase(self) -> str:
+        rollout = await self._session.scalar(
+            select(PermissionFeatureRolloutModel).where(
+                PermissionFeatureRolloutModel.feature_code == "ai_job_runtime_v1"
+            )
+        )
+        return "catalog_only" if rollout is None else rollout.phase
 
     async def assign_owner(
         self,
