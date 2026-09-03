@@ -12,6 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lawyer_agent.domain.authorization import AuthorizationScope
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.tenancy import MembershipStatus, TenantContext, TenantStatus
+from lawyer_agent.infrastructure.persistence.repositories.ai_jobs import (
+    SqlAlchemyAIJobRepository,
+)
 from lawyer_agent.infrastructure.persistence.repositories.authorization import (
     AuthorizationRepository,
 )
@@ -115,6 +118,9 @@ INVALID_IDS = (
         ),
         ("authorization", "unassign_role", (None, ROLE_ID), {}),
         ("authorization", "unassign_role", (MEMBERSHIP_ID, None), {}),
+        ("ai_job", "get", (None,), {}),
+        ("ai_job", "get_access", (None, MEMBERSHIP_ID), {}),
+        ("ai_job", "get_access", (MEMBERSHIP_ID, None), {}),
     ],
 )
 async def test_repository_rejects_every_non_uuid7_argument_before_sql(
@@ -130,6 +136,7 @@ async def test_repository_rejects_every_non_uuid7_argument_before_sql(
         "department": DepartmentRepository(cast(AsyncSession, session)),
         "membership": MembershipRepository(cast(AsyncSession, session)),
         "authorization": AuthorizationRepository(cast(AsyncSession, session)),
+        "ai_job": SqlAlchemyAIJobRepository(cast(AsyncSession, session)),
     }
     actual_args = tuple(invalid if value is None else value for value in args)
     actual_kwargs = {
