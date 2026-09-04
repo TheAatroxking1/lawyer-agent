@@ -32,6 +32,15 @@ from lawyer_agent.infrastructure.persistence.models.identity import (
     PasswordCredentialModel,
     UserModel,
 )
+from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
+    LegalChunkModel,
+    LegalDatasetSnapshotModel,
+    LegalInstrumentModel,
+    LegalLoadBatchModel,
+    LegalProvisionModel,
+    LegalQualityIssueModel,
+    LegalVersionModel,
+)
 from lawyer_agent.infrastructure.persistence.models.outbox import (
     AuthorizationCacheInvalidationOutboxModel,
 )
@@ -61,6 +70,13 @@ __all__ = [
     "DepartmentModel",
     "IdempotencyRecordModel",
     "IdentityVerificationChallengeModel",
+    "LegalChunkModel",
+    "LegalDatasetSnapshotModel",
+    "LegalInstrumentModel",
+    "LegalLoadBatchModel",
+    "LegalProvisionModel",
+    "LegalQualityIssueModel",
+    "LegalVersionModel",
     "MembershipRoleAssignmentModel",
     "MessageSecurityRejectionModel",
     "PasswordCredentialModel",
