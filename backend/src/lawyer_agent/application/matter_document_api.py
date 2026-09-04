@@ -408,26 +408,51 @@ class MatterDocumentHttpService:
         trace_id: str | None = None,
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
-        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
-            await self._require_matter(uow, context, matter_id)
-            try:
-                party = await uow.matters.add_party(
-                    tenant_id=context.tenant_id,
-                    matter_id=matter_id,
-                    display_name=display_name,
-                    kind=kind,
+        try:
+            async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+                await self._require_matter(uow, context, matter_id)
+                try:
+                    party = await uow.matters.add_party(
+                        tenant_id=context.tenant_id,
+                        matter_id=matter_id,
+                        display_name=display_name,
+                        kind=kind,
+                    )
+                except ValueError as exc:
+                    raise MatterDocumentInvalidRequest from exc
+                await _append_party_audit(
+                    uow,
+                    context=context,
+                    action="matter.party.add",
+                    reason_code="added",
+                    target_id=party.id,
+                    trace_id=trace_id,
                 )
-            except ValueError as exc:
-                raise MatterDocumentInvalidRequest from exc
-            await _append_party_audit(
-                uow,
+                return party
+        except MatterDocumentNotFound as exc:
+            await _append_party_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="matter.party.add",
-                reason_code="added",
-                target_id=party.id,
+                result="denied",
+                reason_code=exc.code,
+                target_type="matter",
+                target_id=matter_id,
                 trace_id=trace_id,
             )
-            return party
+            raise
+        except MatterDocumentInvalidRequest as exc:
+            await _append_party_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="matter.party.add",
+                result="failure",
+                reason_code=exc.code,
+                target_type="matter",
+                target_id=matter_id,
+                trace_id=trace_id,
+            )
+            raise
 
     async def list_parties(
         self, *, context: TenantContext, matter_id: UUID
@@ -449,29 +474,54 @@ class MatterDocumentHttpService:
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
-        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
-            await self._require_matter(uow, context, matter_id)
-            try:
-                party = await uow.matters.update_party(
-                    tenant_id=context.tenant_id,
-                    matter_id=matter_id,
-                    party_id=party_id,
-                    display_name=display_name,
-                    kind=kind,
+        try:
+            async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+                await self._require_matter(uow, context, matter_id)
+                try:
+                    party = await uow.matters.update_party(
+                        tenant_id=context.tenant_id,
+                        matter_id=matter_id,
+                        party_id=party_id,
+                        display_name=display_name,
+                        kind=kind,
+                    )
+                except ValueError as exc:
+                    raise MatterDocumentInvalidRequest from exc
+                if party is None:
+                    raise MatterDocumentNotFound
+                await _append_party_audit(
+                    uow,
+                    context=context,
+                    action="matter.party.update",
+                    reason_code="updated",
+                    target_id=party.id,
+                    trace_id=trace_id,
                 )
-            except ValueError as exc:
-                raise MatterDocumentInvalidRequest from exc
-            if party is None:
-                raise MatterDocumentNotFound
-            await _append_party_audit(
-                uow,
+                return party
+        except MatterDocumentNotFound as exc:
+            await _append_party_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="matter.party.update",
-                reason_code="updated",
-                target_id=party.id,
+                result="denied",
+                reason_code=exc.code,
+                target_type="matter_party",
+                target_id=party_id,
                 trace_id=trace_id,
             )
-            return party
+            raise
+        except MatterDocumentInvalidRequest as exc:
+            await _append_party_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="matter.party.update",
+                result="failure",
+                reason_code=exc.code,
+                target_type="matter_party",
+                target_id=party_id,
+                trace_id=trace_id,
+            )
+            raise
 
     async def remove_party(
         self,
@@ -483,22 +533,35 @@ class MatterDocumentHttpService:
     ) -> None:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
-        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
-            await self._require_matter(uow, context, matter_id)
-            if not await uow.matters.remove_party(
-                tenant_id=context.tenant_id,
-                matter_id=matter_id,
-                party_id=party_id,
-            ):
-                raise MatterDocumentNotFound
-            await _append_party_audit(
-                uow,
+        try:
+            async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+                await self._require_matter(uow, context, matter_id)
+                if not await uow.matters.remove_party(
+                    tenant_id=context.tenant_id,
+                    matter_id=matter_id,
+                    party_id=party_id,
+                ):
+                    raise MatterDocumentNotFound
+                await _append_party_audit(
+                    uow,
+                    context=context,
+                    action="matter.party.remove",
+                    reason_code="removed",
+                    target_id=party_id,
+                    trace_id=trace_id,
+                )
+        except MatterDocumentNotFound as exc:
+            await _append_party_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="matter.party.remove",
-                reason_code="removed",
+                result="denied",
+                reason_code=exc.code,
+                target_type="matter_party",
                 target_id=party_id,
                 trace_id=trace_id,
             )
+            raise
 
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID
@@ -546,6 +609,43 @@ async def _append_party_audit(
         target_id=target_id,
     )
     await audit.append_structured(event)
+
+
+async def _append_party_rejected_audit(
+    uow_factory: Callable[[], object],
+    *,
+    context: TenantContext,
+    action: str,
+    result: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    """Record a rejected/failed party write attempt in its own committed transaction.
+
+    The failing business UoW has already rolled back when an error handler calls
+    this, so the audit append opens a fresh short-lived UoW whose clean exit
+    commits only the audit row.
+    """
+    async with cast(MatterDocumentUnitOfWorkPort, uow_factory()) as uow:
+        audit = getattr(uow, "audit", None)
+        user_id = context.membership_user_id
+        membership_id = context.membership_id
+        if audit is None or user_id is None or membership_id is None:
+            return
+        event = new_tenant_user_audit_event(
+            tenant_id=context.tenant_id,
+            actor_user_id=user_id,
+            actor_membership_id=membership_id,
+            action=action,
+            reason_code=reason_code,
+            trace_id=trace_id or "http",
+            target_type=target_type,
+            target_id=target_id,
+            result=result,
+        )
+        await audit.append_structured(event)
 
 
 def _actor_ids(context: TenantContext) -> tuple[UUID, UUID]:
