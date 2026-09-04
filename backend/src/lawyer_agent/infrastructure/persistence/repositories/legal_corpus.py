@@ -241,3 +241,90 @@ def _chunk_model(chunk: LegalChunk) -> LegalChunkModel:
         content_hash=chunk.content_hash,
         parser_version=chunk.parser_version,
     )
+
+
+def _instrument_model(instrument: LegalInstrument) -> LegalInstrumentModel:
+    return LegalInstrumentModel(
+        id=instrument.id,
+        title=instrument.title,
+        issuing_authority=instrument.issuing_authority,
+        jurisdiction=instrument.jurisdiction,
+        region_code=instrument.region_code,
+    )
+
+
+def _version_model(version: LegalVersion) -> LegalVersionModel:
+    return LegalVersionModel(
+        id=version.id,
+        instrument_id=version.instrument_id,
+        version_label=version.version_label,
+        law_number=version.law_number,
+        status=version.status.value,
+        published_on=version.published_on,
+        effective_on=version.effective_on,
+        repealed_on=version.repealed_on,
+        content_hash=version.content_hash,
+        source_ref=version.source_ref,
+        dataset_version=version.dataset_version,
+        parser_version=version.parser_version,
+    )
+
+
+def _provision_model(provision: Provision) -> LegalProvisionModel:
+    return LegalProvisionModel(
+        id=provision.id,
+        version_id=provision.version_id,
+        provision_no=provision.provision_no,
+        level=provision.level.value,
+        structure_path_json=list(provision.structure_path),
+        title=provision.title,
+        full_text=provision.full_text,
+        content_hash=provision.content_hash,
+        char_start=provision.char_start,
+        char_end=provision.char_end,
+    )
+
+
+class SqlAlchemyLegalCorpusImportRepository:
+    """Write path for imported corpus instruments, versions and provisions.
+
+    All calls flush within the caller's session/transaction; no implicit commit.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def find_instrument_by_identity(
+        self, title: str, jurisdiction: str
+    ) -> LegalInstrument | None:
+        model = await self._session.scalar(
+            select(LegalInstrumentModel).where(
+                LegalInstrumentModel.title == title,
+                LegalInstrumentModel.jurisdiction == jurisdiction,
+            )
+        )
+        return None if model is None else _to_instrument(model)
+
+    async def create_instrument(self, instrument: LegalInstrument) -> None:
+        self._session.add(_instrument_model(instrument))
+        await self._session.flush()
+
+    async def find_version(
+        self, instrument_id: UUID, version_label: str
+    ) -> LegalVersion | None:
+        model = await self._session.scalar(
+            select(LegalVersionModel).where(
+                LegalVersionModel.instrument_id == instrument_id,
+                LegalVersionModel.version_label == version_label,
+            )
+        )
+        return None if model is None else _to_version(model)
+
+    async def create_version(self, version: LegalVersion) -> None:
+        self._session.add(_version_model(version))
+        await self._session.flush()
+
+    async def create_provisions(self, provisions: tuple[Provision, ...]) -> None:
+        for provision in provisions:
+            self._session.add(_provision_model(provision))
+        await self._session.flush()
