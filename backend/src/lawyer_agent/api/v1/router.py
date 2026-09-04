@@ -6,6 +6,7 @@ from lawyer_agent.api.v1 import (
     audit,
     auth,
     invitations,
+    legal_corpus,
     matter_documents,
     platform,
     reviews,
@@ -26,3 +27,4 @@ api_v1_router.include_router(matter_documents.router)
 api_v1_router.include_router(reviews.router)
 api_v1_router.include_router(rule_packs.router)
 api_v1_router.include_router(audit.router)
+api_v1_router.include_router(legal_corpus.router)

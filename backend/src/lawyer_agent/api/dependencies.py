@@ -97,6 +97,7 @@ class ApplicationServices:
     document_review_http: Any = None
     rule_pack_admin_http: Any = None
     audit_query_http: Any = None
+    legal_corpus_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -232,6 +233,7 @@ async def application_services(
         document_review_http=_build_document_review_http_service(session_factory),
         rule_pack_admin_http=_build_rule_pack_admin_http_service(session_factory),
         audit_query_http=_build_audit_query_http_service(session_factory),
+        legal_corpus_http=_build_legal_corpus_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -329,6 +331,18 @@ def _build_audit_query_http_service(session_factory: Any) -> Any:
 
     return AuditQueryHttpService(
         lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
+    )
+
+
+def _build_legal_corpus_http_service(session_factory: Any) -> Any:
+    """Composition root for the public legal corpus read HTTP service."""
+    from lawyer_agent.application.legal_corpus_read import LegalCorpusQueryService
+    from lawyer_agent.infrastructure.persistence.legal_corpus_read_uow import (
+        SqlAlchemyLegalCorpusReadUnitOfWork,
+    )
+
+    return LegalCorpusQueryService(
+        lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
     )
 
 
