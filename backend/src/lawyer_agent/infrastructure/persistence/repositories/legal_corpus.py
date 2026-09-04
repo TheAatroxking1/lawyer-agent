@@ -76,6 +76,10 @@ class LegalCorpusQueryPort(Protocol):
 
     async def instrument_exists(self, instrument_id: UUID) -> bool: ...
 
+    async def instrument_by_id(
+        self, instrument_id: UUID
+    ) -> LegalInstrument | None: ...
+
     async def versions_for_instrument(
         self, instrument_id: UUID
     ) -> tuple[LegalVersion, ...]: ...
@@ -206,6 +210,16 @@ class SqlAlchemyLegalCorpusRepository:
             )
         )
         return model is not None
+
+    async def instrument_by_id(
+        self, instrument_id: UUID
+    ) -> LegalInstrument | None:
+        model = await self._session.scalar(
+            select(LegalInstrumentModel).where(
+                LegalInstrumentModel.id == instrument_id
+            )
+        )
+        return None if model is None else _to_instrument(model)
 
     async def versions_for_instrument(
         self, instrument_id: UUID

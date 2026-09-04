@@ -41,6 +41,14 @@ class LegalVersionSummary(StrictModel):
     parser_version: str | None = None
 
 
+class LegalInstrumentSummary(StrictModel):
+    id: UUID
+    title: str
+    issuing_authority: str
+    jurisdiction: str
+    region_code: str | None = None
+
+
 class ProvisionSummary(StrictModel):
     id: UUID
     version_id: UUID
@@ -105,6 +113,30 @@ def _version_summary(version: LegalVersion) -> LegalVersionSummary:
         source_ref=version.source_ref,
         dataset_version=version.dataset_version,
         parser_version=version.parser_version,
+    )
+
+
+@router.get(
+    "/instruments/{instrument_id}",
+    response_model=LegalInstrumentSummary,
+)
+async def get_instrument(
+    instrument_id: UUID,
+    current: AccountSession,
+    services: Services,
+) -> LegalInstrumentSummary:
+    del current
+    service = _require_service(services)
+    try:
+        instrument = await service.instrument(instrument_id=instrument_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return LegalInstrumentSummary(
+        id=instrument.id,
+        title=instrument.title,
+        issuing_authority=instrument.issuing_authority,
+        jurisdiction=instrument.jurisdiction,
+        region_code=instrument.region_code,
     )
 
 

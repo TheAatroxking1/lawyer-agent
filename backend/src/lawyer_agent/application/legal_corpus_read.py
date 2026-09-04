@@ -12,7 +12,11 @@ from datetime import date
 from typing import Protocol, cast
 from uuid import UUID
 
-from lawyer_agent.domain.legal_corpus import LegalVersion, Provision
+from lawyer_agent.domain.legal_corpus import (
+    LegalInstrument,
+    LegalVersion,
+    Provision,
+)
 
 
 class LegalCorpusQueryError(Exception):
@@ -43,6 +47,10 @@ class LegalCorpusQueryPort(Protocol):
     ) -> tuple[Provision, ...]: ...
 
     async def instrument_exists(self, instrument_id: UUID) -> bool: ...
+
+    async def instrument_by_id(
+        self, instrument_id: UUID
+    ) -> LegalInstrument | None: ...
 
     async def versions_for_instrument(
         self, instrument_id: UUID
@@ -90,3 +98,10 @@ class LegalCorpusQueryService:
                 raise LegalCorpusInstrumentNotFound()
             versions = await uow.corpus.versions_for_instrument(instrument_id)
         return tuple(versions)
+
+    async def instrument(self, *, instrument_id: UUID) -> LegalInstrument:
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            instrument = await uow.corpus.instrument_by_id(instrument_id)
+        if instrument is None:
+            raise LegalCorpusInstrumentNotFound()
+        return instrument
