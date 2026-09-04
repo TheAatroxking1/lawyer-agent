@@ -210,6 +210,28 @@ def test_legal_corpus_read_http_over_real_mysql(migrated_mysql_url: URL) -> None
         # 1. as_of before the first effective date -> 404.
         base = "/api/v1/legal"
         headers = {"Authorization": f"Bearer {account_token}"}
+
+        # 0. Instrument identity is readable by id.
+        identity = client.get(
+            f"{base}/instruments/{instrument_id}", headers=headers
+        )
+        assert identity.status_code == 200, identity.text
+        assert identity.json()["id"] == str(instrument_id)
+        assert identity.json()["title"] == "中华人民共和国示例法"
+        assert identity.json()["issuing_authority"] == "全国人民代表大会常务委员会"
+        unknown_identity = client.get(
+            f"{base}/instruments/{new_uuid7()}", headers=headers
+        )
+        assert unknown_identity.status_code == 404
+        assert (
+            unknown_identity.json()["code"]
+            == "legal_corpus_instrument_not_found"
+        )
+        unauth_identity = client.get(
+            f"{base}/instruments/{instrument_id}",
+        )
+        assert unauth_identity.status_code == 401
+
         none_yet = client.get(
             f"{base}/instruments/{instrument_id}/version?as_of=2019-06-01",
             headers=headers,

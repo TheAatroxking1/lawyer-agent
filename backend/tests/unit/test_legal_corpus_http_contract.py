@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from lawyer_agent.api.v1.legal_corpus import (
+    LegalInstrumentSummary,
     LegalVersionSummary,
     ProvisionSummary,
 )
@@ -38,6 +39,18 @@ def test_provision_summary_round_trip() -> None:
         full_text="第一条 为了保护民事权益，制定本法。",
     )
     assert summary.provision_no == "第一条"
+
+
+def test_instrument_summary_round_trip() -> None:
+    summary = LegalInstrumentSummary(
+        id=new_uuid7(),
+        title="中华人民共和国民法典",
+        issuing_authority="全国人民代表大会",
+        jurisdiction="national",
+        region_code=None,
+    )
+    assert summary.title == "中华人民共和国民法典"
+    assert summary.issuing_authority == "全国人民代表大会"
 
 
 def test_version_not_found_code() -> None:
