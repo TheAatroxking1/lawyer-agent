@@ -92,6 +92,7 @@ class ApplicationServices:
     token_service: Any
     accounts: AccountQueryPort
     ai_jobs: Any = None
+    rule_check_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -220,6 +221,7 @@ async def application_services(
             )
         ),
         ai_jobs=_build_ai_job_service(session_factory, idempotency),
+        rule_check_http=_build_rule_check_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -248,6 +250,18 @@ def _build_ai_job_service(
     return AIJobService(
         lambda: SqlAlchemyAIJobUnitOfWork(session_factory),
         idempotency,
+    )
+
+
+def _build_rule_check_http_service(session_factory: Any) -> Any:
+    """Composition root for the deterministic Rule Check HTTP service."""
+    from lawyer_agent.application.rule_check_api import RuleCheckHttpService
+    from lawyer_agent.infrastructure.persistence.rule_check_uow import (
+        SqlAlchemyRuleCheckUnitOfWork,
+    )
+
+    return RuleCheckHttpService(
+        lambda: SqlAlchemyRuleCheckUnitOfWork(session_factory)
     )
 
 

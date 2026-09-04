@@ -108,7 +108,8 @@ def _clamp(value: str) -> str:
 
 
 class TenantScoped(Protocol):
-    tenant_id: UUID
+    @property
+    def tenant_id(self) -> UUID: ...
 
 
 class RiskIssueStorePort(Protocol):

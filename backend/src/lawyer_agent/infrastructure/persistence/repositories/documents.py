@@ -42,6 +42,15 @@ class SqlAlchemyDocumentRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def document_exists(self, tenant_id: UUID, document_id: UUID) -> bool:
+        model = await self._session.scalar(
+            select(TenantDocumentModel.id).where(
+                TenantDocumentModel.tenant_id == tenant_id,
+                TenantDocumentModel.id == document_id,
+            )
+        )
+        return model is not None
+
     async def find_version(
         self, tenant_id: UUID, document_id: UUID
     ) -> DocumentVersion | None:

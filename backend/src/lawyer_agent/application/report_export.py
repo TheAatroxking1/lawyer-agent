@@ -29,7 +29,8 @@ _NO_HITS = "未发现规则命中（仍需人工核验，不代表检查已经�
 
 
 class TenantScoped(Protocol):
-    tenant_id: UUID
+    @property
+    def tenant_id(self) -> UUID: ...
 
 
 class ReportDocumentPort(Protocol):
