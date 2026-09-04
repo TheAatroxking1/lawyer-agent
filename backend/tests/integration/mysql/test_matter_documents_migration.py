@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
