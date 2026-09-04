@@ -98,6 +98,7 @@ class ApplicationServices:
     rule_pack_admin_http: Any = None
     audit_query_http: Any = None
     legal_corpus_http: Any = None
+    legal_version_diff_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -238,6 +239,7 @@ async def application_services(
         ),
         audit_query_http=_build_audit_query_http_service(session_factory),
         legal_corpus_http=_build_legal_corpus_http_service(session_factory),
+        legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -355,6 +357,18 @@ def _build_legal_corpus_http_service(session_factory: Any) -> Any:
     )
 
     return LegalCorpusQueryService(
+        lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
+    )
+
+
+def _build_legal_version_diff_http_service(session_factory: Any) -> Any:
+    """Composition root for the public legal version diff HTTP service."""
+    from lawyer_agent.application.legal_corpus_diff import LegalVersionDiffReadService
+    from lawyer_agent.infrastructure.persistence.legal_corpus_read_uow import (
+        SqlAlchemyLegalCorpusReadUnitOfWork,
+    )
+
+    return LegalVersionDiffReadService(
         lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
     )
 

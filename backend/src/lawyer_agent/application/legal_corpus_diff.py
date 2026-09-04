@@ -9,8 +9,9 @@ first, non-model step of the semi-automatic update flow (spec 6.6).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from lawyer_agent.domain.legal_corpus import LegalInstrument, LegalVersion, Provision
@@ -74,6 +75,25 @@ class LegalVersionDiffQueryPort(Protocol):
 class LegalVersionDiffError(ValueError):
     """Versions are missing or belong to different instruments."""
 
+    status: int = 500
+    code: str = "legal_version_diff_error"
+    title: str = "Legal version diff failed"
+
+
+class LegalVersionDiffVersionNotFound(LegalVersionDiffError):
+    status = 404
+    code = "legal_corpus_version_not_found"
+    title = "No legal version exists for diff"
+
+    def __init__(self, version_id: UUID) -> None:
+        super().__init__(f"version not found: {version_id}")
+
+
+class LegalVersionDiffCrossInstrument(LegalVersionDiffError):
+    status = 409
+    code = "legal_version_diff_cross_instrument"
+    title = "Versions belong to different instruments"
+
 
 class LegalVersionDiffService:
     """Computes the provision-level diff between two versions."""
@@ -89,7 +109,7 @@ class LegalVersionDiffService:
         old = await self._load_version(from_version_id)
         new = await self._load_version(to_version_id)
         if old.instrument_id != new.instrument_id:
-            raise LegalVersionDiffError(
+            raise LegalVersionDiffCrossInstrument(
                 "versions belong to different instruments; "
                 "cross-instrument diff is refused"
             )
@@ -100,11 +120,40 @@ class LegalVersionDiffService:
             from_version_id=from_version_id,
             to_version_id=to_version_id,
         )
+
     async def _load_version(self, version_id: UUID) -> LegalVersion:
         loaded = await self._query.version_with_instrument(version_id)
         if loaded is None:
-            raise LegalVersionDiffError(f"version not found: {version_id}")
+            raise LegalVersionDiffVersionNotFound(version_id)
         return loaded[0]
+
+
+class LegalVersionDiffUnitOfWorkPort(Protocol):
+    corpus: LegalVersionDiffQueryPort
+
+    async def __aenter__(self) -> LegalVersionDiffUnitOfWorkPort: ...
+
+    async def __aexit__(self, *exc: object) -> None: ...
+
+
+class LegalVersionDiffReadService:
+    """Composition facade: one diff runs on one read-only unit of work."""
+
+    def __init__(self, uow_factory: Callable[[], object]) -> None:
+        if not callable(uow_factory):
+            raise ValueError("version diff service requires a unit of work factory")
+        self._uow_factory = uow_factory
+
+    async def diff(
+        self, *, from_version_id: UUID, to_version_id: UUID
+    ) -> LegalVersionDiff:
+        async with cast(
+            LegalVersionDiffUnitOfWorkPort, self._uow_factory()
+        ) as uow:
+            return await LegalVersionDiffService(uow.corpus).diff(
+                from_version_id=from_version_id,
+                to_version_id=to_version_id,
+            )
 
 
 def version_diff(
