@@ -94,15 +94,18 @@ class OpenSearchRestClient:
             "parser_version": {"type": "keyword"},
             "content": {"type": "text"},
         }
+        settings: dict[str, Any] = {
+            "number_of_shards": 1,
+            "number_of_replicas": 0,
+        }
         if vector_dimension is not None:
             properties["content_vector"] = {
                 "type": "knn_vector",
                 "dimension": vector_dimension,
+                "method": {"name": "hnsw", "space_type": "l2", "engine": "lucene"},
             }
-        body = {
-            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-            "mappings": {"properties": properties},
-        }
+            settings["index"] = {"knn": True}
+        body = {"settings": settings, "mappings": {"properties": properties}}
         async with self._client() as client:
             response = await client.put(f"/{index_name}", json=body)
             if response.status_code not in (200, 201):
@@ -198,19 +201,13 @@ class OpenSearchRestClient:
             for value in query_vector
         ):
             raise ValueError("knn query vector values must be finite floats")
-        knn: dict[str, Any] = {
-            "field": "content_vector",
-            "query_vector": list(query_vector),
-            "k": limit,
-        }
-        body: dict[str, Any] = {"query": {"knn": knn}, "size": limit}
+        knn_query: dict[str, Any] = {"vector": list(query_vector), "k": limit}
         if version_id is not None:
-            body["query"] = {
-                "bool": {
-                    "must": [{"knn": knn}],
-                    "filter": [{"term": {"version_id": str(version_id)}}],
-                }
-            }
+            knn_query["filter"] = {"term": {"version_id": str(version_id)}}
+        body: dict[str, Any] = {
+            "query": {"knn": {"content_vector": knn_query}},
+            "size": limit,
+        }
         async with self._client() as client:
             response = await client.post(f"/{index_name}/_search", json=body)
             if response.status_code != 200:
