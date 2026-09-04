@@ -20,6 +20,19 @@ MAX_DOCUMENT_NAME_BYTES = 256
 MAX_MATTER_TITLE_CHARS = 512
 MAX_MATTER_DESCRIPTION_CHARS = 4000
 
+# A Matter owner is the tenant's own lawyer/legal staff (spec 8.4 Assignment).
+MATTER_OWNER_MEMBER_TYPES = frozenset({"owner", "internal"})
+
+
+def matter_owner_assignable(member_type: str, status: str) -> bool:
+    """True when a tenant membership may be assigned as a Matter owner.
+
+    Only active members of the firm (owner/internal member types) can be the
+    responsible lawyer/legal staff. External clients and students are never
+    assignable as the firm's own owner.
+    """
+    return member_type in MATTER_OWNER_MEMBER_TYPES and status == "active"
+
 
 def validate_matter_metadata(
     *,

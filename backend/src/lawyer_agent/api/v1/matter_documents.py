@@ -55,6 +55,7 @@ class MatterSummary(StrictModel):
     title: str
     kind: str
     status: str
+    owner_membership_id: UUID | None = None
     version: int
 
 
@@ -215,6 +216,10 @@ class MatterStatusResponse(StrictModel):
     matter: MatterSummary
 
 
+class AssignMatterOwnerBody(StrictModel):
+    owner_membership_id: UUID
+
+
 class UpdateMatterMetadataBody(StrictModel):
     title: str | None = Field(default=None, min_length=1, max_length=512)
     description: str | None = Field(default=None, max_length=4000)
@@ -258,6 +263,41 @@ async def update_matter_metadata(
             expected_version=expected_version,
             title=body.title,
             description=body.description,
+            trace_id=getattr(request.state, "trace_id", None),
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest, MatterDocumentConflict) as exc:
+        raise _map_error(exc) from None
+    response.headers["ETag"] = StrongETag.format(matter.version)
+    return MatterStatusResponse(matter=_matter_summary(matter))
+
+
+@router.put(
+    "/matters/{matter_id}/owner",
+    response_model=MatterStatusResponse,
+    status_code=200,
+)
+async def assign_matter_owner(
+    tenant_id: UUID,
+    matter_id: UUID,
+    body: AssignMatterOwnerBody,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+    request: Request,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> MatterStatusResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    expected_version = (
+        None if if_match is None else StrongETag.parse(if_match).version
+    )
+    try:
+        matter = await service.assign_matter_owner(
+            context=actor.context,
+            matter_id=matter_id,
+            expected_version=expected_version,
+            owner_membership_id=body.owner_membership_id,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest, MatterDocumentConflict) as exc:
@@ -410,6 +450,7 @@ def _matter_summary(matter: Matter) -> MatterSummary:
         title=matter.title,
         kind=matter.kind.value,
         status=matter.status.value,
+        owner_membership_id=matter.owner_membership_id,
         version=matter.version,
     )
 

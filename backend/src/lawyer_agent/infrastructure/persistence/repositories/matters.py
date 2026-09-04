@@ -17,6 +17,7 @@ from lawyer_agent.domain.matter_documents import (
     MatterParty,
     MatterStatus,
     ReviewStatus,
+    matter_owner_assignable,
     require_matter_status_transition,
     validate_matter_metadata,
 )
@@ -24,6 +25,9 @@ from lawyer_agent.domain.tenancy import TenantContext
 from lawyer_agent.infrastructure.persistence.models.matter_documents import (
     TenantMatterModel,
     TenantMatterPartyModel,
+)
+from lawyer_agent.infrastructure.persistence.models.tenancy import (
+    TenantMembershipModel,
 )
 
 _MATTER_KIND_MAP = {
@@ -314,6 +318,69 @@ class SqlAlchemyMatterRepository:
                     TenantMatterModel.version == expected_version,
                 )
                 .values(**values, version=TenantMatterModel.version + 1)
+            ),
+        )
+        if result.rowcount != 1:
+            return None
+        await self._session.flush()
+        return _matter(model)
+
+    async def assign_owner(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        owner_membership_id: UUID,
+    ) -> Matter | None:
+        """Assign a tenant member as the Matter's responsible owner (version CAS).
+
+        The owner must be an active own-staff membership (member_type owner or
+        internal) of the SAME tenant. Any other reference - a foreign-tenant
+        membership, an inactive member, a student/external client or a
+        nonexistent id - is rejected with the same ValueError so callers cannot
+        probe whether a membership exists elsewhere.
+        """
+        _require_context(context)
+        require_uuid7(matter_id, field="matter_id")
+        require_uuid7(owner_membership_id, field="owner_membership_id")
+        if isinstance(expected_version, bool) or not isinstance(
+            expected_version, int
+        ) or expected_version < 1:
+            raise ValueError("matter expected_version must be a positive integer")
+        model = await self._session.scalar(
+            select(TenantMatterModel)
+            .where(
+                TenantMatterModel.tenant_id == context.tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+            .with_for_update()
+        )
+        if model is None:
+            return None
+        member = await self._session.scalar(
+            select(TenantMembershipModel).where(
+                TenantMembershipModel.tenant_id == context.tenant_id,
+                TenantMembershipModel.id == owner_membership_id,
+            )
+        )
+        if member is None or not matter_owner_assignable(
+            member.member_type, member.status
+        ):
+            raise ValueError("owner membership is not an active own-staff member")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantMatterModel)
+                .where(
+                    TenantMatterModel.tenant_id == context.tenant_id,
+                    TenantMatterModel.id == matter_id,
+                    TenantMatterModel.version == expected_version,
+                )
+                .values(
+                    owner_membership_id=owner_membership_id,
+                    version=TenantMatterModel.version + 1,
+                )
             ),
         )
         if result.rowcount != 1:

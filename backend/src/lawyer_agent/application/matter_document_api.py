@@ -169,6 +169,15 @@ class MatterStorePort(Protocol):
         description: str | None,
     ) -> Matter | None: ...
 
+    async def assign_owner(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        owner_membership_id: UUID,
+    ) -> Matter | None: ...
+
 class DocumentHeaderStorePort(Protocol):
     async def headers_for_matter(
         self, tenant_id: UUID, matter_id: UUID
@@ -960,6 +969,44 @@ class MatterDocumentHttpService:
                 context=context,
                 action="matter.update",
                 reason_code="changed",
+                target_id=matter_id,
+                trace_id=trace_id,
+            )
+            return updated
+
+    async def assign_matter_owner(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        expected_version: int | None,
+        owner_membership_id: UUID,
+        trace_id: str | None = None,
+    ) -> Matter:
+        require_uuid7(matter_id, field="matter_id")
+        require_uuid7(owner_membership_id, field="owner_membership_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            existing = await uow.matters.get_matter(context, matter_id)
+            if existing is None:
+                raise MatterDocumentNotFound
+            try:
+                updated = await uow.matters.assign_owner(
+                    context,
+                    matter_id,
+                    expected_version=(
+                        existing.version if expected_version is None else expected_version
+                    ),
+                    owner_membership_id=owner_membership_id,
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+            if updated is None:
+                raise MatterDocumentConflict
+            await _append_matter_audit(
+                uow,
+                context=context,
+                action="matter.owner",
+                reason_code="assigned",
                 target_id=matter_id,
                 trace_id=trace_id,
             )
