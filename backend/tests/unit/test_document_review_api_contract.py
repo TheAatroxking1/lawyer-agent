@@ -5,12 +5,44 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from lawyer_agent.api.v1.reviews import DocumentReviewBody
+from lawyer_agent.api.v1.reviews import (
+    DocumentReviewBody,
+    DocumentVersionResponse,
+)
 from lawyer_agent.domain.document_review import (
     InvalidReviewDecision,
     ReviewDecision,
     require_review_reason,
 )
+
+
+def test_version_read_response_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="extra"):
+        DocumentVersionResponse.model_validate(
+            {
+                "document_id": "018f6f60-0000-7000-8000-000000000001",
+                "version_no": 1,
+                "kind": "original",
+                "upload_status": "accepted",
+                "surprise": True,
+            }
+        )
+
+
+def test_version_read_response_white_list_projection() -> None:
+    body = DocumentVersionResponse.model_validate(
+        {
+            "document_id": "018f6f60-0000-7000-8000-000000000001",
+            "version_no": 1,
+            "kind": "original",
+            "file_name": "租赁合同.docx",
+            "upload_status": "accepted",
+            "review_status": "pending_review",
+            "review_reason": None,
+        }
+    )
+    assert body.file_name == "租赁合同.docx"
+    assert body.review_status == "pending_review"
 
 
 def test_review_body_rejects_extra_fields() -> None:
