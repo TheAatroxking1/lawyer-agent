@@ -37,7 +37,9 @@
 ## 当前阶段
 
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
-- 后端包和本地容器栈已经完成。下一个已批准的后端增量是 MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC 和跨租户反向隔离测试。
+- 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
+- “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
+- 下一主线是“阶段 1：法规数据与有据问答”中不依赖 Embedding 模型运行的任务（Embedding/OpenSearch 检索相关步骤仅在用户另行授权时执行）。
 - 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。
 
 ## 多租户与授权不变量
