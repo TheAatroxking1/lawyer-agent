@@ -313,6 +313,9 @@ async def list_matters(
     services: Services,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     before_id: Annotated[UUID | None, Query(alias="before_id")] = None,
+    title: Annotated[str | None, Query(max_length=512)] = None,
+    status: Annotated[str | None, Query()] = None,
+    kind: Annotated[str | None, Query()] = None,
 ) -> MatterPage:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -322,6 +325,9 @@ async def list_matters(
             context=actor.context,
             limit=limit,
             before_id=before_id,
+            title=title,
+            status=status,
+            kind=kind,
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
         raise _map_error(exc) from None

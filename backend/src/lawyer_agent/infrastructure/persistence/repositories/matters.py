@@ -155,19 +155,39 @@ class SqlAlchemyMatterRepository:
         *,
         limit: int,
         before_id: UUID | None = None,
+        title: str | None = None,
+        status: MatterStatus | None = None,
+        kind: MatterKind | None = None,
     ) -> tuple[Matter, ...]:
         """Keyset list of the tenant's Matters newest first (created_at, id).
 
         ``before_id`` anchors the previous page's last item; a cursor that is
         not in this tenant raises a NotFound-style marker via None return
-        semantics of the caller.
+        semantics of the caller. Optional title/status/kind filters narrow the
+        result before ordering and pagination.
         """
         _require_context(context)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("matter list limit must be between 1 and 100")
+        if title is not None and (
+            not isinstance(title, str) or not title.strip()
+        ):
+            raise ValueError("matter list title filter must be non-blank text")
+        if status is not None and not isinstance(status, MatterStatus):
+            raise ValueError("matter list status filter must be strongly typed")
+        if kind is not None and not isinstance(kind, MatterKind):
+            raise ValueError("matter list kind filter must be strongly typed")
         statement = select(TenantMatterModel).where(
             TenantMatterModel.tenant_id == context.tenant_id
         )
+        if title is not None:
+            statement = statement.where(
+                TenantMatterModel.title.contains(title.strip())
+            )
+        if status is not None:
+            statement = statement.where(TenantMatterModel.status == status.value)
+        if kind is not None:
+            statement = statement.where(TenantMatterModel.kind == kind.value)
         if before_id is not None:
             require_uuid7(before_id, field="before_id")
             anchor = await self._session.scalar(

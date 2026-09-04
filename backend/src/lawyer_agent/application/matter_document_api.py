@@ -31,6 +31,7 @@ from lawyer_agent.application.idempotency import (
 )
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.matter_documents import (
+    MAX_MATTER_TITLE_CHARS,
     DocumentHeader,
     DocumentVersion,
     Matter,
@@ -97,6 +98,9 @@ class MatterStorePort(Protocol):
         *,
         limit: int,
         before_id: UUID | None = None,
+        title: str | None = None,
+        status: MatterStatus | None = None,
+        kind: MatterKind | None = None,
     ) -> tuple[Matter, ...]: ...
 
     async def create_matter(
@@ -330,11 +334,33 @@ class MatterDocumentHttpService:
         context: TenantContext,
         limit: int,
         before_id: UUID | None = None,
+        title: str | None = None,
+        status: str | None = None,
+        kind: str | None = None,
     ) -> tuple[Matter, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise MatterDocumentInvalidRequest
         if before_id is not None:
             require_uuid7(before_id, field="before_id")
+        stripped_title: str | None = None
+        if title is not None:
+            if not isinstance(title, str) or not title.strip():
+                raise MatterDocumentInvalidRequest
+            if len(title.strip()) > MAX_MATTER_TITLE_CHARS:
+                raise MatterDocumentInvalidRequest
+            stripped_title = title.strip()
+        parsed_status: MatterStatus | None = None
+        if status is not None:
+            try:
+                parsed_status = MatterStatus(status)
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+        parsed_kind: MatterKind | None = None
+        if kind is not None:
+            try:
+                parsed_kind = MatterKind(kind)
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
         async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
             from lawyer_agent.infrastructure.persistence.repositories.matters import (
                 MatterListCursorInvalid,
@@ -345,6 +371,9 @@ class MatterDocumentHttpService:
                     context,
                     limit=limit,
                     before_id=before_id,
+                    title=stripped_title,
+                    status=parsed_status,
+                    kind=parsed_kind,
                 )
             except MatterListCursorInvalid as exc:
                 raise MatterDocumentNotFound from exc
