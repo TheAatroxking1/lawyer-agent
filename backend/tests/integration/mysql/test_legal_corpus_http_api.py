@@ -301,6 +301,24 @@ def test_legal_corpus_read_http_over_real_mysql(migrated_mysql_url: URL) -> None
             == "legal_corpus_instrument_not_found"
         )
 
+        # 5d. A single version is readable directly by id.
+        version_by_id = client.get(
+            f"{base}/versions/{version_new}", headers=headers
+        )
+        assert version_by_id.status_code == 200, version_by_id.text
+        assert version_by_id.json()["id"] == str(version_new)
+        assert version_by_id.json()["version_label"] == "2024 修正"
+        assert version_by_id.json()["status"] == "current"
+        assert version_by_id.json()["dataset_version"] == "dataset_v1"
+        assert version_by_id.json()["instrument_id"] == str(instrument_id)
+        unknown_version = client.get(
+            f"{base}/versions/{new_uuid7()}", headers=headers
+        )
+        assert unknown_version.status_code == 404
+        assert unknown_version.json()["code"] == "legal_corpus_version_not_found"
+        unauth_version = client.get(f"{base}/versions/{version_new}")
+        assert unauth_version.status_code == 401
+
         # 6. Unauthenticated -> 401.
         unauth = client.get(
             f"{base}/versions/{version_new}/provisions",
