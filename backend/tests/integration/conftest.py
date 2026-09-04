@@ -16,7 +16,7 @@ _TEST_DATABASE_PATTERN = re.compile(r"^lawyer_test_[a-f0-9]{32}$")
 
 
 def _compose_mysql_password() -> str:
-    env_path = Path(__file__).parents[4] / "deploy" / ".env"
+    env_path = Path(__file__).parents[3] / "deploy" / ".env"
     if not env_path.is_file():
         pytest.skip("deploy/.env is required unless LAWYER_TEST_MYSQL_ADMIN_URL is set")
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
@@ -55,6 +55,7 @@ async def _execute_admin(statement: str) -> None:
 
 @pytest.fixture(scope="session")
 def mysql_url() -> Iterator[URL]:
+    """Disposable MySQL database shared by every integration test directory."""
     database_name = f"lawyer_test_{uuid4().hex}"
     if not _TEST_DATABASE_PATTERN.fullmatch(database_name):
         raise RuntimeError("refusing to manage an unexpected database name")

@@ -42,6 +42,7 @@ packages = ["src/lawyer_agent"]
 addopts = "-ra --strict-markers --strict-config"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["tests/integration/mysql", "tests/integration/rabbitmq"]
 markers = [
   "integration: requires an external infrastructure service",
   "mysql: requires a disposable MySQL database",

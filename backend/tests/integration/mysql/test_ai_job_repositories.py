@@ -234,3 +234,99 @@ def test_claim_due_job_creates_attempt_and_leases(mysql_url) -> None:
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     asyncio.run(_run_claim_check(factory))
     asyncio.run(engine.dispose())
+
+
+def _placeholder_signature() -> str:
+    import base64
+
+    return "ed25519.dev." + base64.urlsafe_b64encode(b"x" * 64).decode("ascii").rstrip("=")
+
+
+def _placeholder_nonce() -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(b"n" * 16).decode("ascii").rstrip("=")
+
+
+def _fake_envelope_factory(candidate) -> object:
+    from lawyer_agent.domain.common import new_uuid7
+    from lawyer_agent.infrastructure.messaging.envelope import AIJobEnvelope
+
+    return AIJobEnvelope(
+        schema_version=1,
+        message_id=new_uuid7(),
+        job_id=candidate.job_id,
+        tenant_id=candidate.tenant_id,
+        correlation_id=candidate.correlation_id,
+        issued_at=_NOW + timedelta(seconds=5),
+        nonce=_placeholder_nonce(),
+        signature=_placeholder_signature(),
+    )
+
+
+async def _run_claim_reuse_check(factory: async_sessionmaker[AsyncSession]) -> None:
+    graph: JobGraph | None = None
+    try:
+        async with factory() as session:
+            graph = await _insert_graph(session)
+            # The claim test needs a fresh outbox without a generated envelope.
+            await session.execute(
+                update(AIJobOutboxModel)
+                .where(AIJobOutboxModel.job_id == graph.job_id)
+                .values(
+                    status="pending",
+                    message_id=None,
+                    nonce=None,
+                    signature=None,
+                    envelope_digest=None,
+                    correlation_id=new_uuid7(),
+                )
+            )
+            await session.commit()
+
+        claim_now = datetime.now(UTC)
+        async with SqlAlchemyAIJobUnitOfWork(factory) as uow:
+            claimed = await uow.runtime.claim_outbox_batch(  # type: ignore[attr-defined]
+                now=claim_now,
+                claim_expires_at=claim_now + timedelta(seconds=30),
+                worker_ref="publisher-1",
+                limit=10,
+                envelope_factory=_fake_envelope_factory,
+            )
+            assert len(claimed) == 1
+            first_message_id = claimed[0].envelope.message_id
+            first_digest = claimed[0].envelope_digest
+            assert first_message_id is not None and first_digest
+
+        # Expire the claim and reclaim: the envelope must be reused unchanged.
+        async with factory() as session:
+            await session.execute(
+                update(AIJobOutboxModel)
+                .where(AIJobOutboxModel.id == claimed[0].id)
+                .values(claim_expires_at=claim_now - timedelta(seconds=1))
+            )
+            await session.commit()
+
+        async with SqlAlchemyAIJobUnitOfWork(factory) as uow:
+            reclaimed = await uow.runtime.claim_outbox_batch(  # type: ignore[attr-defined]
+                now=claim_now + timedelta(seconds=31),
+                claim_expires_at=claim_now + timedelta(seconds=61),
+                worker_ref="publisher-2",
+                limit=10,
+                envelope_factory=_fake_envelope_factory,
+            )
+            assert len(reclaimed) == 1
+            assert reclaimed[0].envelope.message_id == first_message_id
+            assert reclaimed[0].envelope_digest == first_digest
+    finally:
+        async with factory() as session:
+            await _delete_graphs(session, (graph,) if graph is not None else ())
+
+
+def test_expired_publisher_claim_reuses_same_envelope(mysql_url) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    engine = create_async_engine(mysql_url.render_as_string(hide_password=False))
+    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    asyncio.run(_run_claim_reuse_check(factory))
+    asyncio.run(engine.dispose())

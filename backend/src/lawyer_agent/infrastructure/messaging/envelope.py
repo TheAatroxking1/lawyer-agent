@@ -91,3 +91,17 @@ def _canonical_datetime(value: datetime) -> str:
     if utc_value.microsecond == 0:
         return f"{utc_value:%Y-%m-%dT%H:%M:%S}Z"
     return f"{utc_value:%Y-%m-%dT%H:%M:%S.%f}Z"
+
+
+def envelope_to_json(envelope: AIJobEnvelope) -> dict[str, object]:
+    """The fixed eight-field wire representation of an envelope."""
+    return {
+        "schema_version": envelope.schema_version,
+        "message_id": str(envelope.message_id),
+        "job_id": str(envelope.job_id),
+        "tenant_id": str(envelope.tenant_id),
+        "correlation_id": str(envelope.correlation_id),
+        "issued_at": _canonical_datetime(envelope.issued_at),
+        "nonce": envelope.nonce,
+        "signature": envelope.signature,
+    }

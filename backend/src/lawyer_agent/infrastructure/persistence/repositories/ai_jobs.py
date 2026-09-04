@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -8,6 +8,13 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.application.ai_job_runtime import (
+    ClaimCandidate,
+    ClaimedOutbox,
+    EnvelopeFactory,
+    PublisherErrorCode,
+    envelope_digest,
+)
 from lawyer_agent.application.ai_jobs import (
     JOB_SCOPE_BY_ROLE,
     JobAuthoritySnapshot,
@@ -31,13 +38,14 @@ from lawyer_agent.domain.ai_jobs import (
     ReleaseState,
     RiskClass,
 )
-from lawyer_agent.domain.common import require_uuid7
+from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.domain.tenancy import (
     Membership,
     MembershipStatus,
     MemberType,
     TenantContext,
 )
+from lawyer_agent.infrastructure.messaging.envelope import AIJobEnvelope
 from lawyer_agent.infrastructure.persistence.models import (
     AIJobAccessGrantModel,
     AIJobAttemptModel,
@@ -111,6 +119,7 @@ class SqlAlchemyAIJobRepository:
                 event_type=graph.outbox.event_type,
                 routing_key=graph.outbox.routing_key,
                 schema_version=graph.outbox.schema_version,
+                correlation_id=graph.job.correlation_id,
                 available_at=_naive(graph.outbox.available_at),
             )
         )
@@ -277,6 +286,152 @@ class SqlAlchemyAIJobRepository:
         )
         return True
 
+    async def claim_outbox_batch(
+        self,
+        *,
+        now: datetime,
+        claim_expires_at: datetime,
+        worker_ref: str,
+        limit: int,
+        envelope_factory: EnvelopeFactory,
+    ) -> tuple[ClaimedOutbox, ...]:
+        now_naive = _naive(now)
+        claim_expires_naive = _naive(claim_expires_at)
+        models = (
+            await self._session.scalars(
+                select(AIJobOutboxModel)
+                .where(
+                    or_(
+                        and_(
+                            AIJobOutboxModel.status == "pending",
+                            AIJobOutboxModel.available_at <= now_naive,
+                        ),
+                        and_(
+                            AIJobOutboxModel.status == "publishing",
+                            AIJobOutboxModel.claim_expires_at < now_naive,
+                        ),
+                    )
+                )
+                .order_by(AIJobOutboxModel.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        claimed: list[ClaimedOutbox] = []
+        for model in models:
+            if model.message_id is None:
+                if model.correlation_id is None:
+                    raise RuntimeError("outbox row is missing its correlation id")
+                envelope = envelope_factory(
+                    ClaimCandidate(
+                        tenant_id=model.tenant_id,
+                        job_id=model.job_id,
+                        correlation_id=model.correlation_id,
+                        schema_version=model.schema_version,
+                    )
+                )
+                model.message_id = envelope.message_id
+                model.nonce = envelope.nonce
+                model.issued_at = _naive(envelope.issued_at)
+                model.signature = envelope.signature
+                model.envelope_digest = envelope_digest(envelope)
+            model.status = "publishing"
+            model.claim_owner = worker_ref
+            model.claim_token = new_uuid7()
+            model.claim_fence = (model.claim_fence or 0) + 1
+            model.claim_expires_at = claim_expires_naive
+            model.publish_attempt_count = (model.publish_attempt_count or 0) + 1
+            model.version = model.version + 1
+            claimed.append(_claimed_outbox(model))
+        await self._session.flush()
+        return tuple(claimed)
+
+    async def mark_published(
+        self,
+        claim: ClaimedOutbox,
+        *,
+        now: datetime,
+    ) -> bool:
+        changed = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobOutboxModel)
+                .where(
+                    AIJobOutboxModel.id == claim.id,
+                    AIJobOutboxModel.claim_token == claim.claim_token,
+                    AIJobOutboxModel.claim_fence == claim.claim_fence,
+                    AIJobOutboxModel.version == claim.version,
+                    AIJobOutboxModel.status == "publishing",
+                )
+                .values(
+                    status="published",
+                    published_at=_naive(now),
+                    confirmed_at=_naive(now),
+                    version=AIJobOutboxModel.version + 1,
+                )
+            ),
+        )
+        return changed.rowcount == 1
+
+    async def release_or_block(
+        self,
+        claim: ClaimedOutbox,
+        error_code: PublisherErrorCode,
+        *,
+        now: datetime,
+    ) -> bool:
+        if not isinstance(error_code, PublisherErrorCode):
+            raise ValueError("publisher error code must be strongly typed")
+        exhausted = claim.publish_attempt_count >= claim.max_publish_attempts
+        if exhausted:
+            changed = cast(
+                CursorResult[Any],
+                await self._session.execute(
+                    update(AIJobOutboxModel)
+                    .where(
+                        AIJobOutboxModel.id == claim.id,
+                        AIJobOutboxModel.claim_token == claim.claim_token,
+                        AIJobOutboxModel.claim_fence == claim.claim_fence,
+                        AIJobOutboxModel.version == claim.version,
+                        AIJobOutboxModel.status == "publishing",
+                    )
+                    .values(
+                        status="blocked",
+                        last_error_code=error_code.value,
+                        claim_owner=None,
+                        claim_token=None,
+                        claim_fence=None,
+                        claim_expires_at=None,
+                        version=AIJobOutboxModel.version + 1,
+                    )
+                ),
+            )
+            return changed.rowcount == 1
+        changed = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobOutboxModel)
+                .where(
+                    AIJobOutboxModel.id == claim.id,
+                    AIJobOutboxModel.claim_token == claim.claim_token,
+                    AIJobOutboxModel.claim_fence == claim.claim_fence,
+                    AIJobOutboxModel.version == claim.version,
+                    AIJobOutboxModel.status == "publishing",
+                )
+                .values(
+                    status="pending",
+                    last_error_code=error_code.value,
+                    claim_owner=None,
+                    claim_token=None,
+                    claim_fence=None,
+                    claim_expires_at=None,
+                    available_at=_naive(now + timedelta(seconds=5)),
+                    version=AIJobOutboxModel.version + 1,
+                )
+            ),
+        )
+        return changed.rowcount == 1
+
 
 def _job(model: AIJobModel) -> AIJob:
     return AIJob(
@@ -368,6 +523,43 @@ def _access(model: AIJobAccessGrantModel) -> JobAccess:
         access_level=model.access_level,
         generation=model.generation,
         revoked_at=_aware_optional(model.revoked_at),
+    )
+
+
+def _claimed_outbox(model: AIJobOutboxModel) -> ClaimedOutbox:
+    if (
+        model.message_id is None
+        or model.correlation_id is None
+        or model.nonce is None
+        or model.signature is None
+        or model.issued_at is None
+        or model.claim_token is None
+        or model.claim_fence is None
+        or model.envelope_digest is None
+    ):
+        raise RuntimeError("claimed outbox envelope is incomplete")
+    envelope = AIJobEnvelope(
+        schema_version=cast(Any, model.schema_version),
+        message_id=model.message_id,
+        job_id=model.job_id,
+        tenant_id=model.tenant_id,
+        correlation_id=model.correlation_id,
+        issued_at=_aware(model.issued_at),
+        nonce=model.nonce,
+        signature=model.signature,
+    )
+    return ClaimedOutbox(
+        id=model.id,
+        tenant_id=model.tenant_id,
+        job_id=model.job_id,
+        routing_key=model.routing_key,
+        envelope=envelope,
+        envelope_digest=bytes(model.envelope_digest),
+        claim_token=model.claim_token,
+        claim_fence=model.claim_fence,
+        version=model.version,
+        publish_attempt_count=model.publish_attempt_count,
+        max_publish_attempts=model.max_publish_attempts,
     )
 
 
