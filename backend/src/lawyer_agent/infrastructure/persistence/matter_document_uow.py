@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lawyer_agent.application.documents import DocumentUploadService
 from lawyer_agent.infrastructure.objects.object_store import LocalObjectStorePlaceholder
+from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 from lawyer_agent.infrastructure.persistence.repositories.documents import (
     SqlAlchemyDocumentRepository,
 )
@@ -24,6 +25,7 @@ class SqlAlchemyMatterDocumentUnitOfWork:
         self.matters: SqlAlchemyMatterRepository
         self.documents: SqlAlchemyDocumentRepository
         self.upload: DocumentUploadService
+        self.audit: AuditRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -34,6 +36,7 @@ class SqlAlchemyMatterDocumentUnitOfWork:
         self.upload = DocumentUploadService(
             LocalObjectStorePlaceholder(), self.documents
         )
+        self.audit = AuditRepository(self._session)
         return self
 
     async def __aexit__(

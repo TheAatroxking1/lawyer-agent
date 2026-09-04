@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
-from lawyer_agent.domain.common import require_uuid7
+from lawyer_agent.domain.common import new_uuid7, require_uuid7
 
 _BOOTSTRAP_ACTIONS = frozenset({"platform_admin.bootstrap"})
 _GLOBAL_MAINTENANCE_ACTIONS = frozenset({"invitation.blind_index_legacy_reconcile"})
@@ -17,6 +17,10 @@ _TENANT_USER_PREFIXES = (
     "role.",
     "invitation.",
     "ai_job.",
+    "risk_issue.",
+    "document.",
+    "rule_pack.",
+    "matter.",
 )
 _GLOBAL_USER_PREFIXES = ("identity.", "credential.", "account.")
 _ANONYMOUS_ACTIONS = frozenset({"identity.authenticate", "identity.register"})
@@ -270,6 +274,38 @@ def _validate_action_allowlist(event: StructuredAuditEvent) -> None:
 
 class StructuredAuditRepositoryPort(Protocol):
     async def append_structured(self, event: StructuredAuditEvent) -> None: ...
+
+
+def new_tenant_user_audit_event(
+    *,
+    tenant_id: UUID,
+    actor_user_id: UUID,
+    actor_membership_id: UUID,
+    action: str,
+    reason_code: str,
+    trace_id: str,
+    target_type: str | None = None,
+    target_id: UUID | None = None,
+    result: str = "success",
+    occurred_at: datetime | None = None,
+) -> StructuredAuditEvent:
+    """Build a TENANT_USER structured audit event for a tenant write action."""
+    if result not in {"success", "failure", "denied"}:
+        raise StructuredAuditError("audit result is invalid")
+    return StructuredAuditEvent(
+        id=new_uuid7(),
+        actor_kind=AuditActorKind.TENANT_USER,
+        tenant_id=tenant_id,
+        actor_user_id=actor_user_id,
+        actor_membership_id=actor_membership_id,
+        action=action,
+        result=result,
+        reason_code=reason_code,
+        trace_id=trace_id,
+        target_type=target_type,
+        target_id=target_id,
+        occurred_at=occurred_at or datetime.now(UTC),
+    )
 
 
 def _require_utc(value: object, name: str) -> None:

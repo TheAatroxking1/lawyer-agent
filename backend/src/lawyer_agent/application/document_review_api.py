@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Protocol, cast
 from uuid import UUID
 
+from lawyer_agent.application.audit import new_tenant_user_audit_event
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.document_review import (
     InvalidReviewDecision,
@@ -80,11 +81,12 @@ class DocumentReviewHttpService:
         version_no: int,
         decision: ReviewDecision,
         reason: str | None,
+        trace_id: str | None = None,
     ) -> DocumentVersion:
         require_uuid7(document_id, field="document_id")
         async with cast(DocumentReviewUnitOfWorkPort, self._uow_factory()) as uow:
             try:
-                return await uow.documents.review_document_version(
+                version = await uow.documents.review_document_version(
                     tenant_id=context.tenant_id,
                     document_id=document_id,
                     version_no=version_no,
@@ -93,6 +95,45 @@ class DocumentReviewHttpService:
                 )
             except ValueError as exc:
                 raise _map_domain_error(exc) from exc
+            await _append_audit(
+                uow,
+                context=context,
+                action="document.review",
+                reason_code="reviewed",
+                target_type="document_version",
+                target_id=version.id,
+                trace_id=trace_id,
+            )
+            return version
+
+
+async def _append_audit(
+    uow: object,
+    *,
+    context: TenantContext,
+    action: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    audit = getattr(uow, "audit", None)
+    user_id = context.membership_user_id
+    membership_id = context.membership_id
+    if audit is None or user_id is None or membership_id is None:
+        return
+    event = new_tenant_user_audit_event(
+        tenant_id=context.tenant_id,
+        actor_user_id=user_id,
+        actor_membership_id=membership_id,
+        action=action,
+        reason_code=reason_code,
+        trace_id=trace_id or "http",
+        target_type=target_type,
+        target_id=target_id,
+        result="success",
+    )
+    await audit.append_structured(event)
 
 
 def _map_domain_error(exc: ValueError) -> DocumentReviewError:

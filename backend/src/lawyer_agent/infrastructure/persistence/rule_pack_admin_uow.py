@@ -5,6 +5,7 @@ from typing import Self
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 from lawyer_agent.infrastructure.persistence.repositories.rule_pack import (
     SqlAlchemyRulePackRepository,
 )
@@ -17,12 +18,14 @@ class SqlAlchemyRulePackAdminUnitOfWork:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
         self.rule_pack: SqlAlchemyRulePackRepository
+        self.audit: AuditRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
             raise RuntimeError("unit of work is already active")
         self._session = self._session_factory()
         self.rule_pack = SqlAlchemyRulePackRepository(self._session)
+        self.audit = AuditRepository(self._session)
         return self
 
     async def __aexit__(

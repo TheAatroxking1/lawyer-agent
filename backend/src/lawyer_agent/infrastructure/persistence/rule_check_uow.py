@@ -5,6 +5,7 @@ from typing import Self
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 from lawyer_agent.infrastructure.persistence.repositories.documents import (
     SqlAlchemyDocumentRepository,
 )
@@ -21,6 +22,7 @@ class SqlAlchemyRuleCheckUnitOfWork:
         self._session: AsyncSession | None = None
         self.rule_check: SqlAlchemyRulePackRepository
         self.documents: SqlAlchemyDocumentRepository
+        self.audit: AuditRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -28,6 +30,7 @@ class SqlAlchemyRuleCheckUnitOfWork:
         self._session = self._session_factory()
         self.rule_check = SqlAlchemyRulePackRepository(self._session)
         self.documents = SqlAlchemyDocumentRepository(self._session)
+        self.audit = AuditRepository(self._session)
         return self
 
     async def __aexit__(

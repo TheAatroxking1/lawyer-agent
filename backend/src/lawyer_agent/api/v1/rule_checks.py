@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import Field, field_validator
 
 from lawyer_agent.api.dependencies import (
@@ -153,6 +153,7 @@ async def dispose_risk_issue(
     body: DispositionBody,
     actor: TenantActorDependency,
     services: Services,
+    request: Request,
 ) -> RiskIssueSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -164,6 +165,7 @@ async def dispose_risk_issue(
             status=RiskIssueStatus(body.status),
             reason=body.reason,
             now=datetime.now(UTC),
+            trace_id=getattr(request.state, "trace_id", None),
         )
     except (RuleCheckIssueNotFound, RuleCheckDocumentNotFound) as exc:
         raise _map_error(exc) from None

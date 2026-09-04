@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import Field, field_validator
 
 from lawyer_agent.api.dependencies import (
@@ -188,12 +188,17 @@ async def activate_rule_pack(
     pack_id: UUID,
     actor: TenantActorDependency,
     services: Services,
+    request: Request,
 ) -> RulePackSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
     service = _require_service(services)
     try:
-        pack = await service.activate_pack(context=actor.context, pack_id=pack_id)
+        pack = await service.activate_pack(
+            context=actor.context,
+            pack_id=pack_id,
+            trace_id=getattr(request.state, "trace_id", None),
+        )
     except (RulePackAdminNotFound, RulePackAdminConflict) as exc:
         raise _map_error(exc) from None
     return _pack_summary(pack)

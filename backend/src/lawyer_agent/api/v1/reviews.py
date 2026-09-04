@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import Field
 
 from lawyer_agent.api.dependencies import (
@@ -62,6 +62,7 @@ async def apply_document_review(
     actor: TenantActorDependency,
     services: Services,
     response: Response,
+    request: Request,
 ) -> DocumentReviewResponse:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -73,6 +74,7 @@ async def apply_document_review(
             version_no=version_no,
             decision=ReviewDecision(body.decision),
             reason=body.reason,
+            trace_id=getattr(request.state, "trace_id", None),
         )
     except DocumentReviewNotFound as exc:
         raise _map_error(exc) from None

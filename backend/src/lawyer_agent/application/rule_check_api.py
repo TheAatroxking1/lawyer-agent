@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+from lawyer_agent.application.audit import new_tenant_user_audit_event
 from lawyer_agent.application.report_export import (
     ReportDocumentPort,
     RiskReportService,
@@ -139,6 +140,7 @@ class RuleCheckHttpService:
         status: RiskIssueStatus,
         reason: str,
         now: datetime,
+        trace_id: str | None = None,
     ) -> RiskIssue:
         require_uuid7(issue_id, field="issue_id")
         async with cast(RuleCheckUnitOfWorkPort, self._uow_factory()) as uow:
@@ -163,6 +165,16 @@ class RuleCheckHttpService:
                 raise RuleCheckInvalidRequest from exc
             if not disposed:
                 raise RuleCheckConflict
+            await _append_tenant_audit(
+                uow,
+                context=context,
+                action="risk_issue.dispose",
+                reason_code="disposed",
+                target_type="risk_issue",
+                target_id=issue_id,
+                trace_id=trace_id,
+                now=now,
+            )
             # Project the committed disposition without relying on a second read.
             return dispose_risk_issue(
                 issue=issue,
@@ -199,3 +211,37 @@ class RuleCheckHttpService:
     ) -> None:
         if not await uow.documents.document_exists(tenant_id, document_id):
             raise RuleCheckDocumentNotFound
+
+
+async def _append_tenant_audit(
+    uow: Any,
+    *,
+    context: TenantScoped,
+    action: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+    now: datetime,
+) -> None:
+    audit = getattr(uow, "audit", None)
+    user_id = getattr(context, "membership_user_id", None)
+    membership_id = getattr(context, "membership_id", None)
+    if audit is None or user_id is None or membership_id is None:
+        return
+    if trace_id is None:
+        trace_id = "http"
+    await audit.append_structured(
+        new_tenant_user_audit_event(
+            tenant_id=context.tenant_id,
+            actor_user_id=user_id,
+            actor_membership_id=membership_id,
+            action=action,
+            reason_code=reason_code,
+            trace_id=trace_id,
+            target_type=target_type,
+            target_id=target_id,
+            result="success",
+            occurred_at=now,
+        )
+    )
