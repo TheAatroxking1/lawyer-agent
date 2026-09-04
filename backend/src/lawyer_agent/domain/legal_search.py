@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
+from uuid import UUID
 
 from lawyer_agent.domain.common import require_uuid7
 
@@ -12,9 +13,9 @@ from lawyer_agent.domain.common import require_uuid7
 class LegalSearchHit:
     """One BM25 hit mapped back to its corpus chunk and parent provision."""
 
-    chunk_id: object
-    provision_id: object
-    version_id: object
+    chunk_id: UUID
+    provision_id: UUID
+    version_id: UUID
     score: float
 
     def __post_init__(self) -> None:

@@ -176,6 +176,23 @@ class SqlAlchemyLegalCorpusRepository:
         )
         return tuple(_to_provision(model) for model in rows)
 
+    async def version_with_instrument(
+        self, version_id: UUID
+    ) -> tuple[LegalVersion, LegalInstrument] | None:
+        row = (
+            await self._session.execute(
+                select(LegalVersionModel, LegalInstrumentModel)
+                .join(
+                    LegalInstrumentModel,
+                    LegalVersionModel.instrument_id == LegalInstrumentModel.id,
+                )
+                .where(LegalVersionModel.id == version_id)
+            )
+        ).first()
+        if row is None:
+            return None
+        return _to_version(row[0]), _to_instrument(row[1])
+
 
 class SqlAlchemyLegalCorpusChunkRepository:
     """Derived chunk rows; fully replaceable per version (re-index friendly)."""
