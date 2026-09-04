@@ -94,6 +94,7 @@ class ApplicationServices:
     ai_jobs: Any = None
     rule_check_http: Any = None
     matter_document_http: Any = None
+    document_review_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -224,6 +225,7 @@ async def application_services(
         ai_jobs=_build_ai_job_service(session_factory, idempotency),
         rule_check_http=_build_rule_check_http_service(session_factory),
         matter_document_http=_build_matter_document_http_service(session_factory),
+        document_review_http=_build_document_review_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -277,6 +279,20 @@ def _build_matter_document_http_service(session_factory: Any) -> Any:
     )
 
     return MatterDocumentHttpService(
+        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
+    )
+
+
+def _build_document_review_http_service(session_factory: Any) -> Any:
+    """Composition root for the Document Review HTTP service."""
+    from lawyer_agent.application.document_review_api import (
+        DocumentReviewHttpService,
+    )
+    from lawyer_agent.infrastructure.persistence.matter_document_uow import (
+        SqlAlchemyMatterDocumentUnitOfWork,
+    )
+
+    return DocumentReviewHttpService(
         lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
     )
 
