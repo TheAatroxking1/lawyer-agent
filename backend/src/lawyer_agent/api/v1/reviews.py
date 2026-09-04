@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Header, Request, Response
 from pydantic import Field
 
 from lawyer_agent.api.dependencies import (
@@ -63,6 +63,7 @@ async def apply_document_review(
     services: Services,
     response: Response,
     request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> DocumentReviewResponse:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -74,6 +75,7 @@ async def apply_document_review(
             version_no=version_no,
             decision=ReviewDecision(body.decision),
             reason=body.reason,
+            idempotency_key=idempotency_key,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except DocumentReviewNotFound as exc:

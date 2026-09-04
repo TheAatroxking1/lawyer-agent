@@ -7,10 +7,21 @@ the tenant context. Every read/write stays tenant-scoped.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Protocol, cast
 from uuid import UUID
 
 from lawyer_agent.application.audit import new_tenant_user_audit_event
+from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
+    IdempotencyRepositoryPort,
+    IdempotencyRequest,
+    IdempotencyReservation,
+    IdempotencyResultReference,
+    IdempotencyScope,
+    IdempotencyScopeType,
+    IdempotencyService,
+)
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.document_review import (
     InvalidReviewDecision,
@@ -19,6 +30,12 @@ from lawyer_agent.domain.document_review import (
 )
 from lawyer_agent.domain.matter_documents import DocumentVersion
 from lawyer_agent.domain.tenancy import TenantContext
+
+_REVIEW_OPERATION = "document.review"
+_REVIEW_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/documents/{document_id}/versions/{version_no}/review"
+)
+_REVIEW_RESULT_TYPE = "document_version"
 
 
 class DocumentReviewError(Exception):
@@ -56,9 +73,17 @@ class DocumentReviewStorePort(Protocol):
         reason: str | None,
     ) -> DocumentVersion: ...
 
+    async def find_version(
+        self,
+        tenant_id: UUID,
+        document_id: UUID,
+        version_no: int,
+    ) -> DocumentVersion | None: ...
+
 
 class DocumentReviewUnitOfWorkPort(Protocol):
     documents: DocumentReviewStorePort
+    idempotency: IdempotencyRepositoryPort
 
     async def __aenter__(self) -> DocumentReviewUnitOfWorkPort: ...
 
@@ -68,10 +93,17 @@ class DocumentReviewUnitOfWorkPort(Protocol):
 class DocumentReviewHttpService:
     """Composition facade used by the tenant HTTP endpoint."""
 
-    def __init__(self, uow_factory: Callable[[], object]) -> None:
+    def __init__(
+        self,
+        uow_factory: Callable[[], object],
+        idempotency: IdempotencyService | None = None,
+    ) -> None:
         if not callable(uow_factory):
             raise ValueError("document review http service requires a unit of work factory")
+        if idempotency is not None and not isinstance(idempotency, IdempotencyService):
+            raise ValueError("document review service requires an idempotency service")
         self._uow_factory = uow_factory
+        self._idempotency = idempotency
 
     async def apply_review(
         self,
@@ -81,11 +113,35 @@ class DocumentReviewHttpService:
         version_no: int,
         decision: ReviewDecision,
         reason: str | None,
+        idempotency_key: str | None = None,
         trace_id: str | None = None,
+        now: datetime | None = None,
     ) -> DocumentVersion:
         require_uuid7(document_id, field="document_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         try:
             async with cast(DocumentReviewUnitOfWorkPort, self._uow_factory()) as uow:
+                if idempotency_key and self._idempotency is not None:
+                    reservation = await self._reserve_review(
+                        uow,
+                        context=context,
+                        document_id=document_id,
+                        version_no=version_no,
+                        decision=decision,
+                        reason=reason,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.is_replay:
+                        assert reservation.replay is not None
+                        version = await uow.documents.find_version(
+                            context.tenant_id, document_id, version_no
+                        )
+                        if version is None:
+                            raise DocumentReviewConflict
+                        return version
                 try:
                     version = await uow.documents.review_document_version(
                         tenant_id=context.tenant_id,
@@ -96,6 +152,17 @@ class DocumentReviewHttpService:
                     )
                 except ValueError as exc:
                     raise _map_domain_error(exc) from exc
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    assert membership_id is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(
+                            _REVIEW_RESULT_TYPE, version.id
+                        ),
+                        now=effective_now,
+                    )
                 await _append_audit(
                     uow,
                     context=context,
@@ -142,6 +209,54 @@ class DocumentReviewHttpService:
                 trace_id=trace_id,
             )
             raise
+
+    async def _reserve_review(
+        self,
+        uow: DocumentReviewUnitOfWorkPort,
+        *,
+        context: TenantContext,
+        document_id: UUID,
+        version_no: int,
+        decision: ReviewDecision,
+        reason: str | None,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        membership_id = context.membership_id
+        if membership_id is None:
+            raise DocumentReviewConflict
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=context.tenant_id,
+            ),
+            operation=_REVIEW_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_REVIEW_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "document_id": str(document_id),
+                        "version_no": version_no,
+                        "decision": decision.value,
+                        "reason": reason,
+                    },
+                    business_paths=frozenset(
+                        {
+                            ("document_id",),
+                            ("version_no",),
+                            ("decision",),
+                            ("reason",),
+                        }
+                    ),
+                ),
+            ),
+            now=now,
+        )
 
 
 async def _append_rejected_audit(

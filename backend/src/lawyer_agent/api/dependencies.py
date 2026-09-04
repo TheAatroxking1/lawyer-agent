@@ -230,7 +230,9 @@ async def application_services(
         matter_document_http=_build_matter_document_http_service(
             session_factory, idempotency
         ),
-        document_review_http=_build_document_review_http_service(session_factory),
+        document_review_http=_build_document_review_http_service(
+            session_factory, idempotency
+        ),
         rule_pack_admin_http=_build_rule_pack_admin_http_service(
             session_factory, idempotency
         ),
@@ -296,7 +298,9 @@ def _build_matter_document_http_service(
     )
 
 
-def _build_document_review_http_service(session_factory: Any) -> Any:
+def _build_document_review_http_service(
+    session_factory: Any, idempotency: IdempotencyService | None = None
+) -> Any:
     """Composition root for the Document Review HTTP service."""
     from lawyer_agent.application.document_review_api import (
         DocumentReviewHttpService,
@@ -306,7 +310,8 @@ def _build_document_review_http_service(session_factory: Any) -> Any:
     )
 
     return DocumentReviewHttpService(
-        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
+        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory),
+        idempotency=idempotency,
     )
 
 
