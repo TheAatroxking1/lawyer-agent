@@ -118,6 +118,64 @@ class OpenSearchRestClient:
             if response.status_code not in (200, 404):
                 await self._raise(response)
 
+    async def index_exists(self, index_name: str) -> bool:
+        """Whether a concrete index exists (used before alias pointing)."""
+        async with self._client() as client:
+            response = await client.head(f"/{index_name}")
+            if response.status_code == 200:
+                return True
+            if response.status_code == 404:
+                return False
+            await self._raise(response)
+            return False  # pragma: no cover - _raise always raises
+
+    async def resolve_alias(self, alias: str) -> str | None:
+        """Return the single index the alias points at, or None when absent."""
+        async with self._client() as client:
+            response = await client.get(f"/_alias/{alias}")
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                await self._raise(response)
+        targets = {key for key in response.json() if isinstance(key, str)}
+        if len(targets) > 1:
+            raise OpenSearchError(
+                f"alias {alias} points at multiple indices: {sorted(targets)}"
+            )
+        return next(iter(targets), None)
+
+    async def point_alias(self, alias: str, index_name: str) -> str | None:
+        """Atomically point the alias at one index; returns the previous target.
+
+        No-op when the alias already points at ``index_name``. Switching is a
+        single ``POST /_aliases`` (remove old target + add new target) so a
+        reader never observes a dangling alias.
+        """
+        previous = await self.resolve_alias(alias)
+        if previous == index_name:
+            return previous
+        actions: list[dict[str, Any]] = []
+        if previous is not None:
+            actions.append(
+                {"remove": {"index": previous, "alias": alias}}
+            )
+        actions.append({"add": {"index": index_name, "alias": alias}})
+        async with self._client() as client:
+            response = await client.post("/_aliases", json={"actions": actions})
+            if response.status_code != 200:
+                await self._raise(response)
+        return previous
+
+    async def drop_alias(self, alias: str) -> None:
+        """Remove the alias; absent aliases are an idempotent no-op."""
+        target = await self.resolve_alias(alias)
+        if target is None:
+            return
+        async with self._client() as client:
+            response = await client.delete(f"/{target}/_alias/{alias}")
+            if response.status_code not in (200, 404):
+                await self._raise(response)
+
     async def replace_documents(
         self,
         index_name: str,
