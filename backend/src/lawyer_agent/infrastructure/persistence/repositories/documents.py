@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.matter_documents import (
+    DocumentHeader,
     DocumentKind,
     DocumentUploadStatus,
     DocumentVersion,
@@ -50,6 +51,29 @@ class SqlAlchemyDocumentRepository:
             )
         )
         return model is not None
+
+    async def headers_for_matter(
+        self, tenant_id: UUID, matter_id: UUID
+    ) -> tuple[DocumentHeader, ...]:
+        rows = await self._session.scalars(
+            select(TenantDocumentModel)
+            .where(
+                TenantDocumentModel.tenant_id == tenant_id,
+                TenantDocumentModel.matter_id == matter_id,
+            )
+            .order_by(TenantDocumentModel.created_at)
+        )
+        return tuple(
+            DocumentHeader(
+                id=row.id,
+                tenant_id=row.tenant_id,
+                matter_id=row.matter_id,
+                display_name=row.display_name,
+                current_version_no=row.current_version_no,
+                version=row.version,
+            )
+            for row in rows
+        )
 
     async def find_version(
         self, tenant_id: UUID, document_id: UUID

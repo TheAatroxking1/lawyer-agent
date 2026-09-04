@@ -124,6 +124,32 @@ class MatterParty:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentHeader:
+    """Tenant document header row (stable identity across versions)."""
+
+    id: UUID
+    tenant_id: UUID
+    matter_id: UUID
+    display_name: str
+    current_version_no: int
+    version: int
+
+    def __post_init__(self) -> None:
+        require_uuid7(self.id, field="document id")
+        require_uuid7(self.tenant_id, field="document tenant_id")
+        require_uuid7(self.matter_id, field="document matter_id")
+        if not isinstance(self.display_name, str) or not self.display_name.strip():
+            raise ValueError("document display name must be non-empty text")
+        if (
+            isinstance(self.current_version_no, bool)
+            or not isinstance(self.current_version_no, int)
+            or self.current_version_no < 0
+        ):
+            raise ValueError("document current_version_no must be a non-negative integer")
+        _require_positive_int(self.version, "document version")
+
+
+@dataclass(frozen=True, slots=True)
 class DocumentVersion:
     id: UUID
     tenant_id: UUID

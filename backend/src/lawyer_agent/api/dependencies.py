@@ -93,6 +93,7 @@ class ApplicationServices:
     accounts: AccountQueryPort
     ai_jobs: Any = None
     rule_check_http: Any = None
+    matter_document_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -222,6 +223,7 @@ async def application_services(
         ),
         ai_jobs=_build_ai_job_service(session_factory, idempotency),
         rule_check_http=_build_rule_check_http_service(session_factory),
+        matter_document_http=_build_matter_document_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -262,6 +264,20 @@ def _build_rule_check_http_service(session_factory: Any) -> Any:
 
     return RuleCheckHttpService(
         lambda: SqlAlchemyRuleCheckUnitOfWork(session_factory)
+    )
+
+
+def _build_matter_document_http_service(session_factory: Any) -> Any:
+    """Composition root for the tenant Matter/Document HTTP service."""
+    from lawyer_agent.application.matter_document_api import (
+        MatterDocumentHttpService,
+    )
+    from lawyer_agent.infrastructure.persistence.matter_document_uow import (
+        SqlAlchemyMatterDocumentUnitOfWork,
+    )
+
+    return MatterDocumentHttpService(
+        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
     )
 
 

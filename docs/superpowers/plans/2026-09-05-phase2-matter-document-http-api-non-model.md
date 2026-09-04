@@ -8,7 +8,7 @@
 - 不调用生成模型/Embedding；不做条款 AI、RAG、SSE、PDF。
 - 上传仍是「受管对象引用 + 元数据」：payload 经 API 校验哈希/MIME 后只登记 object_key/sha256，字节直传 MinIO（预签名分片直传）仍为延后切片；`.doc`/ZIP/病毒扫描/宏沙箱不在本计划。
 - 不新增 RBAC permission code：授权与 Rule Check API/既有切片一致——活跃成员 + 显式 tenant 上下文 + 资源 tenant 归属 + 跨租户反向；permission code 化归后续权限计划。
-- 审计事件登记、Review API 端点（状态机已存在服务层）不在本计划。
+- 审计事件登记、Review API 端点（状态机已存在服务层）、写操作 Idempotency-Key 化不在本计划（与既有 Matter/Document 服务一致，延后）。
 
 **Architecture:** API（严格 Pydantic）→ 应用/服务层（`MatterQueryPort`、`DocumentUploadService` 等既有组件）→ 仓储（均 tenant-scoped）。FastAPI `TenantActorDependency` 提供已校验 `TenantContext`；端点强制 path tenant 与 actor 一致（`require_path_tenant` 复用）；跨租户读取不可达（404 语义）。组合根复用 `ApplicationServices` 惰性 UoW 入口（新加 `matter_document_http`），每请求单 session/事务，模式与 Rule Check HTTP 一致。
 
