@@ -8,10 +8,21 @@ read/write stays inside the tenant context; there is no un-scoped ``get_by_id``.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Protocol, cast
 from uuid import UUID
 
 from lawyer_agent.application.audit import new_tenant_user_audit_event
+from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
+    IdempotencyRepositoryPort,
+    IdempotencyRequest,
+    IdempotencyReservation,
+    IdempotencyResultReference,
+    IdempotencyScope,
+    IdempotencyScopeType,
+    IdempotencyService,
+)
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.rule_pack import (
     RiskLevel,
@@ -21,6 +32,15 @@ from lawyer_agent.domain.rule_pack import (
 )
 from lawyer_agent.domain.rule_pack_management import build_pack_rule
 from lawyer_agent.domain.tenancy import TenantContext
+
+_PACK_CREATE_OPERATION = "rule_pack.create"
+_PACK_CREATE_ROUTE = "/api/v1/tenants/{tenant_id}/rule-packs"
+_PACK_RESULT_TYPE = "rule_pack.pack"
+_RULE_ADD_OPERATION = "rule_pack.add_rule"
+_RULE_ADD_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/rule-packs/{pack_id}/rules"
+)
+_RULE_RESULT_TYPE = "rule_pack.rule"
 
 
 class RulePackAdminError(Exception):
@@ -78,6 +98,7 @@ class RulePackAdminStorePort(Protocol):
 
 class RulePackAdminUnitOfWorkPort(Protocol):
     rule_pack: RulePackAdminStorePort
+    idempotency: IdempotencyRepositoryPort
 
     async def __aenter__(self) -> RulePackAdminUnitOfWorkPort: ...
 
@@ -87,17 +108,96 @@ class RulePackAdminUnitOfWorkPort(Protocol):
 class RulePackAdminHttpService:
     """Composition facade used by the tenant HTTP endpoints."""
 
-    def __init__(self, uow_factory: Callable[[], object]) -> None:
+    def __init__(
+        self,
+        uow_factory: Callable[[], object],
+        idempotency: IdempotencyService | None = None,
+    ) -> None:
         if not callable(uow_factory):
             raise ValueError("rule pack admin service requires a unit of work factory")
         self._uow_factory = uow_factory
+        self._idempotency = idempotency
 
-    async def create_pack(self, *, context: TenantContext, name: str) -> RulePack:
+    async def create_pack(
+        self,
+        *,
+        context: TenantContext,
+        name: str,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
+    ) -> RulePack:
+        user_id, membership_id = _actor_ids(context)
+        effective_now = now or datetime.now(UTC)
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
             try:
+                if idempotency_key and self._idempotency is not None:
+                    reservation = await self._reserve_pack_create(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        name=name,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.replay is not None:
+                        return await self._find_pack_by_id(
+                            uow, context, reservation.replay.result_id
+                        )
+                    created = await uow.rule_pack.create_pack(context, name=name)
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(
+                            _PACK_RESULT_TYPE, created.id
+                        ),
+                        now=effective_now,
+                    )
+                    return created
                 return await uow.rule_pack.create_pack(context, name=name)
             except ValueError as exc:
                 raise RulePackAdminInvalidRequest from exc
+
+    async def _reserve_pack_create(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        name: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_PACK_CREATE_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_PACK_CREATE_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={"name": name},
+                    business_paths=frozenset({("name",)}),
+                ),
+            ),
+            now=now,
+        )
+
+    async def _find_pack_by_id(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        context: TenantContext,
+        pack_id: UUID,
+    ) -> RulePack:
+        for pack in tuple(await uow.rule_pack.list_packs(context)):
+            if pack.id == pack_id:
+                return pack
+        raise RulePackAdminNotFound
 
     async def list_packs(self, *, context: TenantContext) -> tuple[RulePack, ...]:
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
@@ -113,11 +213,51 @@ class RulePackAdminHttpService:
         pattern: str,
         risk_level: RiskLevel,
         suggestion: str,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
     ) -> RulePackRule:
         require_uuid7(pack_id, field="pack_id")
+        user_id, membership_id = _actor_ids(context)
+        effective_now = now or datetime.now(UTC)
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
             await self._require_pack(uow, context, pack_id)
             try:
+                if idempotency_key and self._idempotency is not None:
+                    reservation = await self._reserve_rule_add(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        pack_id=pack_id,
+                        trigger_kind=trigger_kind,
+                        label=label,
+                        pattern=pattern,
+                        risk_level=risk_level,
+                        suggestion=suggestion,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.replay is not None:
+                        return await self._find_rule_by_id(
+                            uow, context, pack_id, reservation.replay.result_id
+                        )
+                    rule = build_pack_rule(
+                        tenant_id=context.tenant_id,
+                        pack_id=pack_id,
+                        trigger_kind=trigger_kind,
+                        label=label,
+                        pattern=pattern,
+                        risk_level=risk_level,
+                        suggestion=suggestion,
+                        enabled=True,
+                    )
+                    stored = await uow.rule_pack.add_rule(context, rule)
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(_RULE_RESULT_TYPE, stored.id),
+                        now=effective_now,
+                    )
+                    return stored
                 rule = build_pack_rule(
                     tenant_id=context.tenant_id,
                     pack_id=pack_id,
@@ -131,6 +271,69 @@ class RulePackAdminHttpService:
                 return await uow.rule_pack.add_rule(context, rule)
             except ValueError as exc:
                 raise RulePackAdminInvalidRequest from exc
+
+    async def _reserve_rule_add(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        pack_id: UUID,
+        trigger_kind: RuleTriggerKind,
+        label: str,
+        pattern: str,
+        risk_level: RiskLevel,
+        suggestion: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_RULE_ADD_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_RULE_ADD_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "trigger_kind": trigger_kind.value,
+                        "label": label,
+                        "pattern": pattern,
+                        "risk_level": risk_level.value,
+                        "suggestion": suggestion,
+                    },
+                    business_paths=frozenset(
+                        {
+                            ("trigger_kind",),
+                            ("label",),
+                            ("pattern",),
+                            ("risk_level",),
+                            ("suggestion",),
+                        }
+                    ),
+                ),
+            ),
+            now=now,
+        )
+
+    async def _find_rule_by_id(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        context: TenantContext,
+        pack_id: UUID,
+        rule_id: UUID,
+    ) -> RulePackRule:
+        rules = tuple(await uow.rule_pack.rules_for_pack(context, pack_id))
+        for rule in rules:
+            if rule.id == rule_id:
+                return rule
+        raise RulePackAdminNotFound
 
     async def set_rule_enabled(
         self,
@@ -214,3 +417,13 @@ async def _append_audit(
         result="success",
     )
     await audit.append_structured(event)
+
+
+def _actor_ids(context: TenantContext) -> tuple[UUID, UUID]:
+    user_id = context.membership_user_id
+    membership_id = context.membership_id
+    if user_id is None or membership_id is None:
+        raise RulePackAdminConflict
+    require_uuid7(user_id, field="actor user_id")
+    require_uuid7(membership_id, field="actor membership_id")
+    return user_id, membership_id

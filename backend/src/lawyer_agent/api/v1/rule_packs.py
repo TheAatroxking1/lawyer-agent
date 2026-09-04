@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Header, Request, Response
 from pydantic import Field, field_validator
 
 from lawyer_agent.api.dependencies import (
@@ -94,13 +94,16 @@ async def create_rule_pack(
     body: CreateRulePackBody,
     actor: TenantActorDependency,
     services: Services,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RulePackSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
     service = _require_service(services)
     try:
         pack = await service.create_pack(
-            context=actor.context, name=body.name.strip()
+            context=actor.context,
+            name=body.name.strip(),
+            idempotency_key=idempotency_key,
         )
     except RulePackAdminInvalidRequest as exc:
         raise _map_error(exc) from None
@@ -131,6 +134,7 @@ async def add_rule(
     body: RulePackRuleBody,
     actor: TenantActorDependency,
     services: Services,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RuleSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -144,6 +148,7 @@ async def add_rule(
             pattern=body.pattern,
             risk_level=RiskLevel(body.risk_level),
             suggestion=body.suggestion.strip(),
+            idempotency_key=idempotency_key,
         )
     except (RulePackAdminNotFound, RulePackAdminInvalidRequest) as exc:
         raise _map_error(exc) from None

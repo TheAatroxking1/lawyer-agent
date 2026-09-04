@@ -231,7 +231,9 @@ async def application_services(
             session_factory, idempotency
         ),
         document_review_http=_build_document_review_http_service(session_factory),
-        rule_pack_admin_http=_build_rule_pack_admin_http_service(session_factory),
+        rule_pack_admin_http=_build_rule_pack_admin_http_service(
+            session_factory, idempotency
+        ),
         audit_query_http=_build_audit_query_http_service(session_factory),
         legal_corpus_http=_build_legal_corpus_http_service(session_factory),
         invitation_delivery=delivery_capability,
@@ -308,7 +310,9 @@ def _build_document_review_http_service(session_factory: Any) -> Any:
     )
 
 
-def _build_rule_pack_admin_http_service(session_factory: Any) -> Any:
+def _build_rule_pack_admin_http_service(
+    session_factory: Any, idempotency: IdempotencyService | None = None
+) -> Any:
     """Composition root for the Rule Pack admin HTTP service."""
     from lawyer_agent.application.rule_pack_admin_api import (
         RulePackAdminHttpService,
@@ -318,7 +322,8 @@ def _build_rule_pack_admin_http_service(session_factory: Any) -> Any:
     )
 
     return RulePackAdminHttpService(
-        lambda: SqlAlchemyRulePackAdminUnitOfWork(session_factory)
+        lambda: SqlAlchemyRulePackAdminUnitOfWork(session_factory),
+        idempotency=idempotency,
     )
 
 
