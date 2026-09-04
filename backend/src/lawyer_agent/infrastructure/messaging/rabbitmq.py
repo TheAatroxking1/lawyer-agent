@@ -1,15 +1,120 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+
 import aio_pika
 import orjson
 
 from lawyer_agent.application.ai_job_runtime import (
+    DeliveryDecision,
     MessagePublisherPort,
     PublisherErrorCode,
     PublishReceipt,
 )
+from lawyer_agent.infrastructure.messaging.delivery import (
+    EnvelopeDeliveryCodec,
+    RawDelivery,
+    RejectDelivery,
+)
 from lawyer_agent.infrastructure.messaging.envelope import AIJobEnvelope, envelope_to_json
+from lawyer_agent.infrastructure.messaging.signing import (
+    EnvelopeSignatureError,
+    EnvelopeVerifier,
+)
 from lawyer_agent.infrastructure.messaging.topology import RabbitTopologyV1
+
+AcceptDelivery = Callable[..., Awaitable[DeliveryDecision]]
+RejectObserver = Callable[..., Awaitable[None]]
+
+
+class AioPikaJobConsumer:
+    """Consumes the main AI Job queue; never executes a Handler.
+
+    Fixed order: require size/content-type, parse canonical, verify the
+    signature, then delegate to the accept handler. Structural/canonical/
+    signature failures are observed (bounded security rejection) and the
+    delivery is rejected without requeue.
+    """
+
+    def __init__(
+        self,
+        amqp_url: str,
+        topology: RabbitTopologyV1,
+        *,
+        verifier: EnvelopeVerifier,
+        codec: EnvelopeDeliveryCodec | None = None,
+        accept: AcceptDelivery,
+        on_reject: RejectObserver | None = None,
+        prefetch: int = 8,
+    ) -> None:
+        if not isinstance(amqp_url, str) or "://" not in amqp_url:
+            raise ValueError("AMQP URL must be an absolute URL")
+        if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 1:
+            raise ValueError("consumer prefetch must be a positive integer")
+        if not callable(accept):
+            raise ValueError("consumer accept handler must be callable")
+        if not isinstance(verifier, EnvelopeVerifier):
+            raise ValueError("consumer verifier must be strongly typed")
+        self._amqp_url = amqp_url
+        self._topology = topology
+        self._verifier = verifier
+        self._codec = codec if codec is not None else EnvelopeDeliveryCodec()
+        self._accept = accept
+        self._on_reject = on_reject
+        self._prefetch = prefetch
+
+    async def run(self) -> None:
+        connection = await aio_pika.connect_robust(self._amqp_url)
+        try:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=self._prefetch, global_=False)
+            queue = await channel.get_queue(self._topology.main_queue)
+            await queue.consume(self._on_message)
+            import asyncio
+
+            stop = asyncio.Event()
+            try:
+                await stop.wait()
+            except asyncio.CancelledError:
+                raise
+        finally:
+            await connection.close()
+
+    async def _on_message(self, message: aio_pika.abc.AbstractIncomingMessage) -> None:
+        raw = RawDelivery(
+            body=bytes(message.body),
+            content_type=message.content_type or "",
+            received_at=datetime.now(UTC),
+            redelivered=bool(message.redelivered),
+        )
+        try:
+            bounded = self._codec.require_size_and_content_type(raw)
+            envelope = self._codec.parse_and_require_canonical(bounded)
+        except RejectDelivery as exc:
+            await self._observe_reject(raw, exc.rejection_code)
+            await message.reject(requeue=False)
+            return
+        try:
+            await self._verify(envelope)
+        except EnvelopeSignatureError as exc:
+            del exc
+            await self._observe_reject(raw, "envelope_signature_error")
+            await message.reject(requeue=False)
+            return
+        decision = await self._accept(envelope, received_at=raw.received_at)
+        if decision is DeliveryDecision.REJECT_NO_REQUEUE:
+            await self._observe_reject(raw, "delivery_rejected")
+            await message.reject(requeue=False)
+            return
+        await message.ack()
+
+    async def _verify(self, envelope: AIJobEnvelope) -> None:
+        self._verifier.verify(envelope)
+
+    async def _observe_reject(self, raw: RawDelivery, code: str) -> None:
+        if self._on_reject is not None:
+            await self._on_reject(raw, code)
 
 
 class AioPikaRuntimeTopology:
