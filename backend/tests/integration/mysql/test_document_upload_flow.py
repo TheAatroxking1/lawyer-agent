@@ -14,7 +14,9 @@ from lawyer_agent.application.documents import DocumentCreateCommand, DocumentUp
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.matter_documents import (
     DocumentUploadStatus,
+    DocumentVersion,
     MatterKind,
+    ReviewStatus,
 )
 from lawyer_agent.infrastructure.objects.object_store import LocalObjectStorePlaceholder
 from lawyer_agent.infrastructure.persistence.models.matter_documents import (
@@ -152,6 +154,26 @@ async def _run_upload_flow(mysql_url: URL) -> None:
             assert stored_version is not None
             assert stored_version.upload_status == "accepted"
             assert stored_version.object_key.startswith(f"tenant_{tenant_id.hex}/")
+
+            # Stage the version for review and read it back through the repo.
+            from sqlalchemy import update
+
+            from lawyer_agent.infrastructure.persistence.models.matter_documents import (
+                TenantDocumentVersionModel as _V,
+            )
+
+            await session.execute(
+                update(_V)
+                .where(_V.id == version.id)
+                .values(review_status="pending_review")
+            )
+            await session.commit()
+            loaded = await SqlAlchemyDocumentRepository(session).find_version(
+                tenant_id, version.document_id
+            )
+            assert loaded is not None
+            assert isinstance(loaded, DocumentVersion)
+            assert loaded.review_status is ReviewStatus.PENDING_REVIEW
     finally:
         await engine.dispose()
         await _cleanup(mysql_url, tenant_id)
