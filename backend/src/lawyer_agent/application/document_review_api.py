@@ -84,27 +84,94 @@ class DocumentReviewHttpService:
         trace_id: str | None = None,
     ) -> DocumentVersion:
         require_uuid7(document_id, field="document_id")
-        async with cast(DocumentReviewUnitOfWorkPort, self._uow_factory()) as uow:
-            try:
-                version = await uow.documents.review_document_version(
-                    tenant_id=context.tenant_id,
-                    document_id=document_id,
-                    version_no=version_no,
-                    decision=decision,
-                    reason=reason,
+        try:
+            async with cast(DocumentReviewUnitOfWorkPort, self._uow_factory()) as uow:
+                try:
+                    version = await uow.documents.review_document_version(
+                        tenant_id=context.tenant_id,
+                        document_id=document_id,
+                        version_no=version_no,
+                        decision=decision,
+                        reason=reason,
+                    )
+                except ValueError as exc:
+                    raise _map_domain_error(exc) from exc
+                await _append_audit(
+                    uow,
+                    context=context,
+                    action="document.review",
+                    reason_code="reviewed",
+                    target_type="document_version",
+                    target_id=version.id,
+                    trace_id=trace_id,
                 )
-            except ValueError as exc:
-                raise _map_domain_error(exc) from exc
-            await _append_audit(
-                uow,
+                return version
+        except DocumentReviewNotFound as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="document.review",
-                reason_code="reviewed",
-                target_type="document_version",
-                target_id=version.id,
+                result="denied",
+                reason_code=exc.code,
+                target_type="document",
+                target_id=document_id,
                 trace_id=trace_id,
             )
-            return version
+            raise
+        except DocumentReviewConflict as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="document.review",
+                result="denied",
+                reason_code=exc.code,
+                target_type="document",
+                target_id=document_id,
+                trace_id=trace_id,
+            )
+            raise
+        except DocumentReviewInvalidRequest as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="document.review",
+                result="failure",
+                reason_code=exc.code,
+                target_type="document",
+                target_id=document_id,
+                trace_id=trace_id,
+            )
+            raise
+
+
+async def _append_rejected_audit(
+    uow_factory: Callable[[], object],
+    *,
+    context: TenantContext,
+    action: str,
+    result: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    """Record a rejected/failed review attempt in its own committed transaction.
+
+    The failing business UoW has already rolled back when an error handler calls
+    this, so the audit append opens a fresh short-lived UoW whose clean exit
+    commits only the audit row.
+    """
+    async with cast(DocumentReviewUnitOfWorkPort, uow_factory()) as uow:
+        await _append_audit(
+            uow,
+            context=context,
+            action=action,
+            reason_code=reason_code,
+            target_type=target_type,
+            target_id=target_id,
+            trace_id=trace_id,
+            result=result,
+        )
 
 
 async def _append_audit(
@@ -116,6 +183,7 @@ async def _append_audit(
     target_type: str,
     target_id: UUID,
     trace_id: str | None,
+    result: str = "success",
 ) -> None:
     audit = getattr(uow, "audit", None)
     user_id = context.membership_user_id
@@ -131,7 +199,7 @@ async def _append_audit(
         trace_id=trace_id or "http",
         target_type=target_type,
         target_id=target_id,
-        result="success",
+        result=result,
     )
     await audit.append_structured(event)
 

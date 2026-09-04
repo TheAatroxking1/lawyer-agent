@@ -361,21 +361,46 @@ class RulePackAdminHttpService:
         trace_id: str | None = None,
     ) -> RulePack:
         require_uuid7(pack_id, field="pack_id")
-        async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
-            await self._require_pack(uow, context, pack_id)
-            activated = await uow.rule_pack.activate_pack(context, pack_id)
-            if not activated:
-                raise RulePackAdminConflict
-            await _append_audit(
-                uow,
+        try:
+            async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
+                await self._require_pack(uow, context, pack_id)
+                activated = await uow.rule_pack.activate_pack(context, pack_id)
+                if not activated:
+                    raise RulePackAdminConflict
+                await _append_audit(
+                    uow,
+                    context=context,
+                    action="rule_pack.activate",
+                    reason_code="activated",
+                    target_type="rule_pack",
+                    target_id=pack_id,
+                    trace_id=trace_id,
+                )
+                return await self._require_pack(uow, context, pack_id)
+        except RulePackAdminNotFound as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="rule_pack.activate",
-                reason_code="activated",
+                result="denied",
+                reason_code=exc.code,
                 target_type="rule_pack",
                 target_id=pack_id,
                 trace_id=trace_id,
             )
-            return await self._require_pack(uow, context, pack_id)
+            raise
+        except RulePackAdminConflict as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="rule_pack.activate",
+                result="denied",
+                reason_code=exc.code,
+                target_type="rule_pack",
+                target_id=pack_id,
+                trace_id=trace_id,
+            )
+            raise
 
     async def _require_pack(
         self,
@@ -399,6 +424,7 @@ async def _append_audit(
     target_type: str,
     target_id: UUID,
     trace_id: str | None,
+    result: str = "success",
 ) -> None:
     audit = getattr(uow, "audit", None)
     user_id = context.membership_user_id
@@ -414,9 +440,39 @@ async def _append_audit(
         trace_id=trace_id or "http",
         target_type=target_type,
         target_id=target_id,
-        result="success",
+        result=result,
     )
     await audit.append_structured(event)
+
+
+async def _append_rejected_audit(
+    uow_factory: Callable[[], object],
+    *,
+    context: TenantContext,
+    action: str,
+    result: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    """Record a rejected/failed pack write attempt in its own committed transaction.
+
+    The failing business UoW has already rolled back when an error handler calls
+    this, so the audit append opens a fresh short-lived UoW whose clean exit
+    commits only the audit row.
+    """
+    async with cast(RulePackAdminUnitOfWorkPort, uow_factory()) as uow:
+        await _append_audit(
+            uow,
+            context=context,
+            action=action,
+            reason_code=reason_code,
+            target_type=target_type,
+            target_id=target_id,
+            trace_id=trace_id,
+            result=result,
+        )
 
 
 def _actor_ids(context: TenantContext) -> tuple[UUID, UUID]:
