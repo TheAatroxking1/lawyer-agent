@@ -6,6 +6,10 @@ from lawyer_agent.api.v1.legal_corpus import (
     LegalVersionSummary,
     ProvisionSummary,
 )
+from lawyer_agent.application.legal_corpus_diff import (
+    LegalVersionDiffCrossInstrument,
+    LegalVersionDiffVersionNotFound,
+)
 from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusInstrumentNotFound,
     LegalCorpusVersionNotFound,
@@ -48,7 +52,23 @@ def test_instrument_not_found_code() -> None:
     assert error.code == "legal_corpus_instrument_not_found"
 
 
+def test_diff_version_not_found_code() -> None:
+    error = LegalVersionDiffVersionNotFound(new_uuid7())
+    assert error.status == 404
+    assert error.code == "legal_corpus_version_not_found"
+
+
+def test_diff_cross_instrument_code() -> None:
+    error = LegalVersionDiffCrossInstrument("cross-instrument diff is refused")
+    assert error.status == 409
+    assert error.code == "legal_version_diff_cross_instrument"
+
+
 def test_service_present_in_composition() -> None:
     placeholder = object()
-    services = SimpleNamespace(legal_corpus_http=placeholder)
+    services = SimpleNamespace(
+        legal_corpus_http=placeholder,
+        legal_version_diff_http=placeholder,
+    )
     assert services.legal_corpus_http is placeholder
+    assert services.legal_version_diff_http is placeholder
