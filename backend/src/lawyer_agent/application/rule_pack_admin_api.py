@@ -115,19 +115,18 @@ class RulePackAdminHttpService:
     ) -> RulePackRule:
         require_uuid7(pack_id, field="pack_id")
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
-            pack = await self._require_pack(uow, context, pack_id)
-            del pack
-            rule = build_pack_rule(
-                tenant_id=context.tenant_id,
-                pack_id=pack_id,
-                trigger_kind=trigger_kind,
-                label=label,
-                pattern=pattern,
-                risk_level=risk_level,
-                suggestion=suggestion,
-                enabled=True,
-            )
+            await self._require_pack(uow, context, pack_id)
             try:
+                rule = build_pack_rule(
+                    tenant_id=context.tenant_id,
+                    pack_id=pack_id,
+                    trigger_kind=trigger_kind,
+                    label=label,
+                    pattern=pattern,
+                    risk_level=risk_level,
+                    suggestion=suggestion,
+                    enabled=True,
+                )
                 return await uow.rule_pack.add_rule(context, rule)
             except ValueError as exc:
                 raise RulePackAdminInvalidRequest from exc
