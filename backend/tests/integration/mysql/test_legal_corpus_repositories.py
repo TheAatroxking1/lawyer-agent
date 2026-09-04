@@ -7,10 +7,14 @@ from uuid import UUID
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_ai_job_migration import _alembic_config
 
 from alembic import command
+from lawyer_agent.application.legal_corpus import (
+    CorpusFile,
+    LegalCorpusInventoryService,
+)
 from lawyer_agent.domain.legal_corpus import (
     LegalVersionStatus,
     ProvisionLevel,
@@ -18,6 +22,9 @@ from lawyer_agent.domain.legal_corpus import (
 )
 from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
     SqlAlchemyLegalCorpusRepository,
+)
+from lawyer_agent.infrastructure.persistence.repositories.legal_corpus_inventory import (
+    SqlAlchemyLegalCorpusInventoryRepository,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.mysql]
@@ -158,5 +165,39 @@ def test_legal_corpus_query_version_at_and_provisions(mysql_url: URL) -> None:
     command.upgrade(config, "head")
     try:
         asyncio.run(_run_query_checks(mysql_url))
+    finally:
+        asyncio.run(_cleanup(mysql_url))
+
+
+async def _run_inventory_check(mysql_url: URL) -> None:
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    try:
+        async with factory() as session:
+            repo = SqlAlchemyLegalCorpusInventoryRepository(session)
+            service = LegalCorpusInventoryService(repo, repo, "docx-zip-v1")
+            payload_a = "第一条 内容A。".encode()
+            payload_b = "第二条 内容B。".encode()
+            result = await service.inventory(
+                (
+                    CorpusFile("object://corpus/a.docx", payload_a),
+                    CorpusFile("object://corpus/b.docx", payload_b),
+                    CorpusFile("object://corpus/a-copy.docx", payload_a),
+                )
+            )
+            await session.commit()
+            assert result.quality_metrics["counts"]["duplicates"] == 1
+            found = await repo.find_batch_by_sha256(result.batch.file_sha256)
+            assert found is not None
+            assert found.batch_no == result.batch.batch_no
+    finally:
+        await engine.dispose()
+
+
+def test_legal_corpus_inventory_writes_batch(mysql_url: URL) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    try:
+        asyncio.run(_run_inventory_check(mysql_url))
     finally:
         asyncio.run(_cleanup(mysql_url))
