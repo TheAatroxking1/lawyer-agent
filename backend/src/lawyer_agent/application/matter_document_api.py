@@ -14,6 +14,7 @@ from hashlib import sha256
 from typing import Protocol, cast
 from uuid import UUID
 
+from lawyer_agent.application.audit import new_tenant_user_audit_event
 from lawyer_agent.application.documents import (
     DocumentCreateCommand,
     DocumentStorePort,
@@ -404,12 +405,13 @@ class MatterDocumentHttpService:
         matter_id: UUID,
         display_name: str,
         kind: str,
+        trace_id: str | None = None,
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
         async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
             await self._require_matter(uow, context, matter_id)
             try:
-                return await uow.matters.add_party(
+                party = await uow.matters.add_party(
                     tenant_id=context.tenant_id,
                     matter_id=matter_id,
                     display_name=display_name,
@@ -417,6 +419,15 @@ class MatterDocumentHttpService:
                 )
             except ValueError as exc:
                 raise MatterDocumentInvalidRequest from exc
+            await _append_party_audit(
+                uow,
+                context=context,
+                action="matter.party.add",
+                reason_code="added",
+                target_id=party.id,
+                trace_id=trace_id,
+            )
+            return party
 
     async def list_parties(
         self, *, context: TenantContext, matter_id: UUID
@@ -434,6 +445,7 @@ class MatterDocumentHttpService:
         party_id: UUID,
         display_name: str | None,
         kind: str | None,
+        trace_id: str | None = None,
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
@@ -451,6 +463,14 @@ class MatterDocumentHttpService:
                 raise MatterDocumentInvalidRequest from exc
             if party is None:
                 raise MatterDocumentNotFound
+            await _append_party_audit(
+                uow,
+                context=context,
+                action="matter.party.update",
+                reason_code="updated",
+                target_id=party.id,
+                trace_id=trace_id,
+            )
             return party
 
     async def remove_party(
@@ -459,6 +479,7 @@ class MatterDocumentHttpService:
         context: TenantContext,
         matter_id: UUID,
         party_id: UUID,
+        trace_id: str | None = None,
     ) -> None:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
@@ -470,6 +491,14 @@ class MatterDocumentHttpService:
                 party_id=party_id,
             ):
                 raise MatterDocumentNotFound
+            await _append_party_audit(
+                uow,
+                context=context,
+                action="matter.party.remove",
+                reason_code="removed",
+                target_id=party_id,
+                trace_id=trace_id,
+            )
 
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID
@@ -490,6 +519,33 @@ async def _complete_upload(
     if not isinstance(version, DocumentVersion):
         raise MatterDocumentConflict
     return version
+
+
+async def _append_party_audit(
+    uow: object,
+    *,
+    context: TenantContext,
+    action: str,
+    reason_code: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    audit = getattr(uow, "audit", None)
+    user_id = context.membership_user_id
+    membership_id = context.membership_id
+    if audit is None or user_id is None or membership_id is None:
+        return
+    event = new_tenant_user_audit_event(
+        tenant_id=context.tenant_id,
+        actor_user_id=user_id,
+        actor_membership_id=membership_id,
+        action=action,
+        reason_code=reason_code,
+        trace_id=trace_id or "http",
+        target_type="matter_party",
+        target_id=target_id,
+    )
+    await audit.append_structured(event)
 
 
 def _actor_ids(context: TenantContext) -> tuple[UUID, UUID]:

@@ -4,7 +4,7 @@ import base64
 from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Response
+from fastapi import APIRouter, Header, Request, Response
 from pydantic import Field, field_validator, model_validator
 
 from lawyer_agent.api.dependencies import (
@@ -292,6 +292,7 @@ async def add_matter_party(
     body: CreatePartyBody,
     actor: TenantActorDependency,
     services: Services,
+    request: Request,
 ) -> PartySummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -302,6 +303,7 @@ async def add_matter_party(
             matter_id=matter_id,
             display_name=body.display_name.strip(),
             kind=body.kind.strip(),
+            trace_id=getattr(request.state, "trace_id", None),
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
         raise _map_error(exc) from None
@@ -342,6 +344,7 @@ async def update_matter_party(
     body: UpdatePartyBody,
     actor: TenantActorDependency,
     services: Services,
+    request: Request,
 ) -> PartySummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -353,6 +356,7 @@ async def update_matter_party(
             party_id=party_id,
             display_name=body.display_name,
             kind=body.kind,
+            trace_id=getattr(request.state, "trace_id", None),
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
         raise _map_error(exc) from None
@@ -370,6 +374,7 @@ async def remove_matter_party(
     actor: TenantActorDependency,
     services: Services,
     response: Response,
+    request: Request,
 ) -> Response:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -379,6 +384,7 @@ async def remove_matter_party(
             context=actor.context,
             matter_id=matter_id,
             party_id=party_id,
+            trace_id=getattr(request.state, "trace_id", None),
         )
     except MatterDocumentNotFound as exc:
         raise _map_error(exc) from None
