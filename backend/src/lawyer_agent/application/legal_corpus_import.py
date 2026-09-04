@@ -96,7 +96,7 @@ class LegalCorpusImportService:
     async def import_version(
         self, command: LegalImportCommand
     ) -> LegalImportResult:
-        _validate_command(command)
+        validate_import_command(command)
 
         instrument = await self._repository.find_instrument_by_identity(
             command.title, command.jurisdiction
@@ -155,7 +155,8 @@ class LegalCorpusImportService:
         )
 
 
-def _validate_command(command: LegalImportCommand) -> None:
+def validate_import_command(command: LegalImportCommand) -> None:
+    """Validate an import command; shared by the service and the parser mapper."""
     if not isinstance(command, LegalImportCommand):
         raise LegalCorpusImportError("import command must be strongly typed")
     for field, name in (
