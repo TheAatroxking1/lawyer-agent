@@ -54,6 +54,7 @@
 - 阶段 2 增补“Rule Pack 管理 HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/rule-packs` 下创建（同名版本自动 +1、inactive）/列表/向 Pack 添加规则（正则白名单、枚举校验）/启停规则/激活唯一 active（事务清理其它）；管理纯函数与租户范围仓储写方法，MySQL 集成覆盖版本推进与唯一激活，全栈 HTTP 覆盖 建包→加规则→坏正则 422→v2→激活→联动 Rule Check 命中→停用后 409 拒绝空跑→跨租户双层 404；模板规则库、permission code 化仍为延后项。
 - 阶段 2 增补“租户人工写动作审计”非模型切片已完成（2026-09-05 计划）：`risk_issue.dispose`/`document.review`/`rule_pack.activate` 三个最高影响人工动作在成功路径登记 TENANT_USER 结构化审计（action/result/reason_code/trace_id/target_type/target_id，仅标识符不泄漏正文）；`_TENANT_USER_PREFIXES` 白名单扩展与三个 UoW 暴露 audit 仓储；真实 MySQL+Redis 全栈验证三类动作各产生正确审计行；拒绝路径审计仍为延后项。
 - 阶段 2 增补“租户审计查询 HTTP API”非模型切片已完成（2026-09-05 计划）：`GET /api/v1/tenants/{tenant_id}/audit` 只读列出本租户审计（action 前缀白名单/target_type/trace_id 过滤、limit≤100、before_id 游标稳定翻页；响应仅安全字段白名单，不含 IP/UA hash 与 metadata）；仓储按 `(tenant_id, occurred_at)` 倒序查询；真实 MySQL+Redis 全栈验证三类事件可见、`action=risk_issue.` 过滤、非法前缀 422、limit=1 翻页不重不漏、租户 B 永看不到 A 的动作行；跨租户管理/导出、IP-UA 展示、保留策略仍为延后项。
+- 阶段 2 增补“Matter 参与方 HTTP API”非模型切片已完成（2026-09-05 计划）：`POST/GET /api/v1/tenants/{tenant_id}/matters/{matter_id}/parties` 添加/列出参与方（display_name/kind 必填非空、长度上限；仓储 list_parties 按 created_at 升序、add 前校验 matter 归属）；真实 MySQL+Redis 全栈覆盖 add 2→list 顺序、422 空白拒绝、租户 B 双层 404；参与方更新/删除、团队/角色、冲突检查仍为延后项。
 - 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。
 
 ## 多租户与授权不变量
