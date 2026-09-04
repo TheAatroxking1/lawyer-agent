@@ -7,6 +7,7 @@ from lawyer_agent.api.v1.legal_corpus import (
     ProvisionSummary,
 )
 from lawyer_agent.application.legal_corpus_read import (
+    LegalCorpusInstrumentNotFound,
     LegalCorpusVersionNotFound,
 )
 from lawyer_agent.domain.common import new_uuid7
@@ -39,6 +40,12 @@ def test_version_not_found_code() -> None:
     error = LegalCorpusVersionNotFound()
     assert error.status == 404
     assert error.code == "legal_corpus_version_not_found"
+
+
+def test_instrument_not_found_code() -> None:
+    error = LegalCorpusInstrumentNotFound()
+    assert error.status == 404
+    assert error.code == "legal_corpus_instrument_not_found"
 
 
 def test_service_present_in_composition() -> None:

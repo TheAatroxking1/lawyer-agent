@@ -254,8 +254,37 @@ def test_legal_corpus_read_http_over_real_mysql(migrated_mysql_url: URL) -> None
         assert rows[0]["level"] == "article"
         assert "2024 年版条文" in rows[0]["full_text"]
 
+        # 5b. Version history lists both versions newest-published first.
+        history = client.get(
+            f"{base}/instruments/{instrument_id}/versions", headers=headers
+        )
+        assert history.status_code == 200, history.text
+        history_rows = history.json()
+        assert [row["id"] for row in history_rows] == [
+            str(version_new),
+            str(version_old),
+        ]
+        assert history_rows[0]["version_label"] == "2024 修正"
+        assert history_rows[0]["status"] == "current"
+        assert history_rows[0]["dataset_version"] == "dataset_v1"
+        assert history_rows[1]["status"] == "historical"
+
+        # 5c. Unknown instrument -> 404 instrument_not_found.
+        unknown_instrument = client.get(
+            f"{base}/instruments/{new_uuid7()}/versions", headers=headers
+        )
+        assert unknown_instrument.status_code == 404
+        assert (
+            unknown_instrument.json()["code"]
+            == "legal_corpus_instrument_not_found"
+        )
+
         # 6. Unauthenticated -> 401.
         unauth = client.get(
             f"{base}/versions/{version_new}/provisions",
         )
         assert unauth.status_code == 401
+        unauth_history = client.get(
+            f"{base}/instruments/{instrument_id}/versions",
+        )
+        assert unauth_history.status_code == 401
