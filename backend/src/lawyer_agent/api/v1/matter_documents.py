@@ -293,6 +293,7 @@ async def add_matter_party(
     actor: TenantActorDependency,
     services: Services,
     request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> PartySummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -303,6 +304,7 @@ async def add_matter_party(
             matter_id=matter_id,
             display_name=body.display_name.strip(),
             kind=body.kind.strip(),
+            idempotency_key=idempotency_key,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
@@ -345,6 +347,7 @@ async def update_matter_party(
     actor: TenantActorDependency,
     services: Services,
     request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> PartySummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -356,6 +359,7 @@ async def update_matter_party(
             party_id=party_id,
             display_name=body.display_name,
             kind=body.kind,
+            idempotency_key=idempotency_key,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
@@ -375,6 +379,7 @@ async def remove_matter_party(
     services: Services,
     response: Response,
     request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -384,6 +389,7 @@ async def remove_matter_party(
             context=actor.context,
             matter_id=matter_id,
             party_id=party_id,
+            idempotency_key=idempotency_key,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except MatterDocumentNotFound as exc:

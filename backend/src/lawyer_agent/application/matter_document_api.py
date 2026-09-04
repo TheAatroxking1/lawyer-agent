@@ -47,6 +47,15 @@ _DOCUMENT_REGISTER_ROUTE = (
     "/api/v1/tenants/{tenant_id}/matters/{matter_id}/documents"
 )
 _DOCUMENT_RESULT_TYPE = "document.document_version"
+_PARTY_ADD_OPERATION = "matter.party.add"
+_PARTY_ADD_ROUTE = "/api/v1/tenants/{tenant_id}/matters/{matter_id}/parties"
+_PARTY_UPDATE_OPERATION = "matter.party.update"
+_PARTY_UPDATE_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/matters/{matter_id}/parties/{party_id}"
+)
+_PARTY_REMOVE_OPERATION = "matter.party.remove"
+_PARTY_REMOVE_ROUTE = _PARTY_UPDATE_ROUTE
+_PARTY_RESULT_TYPE = "matter_party"
 
 
 class MatterDocumentError(Exception):
@@ -405,12 +414,38 @@ class MatterDocumentHttpService:
         matter_id: UUID,
         display_name: str,
         kind: str,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
         trace_id: str | None = None,
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         try:
             async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
                 await self._require_matter(uow, context, matter_id)
+                if idempotency_key and self._idempotency is not None:
+                    if membership_id is None:
+                        raise MatterDocumentConflict
+                    reservation = await self._reserve_party_add(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        matter_id=matter_id,
+                        display_name=display_name,
+                        kind=kind,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.is_replay:
+                        assert reservation.replay is not None
+                        party = await _find_party_by_id(
+                            uow.matters, context, matter_id, reservation.replay.result_id
+                        )
+                        if party is None:
+                            raise MatterDocumentConflict
+                        return party
                 try:
                     party = await uow.matters.add_party(
                         tenant_id=context.tenant_id,
@@ -420,6 +455,14 @@ class MatterDocumentHttpService:
                     )
                 except ValueError as exc:
                     raise MatterDocumentInvalidRequest from exc
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(_PARTY_RESULT_TYPE, party.id),
+                        now=effective_now,
+                    )
                 await _append_party_audit(
                     uow,
                     context=context,
@@ -454,6 +497,45 @@ class MatterDocumentHttpService:
             )
             raise
 
+    async def _reserve_party_add(
+        self,
+        uow: MatterDocumentUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        matter_id: UUID,
+        display_name: str,
+        kind: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_PARTY_ADD_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_PARTY_ADD_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "matter_id": str(matter_id),
+                        "display_name": display_name,
+                        "kind": kind,
+                    },
+                    business_paths=frozenset(
+                        {("matter_id",), ("display_name",), ("kind",)}
+                    ),
+                ),
+            ),
+            now=now,
+        )
+
     async def list_parties(
         self, *, context: TenantContext, matter_id: UUID
     ) -> tuple[MatterParty, ...]:
@@ -470,13 +552,40 @@ class MatterDocumentHttpService:
         party_id: UUID,
         display_name: str | None,
         kind: str | None,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
         trace_id: str | None = None,
     ) -> MatterParty:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         try:
             async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
                 await self._require_matter(uow, context, matter_id)
+                if idempotency_key and self._idempotency is not None:
+                    if membership_id is None:
+                        raise MatterDocumentConflict
+                    reservation = await self._reserve_party_update(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        matter_id=matter_id,
+                        party_id=party_id,
+                        display_name=display_name,
+                        kind=kind,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.is_replay:
+                        assert reservation.replay is not None
+                        party = await _find_party_by_id(
+                            uow.matters, context, matter_id, reservation.replay.result_id
+                        )
+                        if party is None:
+                            raise MatterDocumentConflict
+                        return party
                 try:
                     party = await uow.matters.update_party(
                         tenant_id=context.tenant_id,
@@ -489,6 +598,14 @@ class MatterDocumentHttpService:
                     raise MatterDocumentInvalidRequest from exc
                 if party is None:
                     raise MatterDocumentNotFound
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(_PARTY_RESULT_TYPE, party.id),
+                        now=effective_now,
+                    )
                 await _append_party_audit(
                     uow,
                     context=context,
@@ -523,25 +640,98 @@ class MatterDocumentHttpService:
             )
             raise
 
+    async def _reserve_party_update(
+        self,
+        uow: MatterDocumentUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+        display_name: str | None,
+        kind: str | None,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_PARTY_UPDATE_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="PATCH",
+                canonical_route=_PARTY_UPDATE_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "matter_id": str(matter_id),
+                        "party_id": str(party_id),
+                        "display_name": display_name,
+                        "kind": kind,
+                    },
+                    business_paths=frozenset(
+                        {
+                            ("matter_id",),
+                            ("party_id",),
+                            ("display_name",),
+                            ("kind",),
+                        }
+                    ),
+                ),
+            ),
+            now=now,
+        )
+
     async def remove_party(
         self,
         *,
         context: TenantContext,
         matter_id: UUID,
         party_id: UUID,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
         trace_id: str | None = None,
     ) -> None:
         require_uuid7(matter_id, field="matter_id")
         require_uuid7(party_id, field="party_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         try:
             async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
                 await self._require_matter(uow, context, matter_id)
+                if idempotency_key and self._idempotency is not None:
+                    if membership_id is None:
+                        raise MatterDocumentConflict
+                    reservation = await self._reserve_party_remove(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        matter_id=matter_id,
+                        party_id=party_id,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.is_replay:
+                        return
                 if not await uow.matters.remove_party(
                     tenant_id=context.tenant_id,
                     matter_id=matter_id,
                     party_id=party_id,
                 ):
                     raise MatterDocumentNotFound
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(_PARTY_RESULT_TYPE, party_id),
+                        now=effective_now,
+                    )
                 await _append_party_audit(
                     uow,
                     context=context,
@@ -563,6 +753,41 @@ class MatterDocumentHttpService:
             )
             raise
 
+    async def _reserve_party_remove(
+        self,
+        uow: MatterDocumentUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_PARTY_REMOVE_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="DELETE",
+                canonical_route=_PARTY_REMOVE_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "matter_id": str(matter_id),
+                        "party_id": str(party_id),
+                    },
+                    business_paths=frozenset({("matter_id",), ("party_id",)}),
+                ),
+            ),
+            now=now,
+        )
+
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID
     ) -> None:
@@ -582,6 +807,19 @@ async def _complete_upload(
     if not isinstance(version, DocumentVersion):
         raise MatterDocumentConflict
     return version
+
+
+async def _find_party_by_id(
+    matters: MatterStorePort,
+    context: TenantContext,
+    matter_id: UUID,
+    party_id: UUID,
+) -> MatterParty | None:
+    parties = await matters.list_parties(context, matter_id)
+    for party in parties:
+        if party.id == party_id:
+            return party
+    return None
 
 
 async def _append_party_audit(
