@@ -98,6 +98,42 @@ class SqlAlchemyRulePackRepository:
         self._session.add(_issue_model(issue))
         await self._session.flush()
 
+    async def issues_for_document(
+        self, context: TenantContext, document_id: UUID
+    ) -> tuple[RiskIssue, ...]:
+        _require_context(context)
+        rows = await self._session.scalars(
+            select(TenantContractRiskIssueModel)
+            .where(
+                TenantContractRiskIssueModel.tenant_id == context.tenant_id,
+                TenantContractRiskIssueModel.document_id == document_id,
+            )
+            .order_by(TenantContractRiskIssueModel.created_at)
+        )
+        return tuple(_issue(row) for row in rows)
+
+    async def mark_open_issue_stale(
+        self,
+        *,
+        tenant_id: UUID,
+        issue_id: UUID,
+        now: datetime,
+    ) -> bool:
+        """Move an open issue to stale; only open rows can be marked."""
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantContractRiskIssueModel)
+                .where(
+                    TenantContractRiskIssueModel.tenant_id == tenant_id,
+                    TenantContractRiskIssueModel.id == issue_id,
+                    TenantContractRiskIssueModel.status == "open",
+                )
+                .values(status="stale", disposed_at=_naive(now))
+            ),
+        )
+        return result.rowcount == 1
+
     async def dispose_issue(
         self,
         *,

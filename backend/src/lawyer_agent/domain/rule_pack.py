@@ -140,3 +140,50 @@ def new_risk_issue(
         risk_level=risk_level,
         status=RiskIssueStatus.OPEN,
     )
+
+
+_DISPOSABLE = frozenset(
+    {
+        RiskIssueStatus.ACCEPTED,
+        RiskIssueStatus.REJECTED,
+        RiskIssueStatus.MODIFIED,
+    }
+)
+
+
+def dispose_risk_issue(
+    *,
+    issue: RiskIssue,
+    status: RiskIssueStatus,
+    reason: str,
+    now: datetime,
+) -> RiskIssue:
+    """Move an open issue to a lawyer-chosen terminal disposition.
+
+    Only ``OPEN`` issues can be disposed; the target must be accept, reject or
+    modify. A human-supplied reason is required and recorded as evidence of
+    review. High-risk issues stay ``rule_based`` candidates until a lawyer
+    confirms or rejects them here.
+    """
+    if issue.status is not RiskIssueStatus.OPEN:
+        raise ValueError("only open risk issues can be disposed")
+    if status not in _DISPOSABLE:
+        raise ValueError("disposition must accept, reject or modify the issue")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("disposition reason is required")
+    return RiskIssue(
+        id=issue.id,
+        tenant_id=issue.tenant_id,
+        rule_id=issue.rule_id,
+        pack_id=issue.pack_id,
+        pack_version=issue.pack_version,
+        document_id=issue.document_id,
+        provision_no=issue.provision_no,
+        matched_text=issue.matched_text,
+        risk_level=issue.risk_level,
+        status=status,
+        evidence_level=issue.evidence_level,
+        disposition_reason=reason.strip(),
+        raised_at=issue.raised_at,
+        disposed_at=now,
+    )
