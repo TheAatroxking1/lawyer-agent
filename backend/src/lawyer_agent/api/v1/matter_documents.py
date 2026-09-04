@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import base64
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Header, Response
 from pydantic import Field, field_validator
 
 from lawyer_agent.api.dependencies import (
@@ -118,6 +118,7 @@ async def create_matter(
     body: CreateMatterBody,
     actor: TenantActorDependency,
     services: Services,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> MatterSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -128,6 +129,7 @@ async def create_matter(
             title=body.title,
             kind=MatterKind(body.kind),
             description=body.description,
+            idempotency_key=idempotency_key,
         )
     except MatterDocumentInvalidRequest as exc:
         raise _map_error(exc) from None

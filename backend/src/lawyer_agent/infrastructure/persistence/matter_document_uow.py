@@ -11,6 +11,9 @@ from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepo
 from lawyer_agent.infrastructure.persistence.repositories.documents import (
     SqlAlchemyDocumentRepository,
 )
+from lawyer_agent.infrastructure.persistence.repositories.idempotency import (
+    SqlAlchemyIdempotencyRepository,
+)
 from lawyer_agent.infrastructure.persistence.repositories.matters import (
     SqlAlchemyMatterRepository,
 )
@@ -26,6 +29,7 @@ class SqlAlchemyMatterDocumentUnitOfWork:
         self.documents: SqlAlchemyDocumentRepository
         self.upload: DocumentUploadService
         self.audit: AuditRepository
+        self.idempotency: SqlAlchemyIdempotencyRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -37,6 +41,7 @@ class SqlAlchemyMatterDocumentUnitOfWork:
             LocalObjectStorePlaceholder(), self.documents
         )
         self.audit = AuditRepository(self._session)
+        self.idempotency = SqlAlchemyIdempotencyRepository(self._session)
         return self
 
     async def __aexit__(

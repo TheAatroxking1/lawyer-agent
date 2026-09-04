@@ -225,7 +225,9 @@ async def application_services(
         ),
         ai_jobs=_build_ai_job_service(session_factory, idempotency),
         rule_check_http=_build_rule_check_http_service(session_factory),
-        matter_document_http=_build_matter_document_http_service(session_factory),
+        matter_document_http=_build_matter_document_http_service(
+            session_factory, idempotency
+        ),
         document_review_http=_build_document_review_http_service(session_factory),
         rule_pack_admin_http=_build_rule_pack_admin_http_service(session_factory),
         invitation_delivery=delivery_capability,
@@ -271,7 +273,9 @@ def _build_rule_check_http_service(session_factory: Any) -> Any:
     )
 
 
-def _build_matter_document_http_service(session_factory: Any) -> Any:
+def _build_matter_document_http_service(
+    session_factory: Any, idempotency: IdempotencyService | None = None
+) -> Any:
     """Composition root for the tenant Matter/Document HTTP service."""
     from lawyer_agent.application.matter_document_api import (
         MatterDocumentHttpService,
@@ -281,7 +285,8 @@ def _build_matter_document_http_service(session_factory: Any) -> Any:
     )
 
     return MatterDocumentHttpService(
-        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
+        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory),
+        idempotency=idempotency,
     )
 
 

@@ -9,12 +9,23 @@ un-scoped ``get_by_id``.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Protocol, cast
 from uuid import UUID
 
 from lawyer_agent.application.documents import (
     DocumentCreateCommand,
     DocumentStorePort,
+)
+from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
+    IdempotencyRepositoryPort,
+    IdempotencyRequest,
+    IdempotencyReservation,
+    IdempotencyResultReference,
+    IdempotencyScope,
+    IdempotencyScopeType,
+    IdempotencyService,
 )
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.matter_documents import (
@@ -24,6 +35,10 @@ from lawyer_agent.domain.matter_documents import (
     MatterKind,
 )
 from lawyer_agent.domain.tenancy import TenantContext
+
+_MATTER_CREATE_OPERATION = "matter.create"
+_MATTER_CREATE_ROUTE = "/api/v1/tenants/{tenant_id}/matters"
+_MATTER_RESULT_TYPE = "matter.matter"
 
 
 class MatterDocumentError(Exception):
@@ -83,6 +98,7 @@ class MatterDocumentUnitOfWorkPort(Protocol):
     matters: MatterStorePort
     documents: _DocumentStoreForUow
     upload: object
+    idempotency: IdempotencyRepositoryPort
 
     async def __aenter__(self) -> MatterDocumentUnitOfWorkPort: ...
 
@@ -92,10 +108,15 @@ class MatterDocumentUnitOfWorkPort(Protocol):
 class MatterDocumentHttpService:
     """Composition facade used by the tenant HTTP endpoints."""
 
-    def __init__(self, uow_factory: Callable[[], object]) -> None:
+    def __init__(
+        self,
+        uow_factory: Callable[[], object],
+        idempotency: IdempotencyService | None = None,
+    ) -> None:
         if not callable(uow_factory):
             raise ValueError("matter document http service requires a unit of work factory")
         self._uow_factory = uow_factory
+        self._idempotency = idempotency
 
     async def create_matter(
         self,
@@ -104,10 +125,48 @@ class MatterDocumentHttpService:
         title: str,
         kind: MatterKind,
         description: str | None,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
     ) -> Matter:
         user_id, membership_id = _actor_ids(context)
+        effective_now = now or datetime.now(UTC)
         async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
             try:
+                if idempotency_key and self._idempotency is not None:
+                    reservation = await self._reserve_matter_create(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        title=title,
+                        kind=kind,
+                        description=description,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.replay is not None:
+                        matter = await uow.matters.get_matter(
+                            context, reservation.replay.result_id
+                        )
+                        if matter is None:
+                            raise MatterDocumentConflict
+                        return matter
+                    created = await uow.matters.create_matter(
+                        tenant_id=context.tenant_id,
+                        title=title,
+                        kind=kind,
+                        created_by_user_id=user_id,
+                        created_by_membership_id=membership_id,
+                        description=description,
+                    )
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(
+                            _MATTER_RESULT_TYPE, created.id
+                        ),
+                        now=effective_now,
+                    )
+                    return created
                 matter = await uow.matters.create_matter(
                     tenant_id=context.tenant_id,
                     title=title,
@@ -119,6 +178,45 @@ class MatterDocumentHttpService:
             except ValueError as exc:
                 raise MatterDocumentInvalidRequest from exc
             return matter
+
+    async def _reserve_matter_create(
+        self,
+        uow: MatterDocumentUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        title: str,
+        kind: MatterKind,
+        description: str | None,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_MATTER_CREATE_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_MATTER_CREATE_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "title": title,
+                        "kind": kind.value,
+                        "description": description,
+                    },
+                    business_paths=frozenset(
+                        {("title",), ("kind",), ("description",)}
+                    ),
+                ),
+            ),
+            now=now,
+        )
 
     async def get_matter(
         self, *, context: TenantContext, matter_id: UUID
