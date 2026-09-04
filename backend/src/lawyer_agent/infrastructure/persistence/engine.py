@@ -11,13 +11,24 @@ from sqlalchemy.ext.asyncio import (
 from lawyer_agent.config import Settings
 
 
-def create_engine(settings: Settings) -> AsyncEngine:
+def create_engine_from_url(
+    database_url: str,
+    *,
+    pool_size: int = 5,
+    max_overflow: int = 10,
+    pool_timeout_seconds: float = 30.0,
+) -> AsyncEngine:
+    """Build an async engine whose connections run in UTC.
+
+    Process composition roots (publisher, worker, maintenance) reuse this entry
+    point so every backend connection applies the same session time zone.
+    """
     engine = create_async_engine(
-        settings.database_url,
+        database_url,
         pool_pre_ping=True,
-        pool_size=settings.database_pool_size,
-        max_overflow=settings.database_max_overflow,
-        pool_timeout=settings.database_pool_timeout_seconds,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout_seconds,
     )
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -30,6 +41,15 @@ def create_engine(settings: Settings) -> AsyncEngine:
             cursor.close()
 
     return engine
+
+
+def create_engine(settings: Settings) -> AsyncEngine:
+    return create_engine_from_url(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout_seconds=settings.database_pool_timeout_seconds,
+    )
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
