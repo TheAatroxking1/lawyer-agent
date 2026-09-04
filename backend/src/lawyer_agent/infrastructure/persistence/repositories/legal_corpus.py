@@ -5,10 +5,13 @@ from datetime import date
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.legal_corpus import (
+    ChunkQuality,
+    ChunkType,
+    LegalChunk,
     LegalInstrument,
     LegalVersion,
     LegalVersionStatus,
@@ -16,6 +19,7 @@ from lawyer_agent.domain.legal_corpus import (
     ProvisionLevel,
 )
 from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
+    LegalChunkModel,
     LegalInstrumentModel,
     LegalProvisionModel,
     LegalVersionModel,
@@ -39,6 +43,19 @@ _LEVEL_MAP = {
     "sub_item": ProvisionLevel.SUB_ITEM,
 }
 
+_CHUNK_TYPE_MAP = {
+    "provision": ChunkType.PROVISION,
+    "sub_item": ChunkType.SUB_ITEM,
+    "table": ChunkType.TABLE,
+    "attachment": ChunkType.ATTACHMENT,
+}
+
+_CHUNK_QUALITY_MAP = {
+    "ok": ChunkQuality.OK,
+    "degraded": ChunkQuality.DEGRADED,
+    "failed": ChunkQuality.FAILED,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class VersionProvisions:
@@ -56,6 +73,18 @@ class LegalCorpusQueryPort(Protocol):
     async def provisions_for_version(
         self, version_id: UUID
     ) -> tuple[Provision, ...]: ...
+
+
+class LegalCorpusChunkPort(Protocol):
+    """Read/write boundary for derived legal corpus chunks (re-indexable)."""
+
+    async def replace_chunks_for_version(
+        self, version_id: UUID, chunks: tuple[LegalChunk, ...]
+    ) -> None: ...
+
+    async def chunks_for_version(
+        self, version_id: UUID
+    ) -> tuple[LegalChunk, ...]: ...
 
 
 def _to_instrument(model: LegalInstrumentModel) -> LegalInstrument:
@@ -100,6 +129,20 @@ def _to_provision(model: LegalProvisionModel) -> Provision:
     )
 
 
+def _to_chunk(model: LegalChunkModel) -> LegalChunk:
+    return LegalChunk(
+        id=model.id,
+        version_id=model.version_id,
+        provision_id=model.provision_id,
+        chunk_type=_CHUNK_TYPE_MAP[model.chunk_type],
+        quality=_CHUNK_QUALITY_MAP[model.quality],
+        content=model.content,
+        content_hash=bytes(model.content_hash),
+        parent_chunk_id=model.parent_chunk_id,
+        parser_version=model.parser_version,
+    )
+
+
 class SqlAlchemyLegalCorpusRepository:
     """Read-only public corpus repository; never exposes a raw global get_by_id."""
 
@@ -132,3 +175,52 @@ class SqlAlchemyLegalCorpusRepository:
             .order_by(LegalProvisionModel.char_start)
         )
         return tuple(_to_provision(model) for model in rows)
+
+
+class SqlAlchemyLegalCorpusChunkRepository:
+    """Derived chunk rows; fully replaceable per version (re-index friendly)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def replace_chunks_for_version(
+        self, version_id: UUID, chunks: tuple[LegalChunk, ...]
+    ) -> None:
+        await self._session.execute(
+            delete(LegalChunkModel).where(LegalChunkModel.version_id == version_id)
+        )
+        for chunk in chunks:
+            if chunk.version_id != version_id:
+                raise ValueError("chunk does not belong to the target version")
+            self._session.add(_chunk_model(chunk))
+        await self._session.flush()
+
+    async def chunks_for_version(
+        self, version_id: UUID
+    ) -> tuple[LegalChunk, ...]:
+        rows = (
+            await self._session.execute(
+                select(LegalChunkModel, LegalProvisionModel.char_start)
+                .join(
+                    LegalProvisionModel,
+                    LegalChunkModel.provision_id == LegalProvisionModel.id,
+                )
+                .where(LegalChunkModel.version_id == version_id)
+                .order_by(LegalProvisionModel.char_start, LegalChunkModel.id)
+            )
+        ).all()
+        return tuple(_to_chunk(row[0]) for row in rows)
+
+
+def _chunk_model(chunk: LegalChunk) -> LegalChunkModel:
+    return LegalChunkModel(
+        id=chunk.id,
+        version_id=chunk.version_id,
+        provision_id=chunk.provision_id,
+        parent_chunk_id=chunk.parent_chunk_id,
+        chunk_type=chunk.chunk_type.value,
+        quality=chunk.quality.value,
+        content=chunk.content,
+        content_hash=chunk.content_hash,
+        parser_version=chunk.parser_version,
+    )
