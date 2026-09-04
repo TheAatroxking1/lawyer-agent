@@ -1,0 +1,164 @@
+"""Tenant Matter and versioned Document domain (non-model slice).
+
+A Matter is a tenant-scoped business project folder. A Document holds an
+immutable original-object reference plus versioned derived documents. Any
+process-time limit or high-risk conclusion requires lawyer confirmation; this
+slice stores facts only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from uuid import UUID
+
+from lawyer_agent.domain.common import require_uuid7
+
+MAX_OBJECT_KEY_BYTES = 512
+MAX_DOCUMENT_NAME_BYTES = 256
+
+
+class MatterKind(StrEnum):
+    CONTRACT_REVIEW = "contract_review"
+    LITIGATION = "litigation"
+    LEGAL_ADVICE = "legal_advice"
+    COMPLIANCE = "compliance"
+    OTHER = "other"
+
+
+class MatterStatus(StrEnum):
+    OPEN = "open"
+    ACTIVE = "active"
+    CLOSED = "closed"
+    ARCHIVED = "archived"
+
+
+class DocumentKind(StrEnum):
+    ORIGINAL = "original"
+    DERIVED = "derived"
+
+
+class DocumentUploadStatus(StrEnum):
+    UPLOADED = "uploaded"
+    VALIDATING = "validating"
+    ACCEPTED = "accepted"
+    NEEDS_REVIEW = "needs_review"
+    PARSING = "parsing"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class ReviewStatus(StrEnum):
+    DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
+    CHANGES_REQUESTED = "changes_requested"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+def _require_positive_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _require_utc(value: object, name: str) -> None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{name} must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class Matter:
+    id: UUID
+    tenant_id: UUID
+    title: str
+    kind: MatterKind
+    status: MatterStatus
+    created_by_user_id: UUID
+    created_by_membership_id: UUID
+    owner_membership_id: UUID | None = None
+    description: str | None = None
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.id, "matter id"),
+            (self.tenant_id, "matter tenant_id"),
+            (self.created_by_user_id, "matter created_by_user_id"),
+            (self.created_by_membership_id, "matter created_by_membership_id"),
+        ):
+            require_uuid7(value, field=name)
+        if self.owner_membership_id is not None:
+            require_uuid7(self.owner_membership_id, field="matter owner_membership_id")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("matter title must be non-empty text")
+        if not isinstance(self.kind, MatterKind):
+            raise ValueError("matter kind must be strongly typed")
+        if not isinstance(self.status, MatterStatus):
+            raise ValueError("matter status must be strongly typed")
+        _require_positive_int(self.version, "matter version")
+
+
+@dataclass(frozen=True, slots=True)
+class MatterParty:
+    """Participant in a Matter; parties never leak across tenants."""
+
+    id: UUID
+    tenant_id: UUID
+    matter_id: UUID
+    display_name: str
+    kind: str
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        require_uuid7(self.id, field="party id")
+        require_uuid7(self.tenant_id, field="party tenant_id")
+        require_uuid7(self.matter_id, field="party matter_id")
+        if not isinstance(self.display_name, str) or not self.display_name.strip():
+            raise ValueError("party display name must be non-empty text")
+        _require_positive_int(self.version, "party version")
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentVersion:
+    id: UUID
+    tenant_id: UUID
+    document_id: UUID
+    version_no: int
+    kind: DocumentKind
+    object_key: str
+    sha256: bytes
+    upload_status: DocumentUploadStatus
+    file_name: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = None
+    parser_version: str | None = None
+    parse_error: str | None = None
+    review_status: ReviewStatus | None = None
+    created_by_user_id: UUID | None = None
+    created_by_membership_id: UUID | None = None
+    uploaded_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        require_uuid7(self.id, field="document version id")
+        require_uuid7(self.tenant_id, field="document version tenant_id")
+        require_uuid7(self.document_id, field="document version document_id")
+        _require_positive_int(self.version_no, "document version_no")
+        if not isinstance(self.kind, DocumentKind):
+            raise ValueError("document kind must be strongly typed")
+        if not isinstance(self.object_key, str) or not self.object_key:
+            raise ValueError("document object key must be non-empty text")
+        if len(self.object_key.encode("utf-8")) > MAX_OBJECT_KEY_BYTES:
+            raise ValueError("document object key is too long")
+        if self.sha256 is None or len(self.sha256) != 32:
+            raise ValueError("document sha256 must be 32 bytes")
+        if not isinstance(self.upload_status, DocumentUploadStatus):
+            raise ValueError("document upload status must be strongly typed")
+        if self.size_bytes is not None:
+            _require_positive_int(self.size_bytes, "document size_bytes")
+        if self.uploaded_at is not None:
+            _require_utc(self.uploaded_at, "document uploaded_at")

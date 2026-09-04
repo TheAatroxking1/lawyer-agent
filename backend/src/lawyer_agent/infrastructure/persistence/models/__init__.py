@@ -41,6 +41,12 @@ from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalQualityIssueModel,
     LegalVersionModel,
 )
+from lawyer_agent.infrastructure.persistence.models.matter_documents import (
+    TenantDocumentModel,
+    TenantDocumentVersionModel,
+    TenantMatterModel,
+    TenantMatterPartyModel,
+)
 from lawyer_agent.infrastructure.persistence.models.outbox import (
     AuthorizationCacheInvalidationOutboxModel,
 )
@@ -96,4 +102,8 @@ __all__ = [
     "TenantRoleModel",
     "TenantRolePermissionModel",
     "UserModel",
+    "TenantDocumentModel",
+    "TenantDocumentVersionModel",
+    "TenantMatterModel",
+    "TenantMatterPartyModel",
 ]
