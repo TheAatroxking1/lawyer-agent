@@ -84,18 +84,24 @@ class OpenSearchRestClient:
             kwargs["transport"] = self._transport
         return httpx.AsyncClient(**kwargs)
 
-    async def ensure_index(self, index_name: str) -> None:
+    async def ensure_index(
+        self, index_name: str, *, vector_dimension: int | None = None
+    ) -> None:
+        properties: dict[str, Any] = {
+            "chunk_id": {"type": "keyword"},
+            "provision_id": {"type": "keyword"},
+            "version_id": {"type": "keyword"},
+            "parser_version": {"type": "keyword"},
+            "content": {"type": "text"},
+        }
+        if vector_dimension is not None:
+            properties["content_vector"] = {
+                "type": "knn_vector",
+                "dimension": vector_dimension,
+            }
         body = {
             "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-            "mappings": {
-                "properties": {
-                    "chunk_id": {"type": "keyword"},
-                    "provision_id": {"type": "keyword"},
-                    "version_id": {"type": "keyword"},
-                    "parser_version": {"type": "keyword"},
-                    "content": {"type": "text"},
-                }
-            },
+            "mappings": {"properties": properties},
         }
         async with self._client() as client:
             response = await client.put(f"/{index_name}", json=body)
@@ -176,6 +182,50 @@ class OpenSearchRestClient:
         parsed.sort(key=lambda item: item.score, reverse=True)
         return tuple(parsed)
 
+    async def search_knn(
+        self,
+        index_name: str,
+        *,
+        query_vector: tuple[float, ...],
+        limit: int,
+        version_id: UUID | None = None,
+    ) -> tuple[LegalSearchHit, ...]:
+        """k-NN search over the dense ``content_vector`` field."""
+        if not isinstance(query_vector, tuple) or not query_vector:
+            raise ValueError("knn query vector must be a non-empty tuple of floats")
+        if any(
+            not isinstance(value, float) or not _finite(value)
+            for value in query_vector
+        ):
+            raise ValueError("knn query vector values must be finite floats")
+        knn: dict[str, Any] = {
+            "field": "content_vector",
+            "query_vector": list(query_vector),
+            "k": limit,
+        }
+        body: dict[str, Any] = {"query": {"knn": knn}, "size": limit}
+        if version_id is not None:
+            body["query"] = {
+                "bool": {
+                    "must": [{"knn": knn}],
+                    "filter": [{"term": {"version_id": str(version_id)}}],
+                }
+            }
+        async with self._client() as client:
+            response = await client.post(f"/{index_name}/_search", json=body)
+            if response.status_code != 200:
+                await self._raise(response)
+        hits = response.json().get("hits", {}).get("hits", [])
+        parsed: list[LegalSearchHit] = []
+        for hit in hits:
+            parsed.append(parse_search_hit(hit))
+        parsed.sort(key=lambda item: item.score, reverse=True)
+        return tuple(parsed)
+
     async def _raise(self, response: httpx.Response) -> None:
         detail = response.text[:512] if response.text else f"HTTP {response.status_code}"
         raise OpenSearchError(f"OpenSearch request failed ({response.status_code}): {detail}")
+
+
+def _finite(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
