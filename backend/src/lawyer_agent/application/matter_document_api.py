@@ -103,6 +103,24 @@ class MatterStorePort(Protocol):
         self, context: TenantContext, matter_id: UUID
     ) -> tuple[MatterParty, ...]: ...
 
+    async def update_party(
+        self,
+        *,
+        tenant_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+        display_name: str | None,
+        kind: str | None,
+    ) -> MatterParty | None: ...
+
+    async def remove_party(
+        self,
+        *,
+        tenant_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+    ) -> bool: ...
+
 
 class DocumentHeaderStorePort(Protocol):
     async def headers_for_matter(
@@ -407,6 +425,51 @@ class MatterDocumentHttpService:
         async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
             await self._require_matter(uow, context, matter_id)
             return tuple(await uow.matters.list_parties(context, matter_id))
+
+    async def update_party(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        party_id: UUID,
+        display_name: str | None,
+        kind: str | None,
+    ) -> MatterParty:
+        require_uuid7(matter_id, field="matter_id")
+        require_uuid7(party_id, field="party_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            await self._require_matter(uow, context, matter_id)
+            try:
+                party = await uow.matters.update_party(
+                    tenant_id=context.tenant_id,
+                    matter_id=matter_id,
+                    party_id=party_id,
+                    display_name=display_name,
+                    kind=kind,
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+            if party is None:
+                raise MatterDocumentNotFound
+            return party
+
+    async def remove_party(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        party_id: UUID,
+    ) -> None:
+        require_uuid7(matter_id, field="matter_id")
+        require_uuid7(party_id, field="party_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            await self._require_matter(uow, context, matter_id)
+            if not await uow.matters.remove_party(
+                tenant_id=context.tenant_id,
+                matter_id=matter_id,
+                party_id=party_id,
+            ):
+                raise MatterDocumentNotFound
 
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID

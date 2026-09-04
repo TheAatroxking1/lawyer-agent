@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from lawyer_agent.api.v1.matter_documents import (
     CreateMatterBody,
     RegisterDocumentBody,
+    UpdatePartyBody,
 )
 from lawyer_agent.application.matter_document_api import (
     MatterDocumentNotFound,
@@ -89,3 +90,40 @@ def test_matter_document_not_found_carries_stable_code() -> None:
     error = MatterDocumentNotFound()
     assert error.code == "matter_document_not_found"
     assert error.status == 404
+
+
+def test_update_party_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="extra"):
+        UpdatePartyBody.model_validate({"display_name": "甲公司", "surprise": True})
+
+
+def test_update_party_rejects_empty_body() -> None:
+    with pytest.raises(ValidationError):
+        UpdatePartyBody.model_validate({})
+
+
+def test_update_party_rejects_blank_display_name() -> None:
+    with pytest.raises(ValidationError):
+        UpdatePartyBody.model_validate({"display_name": "   "})
+
+
+def test_update_party_rejects_blank_kind() -> None:
+    with pytest.raises(ValidationError):
+        UpdatePartyBody.model_validate({"kind": "  "})
+
+
+def test_update_party_rejects_oversized_display_name() -> None:
+    with pytest.raises(ValidationError):
+        UpdatePartyBody.model_validate({"display_name": "甲" * 300})
+
+
+def test_update_party_accepts_display_name_only() -> None:
+    body = UpdatePartyBody.model_validate({"display_name": "新名称"})
+    assert body.display_name == "新名称"
+    assert body.kind is None
+
+
+def test_update_party_accepts_kind_only() -> None:
+    body = UpdatePartyBody.model_validate({"kind": "lawyer"})
+    assert body.kind == "lawyer"
+    assert body.display_name is None

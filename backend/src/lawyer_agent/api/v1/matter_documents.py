@@ -5,7 +5,7 @@ from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Response
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from lawyer_agent.api.dependencies import (
     Services,
@@ -112,6 +112,27 @@ class CreatePartyBody(StrictModel):
         if not value.strip():
             raise ValueError("must not be blank")
         return value
+
+
+class UpdatePartyBody(StrictModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=256)
+    kind: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("display_name", "kind")
+    @classmethod
+    def _strip_optional(cls, value: str | None) -> str | None:
+        if value is not None:
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("must not be blank")
+            return stripped
+        return value
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self) -> UpdatePartyBody:
+        if self.display_name is None and self.kind is None:
+            raise ValueError("at least one of display_name or kind is required")
+        return self
 
 
 class PartySummary(StrictModel):
@@ -307,6 +328,62 @@ async def list_matter_parties(
     except MatterDocumentNotFound as exc:
         raise _map_error(exc) from None
     return [_party_summary(party) for party in parties]
+
+
+@router.patch(
+    "/matters/{matter_id}/parties/{party_id}",
+    response_model=PartySummary,
+    status_code=200,
+)
+async def update_matter_party(
+    tenant_id: UUID,
+    matter_id: UUID,
+    party_id: UUID,
+    body: UpdatePartyBody,
+    actor: TenantActorDependency,
+    services: Services,
+) -> PartySummary:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        party = await service.update_party(
+            context=actor.context,
+            matter_id=matter_id,
+            party_id=party_id,
+            display_name=body.display_name,
+            kind=body.kind,
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
+        raise _map_error(exc) from None
+    return _party_summary(party)
+
+
+@router.delete(
+    "/matters/{matter_id}/parties/{party_id}",
+    status_code=204,
+)
+async def remove_matter_party(
+    tenant_id: UUID,
+    matter_id: UUID,
+    party_id: UUID,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+) -> Response:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        await service.remove_party(
+            context=actor.context,
+            matter_id=matter_id,
+            party_id=party_id,
+        )
+    except MatterDocumentNotFound as exc:
+        raise _map_error(exc) from None
+    response.status_code = 204
+    return response
 
 
 def _party_summary(party: MatterParty) -> PartySummary:

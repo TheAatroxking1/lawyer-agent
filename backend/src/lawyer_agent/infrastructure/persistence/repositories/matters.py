@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.common import new_uuid7, require_uuid7
@@ -223,6 +224,65 @@ class SqlAlchemyMatterRepository:
             .order_by(TenantMatterPartyModel.created_at)
         )
         return tuple(_party(model) for model in rows)
+
+    async def update_party(
+        self,
+        *,
+        tenant_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+        display_name: str | None,
+        kind: str | None,
+    ) -> MatterParty | None:
+        """Update a party's mutable fields with an optimistic version bump."""
+        require_uuid7(tenant_id, field="party tenant_id")
+        require_uuid7(matter_id, field="party matter_id")
+        require_uuid7(party_id, field="party_id")
+        if display_name is not None and (
+            not isinstance(display_name, str) or not display_name.strip()
+        ):
+            raise ValueError("party display name must be non-empty text")
+        if kind is not None and (not isinstance(kind, str) or not kind.strip()):
+            raise ValueError("party kind must be non-empty text")
+        model = await self._session.scalar(
+            select(TenantMatterPartyModel).where(
+                TenantMatterPartyModel.tenant_id == tenant_id,
+                TenantMatterPartyModel.matter_id == matter_id,
+                TenantMatterPartyModel.id == party_id,
+            )
+        )
+        if model is None:
+            return None
+        if display_name is not None:
+            model.display_name = display_name
+        if kind is not None:
+            model.kind = kind
+        model.version = model.version + 1
+        await self._session.flush()
+        return _party(model)
+
+    async def remove_party(
+        self,
+        *,
+        tenant_id: UUID,
+        matter_id: UUID,
+        party_id: UUID,
+    ) -> bool:
+        """Delete a party row that belongs to exactly (tenant, matter)."""
+        require_uuid7(tenant_id, field="party tenant_id")
+        require_uuid7(matter_id, field="party matter_id")
+        require_uuid7(party_id, field="party_id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                delete(TenantMatterPartyModel).where(
+                    TenantMatterPartyModel.tenant_id == tenant_id,
+                    TenantMatterPartyModel.matter_id == matter_id,
+                    TenantMatterPartyModel.id == party_id,
+                )
+            ),
+        )
+        return result.rowcount == 1
 
 
 def _aware(value: datetime | None) -> datetime | None:
