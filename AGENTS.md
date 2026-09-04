@@ -41,6 +41,7 @@
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
 - 下一主线是“阶段 1：法规数据与有据问答”中不依赖 Embedding 模型运行的任务（Embedding/OpenSearch 检索相关步骤仅在用户另行授权时执行）。
 - 阶段 1 非 Embedding 先行切片已完成（2026-09-04 计划）：法规版本模型/条文/Chunk/数据集快照 Schema、时点查询、DOCX 只读解析（真实样本 134 条）、盘点/Manifest/质量门禁与 dataset_v1 发布、Evidence Bundle 与 Citation Gate 后端校验；OpenSearch/Embedding/Reranker/DeepSeek/SSE 与完整问答链路仍为待授权延后项。
+- 阶段 2 非模型先行切片已完成（2026-09-05 计划）：租户 Matter、Document 版本、对象引用白名单、上传会话/校验（NEEDS_REVIEW 不绕过）、Review 状态骨架与跨租户反向测试；条款/风险 AI、RAG、Drafting/导出、MinIO 预签名直传仍为延后项。
 - 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。
 
 ## 多租户与授权不变量
