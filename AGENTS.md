@@ -46,6 +46,7 @@
 - 阶段 2 增补“Rule Check DOCX 报告导出”非模型切片已完成（2026-09-05 计划）：stdlib 只写 DOCX（XML 转义、拒控制字符/超长、无 DOCTYPE/ENTITY/外部关系）、报告组装服务只消费已入库文档元数据与 RiskIssue/处置记录、免责声明与「待人工核验/无命中≠无风险」措辞、DOCX 写→读回闭环与真实 MySQL seed→检查→处置→导出流、跨租户导出反向测试；PDF、正式 LegalReport 发布/审批/版本化、模板引擎、派生版本落库与下载 API 仍为延后项。
 - 阶段 2 增补“Rule Check 租户 HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/...` 下运行检查/读取/处置 RiskIssue/下载 DOCX 报告四个端点（Pydantic 严格模型、path tenant 强校验、每请求显式 TenantContext UoW、run 幂等、处置条件更新防并发）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 run→list→dispose→409→report 读回，以及 path 与资源两层跨租户反向；permission code 化、上传预签名链、条款 AI/RAG 仍为延后项。
 - 阶段 2 增补“租户 Matter/Document HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/...` 下创建/读取 Matter、登记 Document 原件版本（docx→ACCEPTED、非白名单 MIME→NEEDS_REVIEW）、按 Matter 列出版本（含新增 DocumentHeader 领域类型与仓储 headers_for_matter）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 create→get→register→list 与租户 B 的路径/资源两层跨租户反向；为 Rule Check HTTP API 提供上游闭环；上传预签名 MinIO、Idempotency-Key 化、Review API、审计登记仍为延后项。
+- 阶段 2 增补“Document Review 状态机 HTTP API”非模型切片已完成（2026-09-05 计划）：`POST /api/v1/tenants/{tenant_id}/documents/{document_id}/versions/{version_no}/review` 提交/批准/驳回/要求修改人工复核（迁移 20260905_10 增加 `review_reason` 列并往返+`alembic check`；域状态机纯函数拒绝非法转换与空理由；仓储按唯一键原子更新并仅放行 accepted/ready 版本）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 submit→request_changes→resubmit→approve→终态 409 与跨租户双层 404；自动发布/结论引用门槛、审计登记仍为延后项。
 - 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。
 
 ## 多租户与授权不变量
