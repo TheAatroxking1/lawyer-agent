@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from lawyer_agent.api.v1 import (
     accounts,
     ai_jobs,
+    audit,
     auth,
     invitations,
     matter_documents,
@@ -24,3 +25,4 @@ api_v1_router.include_router(rule_checks.router)
 api_v1_router.include_router(matter_documents.router)
 api_v1_router.include_router(reviews.router)
 api_v1_router.include_router(rule_packs.router)
+api_v1_router.include_router(audit.router)

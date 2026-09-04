@@ -96,6 +96,7 @@ class ApplicationServices:
     matter_document_http: Any = None
     document_review_http: Any = None
     rule_pack_admin_http: Any = None
+    audit_query_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -230,6 +231,7 @@ async def application_services(
         ),
         document_review_http=_build_document_review_http_service(session_factory),
         rule_pack_admin_http=_build_rule_pack_admin_http_service(session_factory),
+        audit_query_http=_build_audit_query_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -315,6 +317,18 @@ def _build_rule_pack_admin_http_service(session_factory: Any) -> Any:
 
     return RulePackAdminHttpService(
         lambda: SqlAlchemyRulePackAdminUnitOfWork(session_factory)
+    )
+
+
+def _build_audit_query_http_service(session_factory: Any) -> Any:
+    """Composition root for the tenant audit query HTTP service."""
+    from lawyer_agent.application.audit_query_api import AuditQueryHttpService
+    from lawyer_agent.infrastructure.persistence.matter_document_uow import (
+        SqlAlchemyMatterDocumentUnitOfWork,
+    )
+
+    return AuditQueryHttpService(
+        lambda: SqlAlchemyMatterDocumentUnitOfWork(session_factory)
     )
 
 
