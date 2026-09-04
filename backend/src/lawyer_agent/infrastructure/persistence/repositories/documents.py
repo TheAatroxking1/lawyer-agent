@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.domain.document_review import (
+    InvalidReviewTransition,
+    ReviewDecision,
+    require_review_reason,
+    review_target_status,
+)
 from lawyer_agent.domain.matter_documents import (
     DocumentHeader,
     DocumentKind,
@@ -35,6 +43,10 @@ _REVIEW_MAP = {
     "approved": ReviewStatus.APPROVED,
     "rejected": ReviewStatus.REJECTED,
 }
+
+
+class ReviewTargetNotFound(ValueError):
+    pass
 
 
 class SqlAlchemyDocumentRepository:
@@ -76,15 +88,70 @@ class SqlAlchemyDocumentRepository:
         )
 
     async def find_version(
-        self, tenant_id: UUID, document_id: UUID
+        self, tenant_id: UUID, document_id: UUID, version_no: int | None = None
     ) -> DocumentVersion | None:
-        model = await self._session.scalar(
-            select(TenantDocumentVersionModel).where(
-                TenantDocumentVersionModel.tenant_id == tenant_id,
-                TenantDocumentVersionModel.document_id == document_id,
+        statement = select(TenantDocumentVersionModel).where(
+            TenantDocumentVersionModel.tenant_id == tenant_id,
+            TenantDocumentVersionModel.document_id == document_id,
+        )
+        if version_no is not None:
+            statement = statement.where(
+                TenantDocumentVersionModel.version_no == version_no
             )
+        model = await self._session.scalar(
+            statement.order_by(TenantDocumentVersionModel.version_no.desc())
         )
         return None if model is None else _document_version(model)
+
+    async def review_document_version(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        version_no: int,
+        decision: ReviewDecision,
+        reason: str | None,
+    ) -> DocumentVersion:
+        """Apply a human review decision to one version atomically.
+
+        Only versions whose upload has completed (accepted or ready) can enter
+        review. The transition is validated by the domain state machine and
+        written with a guarded update on the unique version key.
+        """
+        require_review_reason(decision, reason)
+        version = await self.find_version(tenant_id, document_id, version_no)
+        if version is None:
+            raise ReviewTargetNotFound("document version not found")
+        if version.upload_status not in {
+            DocumentUploadStatus.ACCEPTED,
+            DocumentUploadStatus.READY,
+        }:
+            raise InvalidReviewTransition(
+                f"upload must be accepted or ready before review "
+                f"(current={version.upload_status.value})"
+            )
+        target = review_target_status(version.review_status, decision)
+        stored_reason = reason.strip() if reason is not None else None
+        if target is ReviewStatus.APPROVED or target is ReviewStatus.PENDING_REVIEW:
+            stored_reason = None
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantDocumentVersionModel)
+                .where(
+                    TenantDocumentVersionModel.tenant_id == tenant_id,
+                    TenantDocumentVersionModel.document_id == document_id,
+                    TenantDocumentVersionModel.version_no == version_no,
+                )
+                .values(review_status=target.value, review_reason=stored_reason)
+            ),
+        )
+        if result.rowcount != 1:
+            raise InvalidReviewTransition("review update affected no row")
+        updated = await self.find_version(tenant_id, document_id, version_no)
+        if updated is None:
+            raise InvalidReviewTransition("review update could not be read back")
+        return updated
 
     async def save_document_version(
         self, version: DocumentVersion, *, matter_id: UUID
@@ -112,6 +179,7 @@ class SqlAlchemyDocumentRepository:
                 review_status=version.review_status.value
                 if version.review_status is not None
                 else None,
+                review_reason=version.review_reason,
                 file_name=version.file_name,
                 mime_type=version.mime_type,
                 size_bytes=version.size_bytes,
@@ -143,6 +211,7 @@ def _document_version(model: TenantDocumentVersionModel) -> DocumentVersion:
         review_status=_REVIEW_MAP[model.review_status]
         if model.review_status is not None
         else None,
+        review_reason=model.review_reason,
         created_by_user_id=model.created_by_user_id,
         created_by_membership_id=model.created_by_membership_id,
         uploaded_at=_aware_optional(model.uploaded_at),

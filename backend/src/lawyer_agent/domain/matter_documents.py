@@ -165,6 +165,7 @@ class DocumentVersion:
     parser_version: str | None = None
     parse_error: str | None = None
     review_status: ReviewStatus | None = None
+    review_reason: str | None = None
     created_by_user_id: UUID | None = None
     created_by_membership_id: UUID | None = None
     uploaded_at: datetime | None = None

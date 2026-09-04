@@ -148,6 +148,7 @@ class TenantDocumentVersionModel(TimestampMixin, Base):
         String(16), nullable=False, server_default="uploaded"
     )
     review_status: Mapped[str | None] = mapped_column(String(24))
+    review_reason: Mapped[str | None] = mapped_column(Text)
     file_name: Mapped[str | None] = mapped_column(String(256))
     mime_type: Mapped[str | None] = mapped_column(String(128))
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)

@@ -2,13 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把阶段 2 已建模但未落地的 **Document Version Review 状态机**交付为受控租户 HTTP API：律师/法务对某个上传完成的 Document Version 提交复核（`PENDING_REVIEW`）、批准（`APPROVED`）、驳回（`REJECTED`）或要求修改（`CHANGES_REQUESTED`）。Review 状态是后续「审查报告/正式结论可否引用该版本」的人工闸门。无 Schema 变更、不引入模型。
+**Goal:** 把阶段 2 已建模但未落地的 **Document Version Review 状态机**交付为受控租户 HTTP API：律师/法务对某个上传完成的 Document Version 提交复核（`PENDING_REVIEW`）、批准（`APPROVED`）、驳回（`REJECTED`）或要求修改（`CHANGES_REQUESTED`）。驳回/要求修改必须记录人工理由（新 Migration 为 `tenant_document_versions` 增加 `review_reason` 列）。Review 状态是后续「审查报告/正式结论可否引用该版本」的人工闸门。不加新表、不引入模型。
 
 **Scope / 边界（明确延后）：**
 - 不调用生成模型/Embedding；不做条款 AI、RAG、PDF。
 - 不做 Review 与 RiskIssue/报告导出的自动联动（发布门槛接入报告/正式结论为后续切片）；本切片只让状态机真实可写可查。
 - 上传/预签名 MinIO、Idempotency-Key 化、permission code 化、审计事件登记均为延后项。
 - 只允许有意义的转换（见 Domain 转换表）；`DRAFT→PENDING_REVIEW→APPROVED/CHANGES_REQUESTED/REJECTED`，`PENDING_REVIEW→CHANGES_REQUESTED→PENDING_REVIEW`，终态 `APPROVED/REJECTED` 不可再转换。
+- **Schema**：新增唯一一个向前 Migration（`20260905_10`）为 `tenant_document_versions` 增加可空 `review_reason`（Text）列；不修改已发布 Migration。
 
 **Architecture:** Domain 层提供纯函数状态机（frozen value 语义，非法转换抛错）；仓储提供乐观条件更新（按 `tenant_id+document_id+version_id`，`upload_status` 门禁只允许已上传完成的版本进入 Review，`version` 乐观锁）；API 层薄封装（TenantActorDependency + require_path_tenant + 严格 Pydantic + Problem Details）。组合根沿用 `matter_document_http` 的 UoW 模式。
 
@@ -26,14 +27,18 @@
 
 ```text
 backend/
+  alembic/versions/20260905_10_document_review_reason.py  # add nullable review_reason to tenant_document_versions
   src/lawyer_agent/
-    domain/document_review.py       # ReviewDecision + document_review_transition 纯函数
-    infrastructure/persistence/repositories/documents.py  # find_version 修正排序 + review_version 乐观更新
+    domain/document_review.py       # ReviewDecision + document_review_transition 纯函数（已完成 A1）
+    domain/matter_documents.py      # DocumentVersion.review_reason 字段
+    infrastructure/persistence/models/matter_documents.py  # 同步 review_reason 列
+    infrastructure/persistence/repositories/documents.py  # review_version 原子更新
     api/v1/reviews.py               # router：POST documents/{document_id}/versions/{version_no}/review
     api/v1/router.py / dependencies.py  # include + 组合根
   tests/
-    unit/test_document_review.py           # 状态机纯函数（合法/非法转换、理由必填）
+    unit/test_document_review.py           # 状态机纯函数（合法/非法转换、理由必填）——已完成 A1
     unit/test_document_review_api_contract.py  # body 模型与错误码
+    integration/mysql/test_document_review_migration.py   # 迁移往返 + alembic check
     integration/mysql/test_document_review_http_api.py  # 真实 MySQL+Redis 全栈 + 跨租户反向
 ```
 
@@ -45,9 +50,11 @@ backend/
 - 单测：全部合法转换 + 非法转换拒绝 + 空理由拒绝。
 - Commit: `feat: model document review transitions`
 
-### Task A2: 仓储 Review 更新
-- `review_document_version(...)`：按唯一键 `tenant_id+document_id+version_no` 原子条件更新 `review_status`（`rowcount==1` 判定成功）；加载时校验 `upload_status in ('accepted','ready')`（只有完成上传的版本可进 Review），域转换通过后才落库。
-- 单测/迁移测试：未上传完成的版本拒绝进入 Review；不存在的版本返回 None。
+### Task A2: Migration + 模型 + 仓储 Review 更新
+- Migration `20260905_10`：`tenant_document_versions` 增加可空 `review_reason`（Text）；往返 + `alembic check`（对照模型）。
+- `DocumentVersion.review_reason`（str | None）与 ORM 列、仓储映射同步；`_document_version`/`save` 读写该列。
+- `review_document_version(...)`：按唯一键 `tenant_id+document_id+version_no` 原子条件更新 `review_status` + `review_reason`（`rowcount==1` 判定成功）；加载时校验 `upload_status in ('accepted','ready')`（只有完成上传的版本可进 Review），域转换通过后才落库。
+- 单测/迁移测试：迁移往返 + `alembic check`；未上传完成的版本拒绝进入 Review；不存在的版本返回 None。
 - Commit: `feat: persist document review decisions`
 
 ## 里程碑 B：HTTP API
