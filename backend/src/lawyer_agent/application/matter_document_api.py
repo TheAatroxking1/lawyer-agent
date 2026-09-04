@@ -34,6 +34,7 @@ from lawyer_agent.domain.matter_documents import (
     DocumentVersion,
     Matter,
     MatterKind,
+    MatterParty,
 )
 from lawyer_agent.domain.tenancy import TenantContext
 
@@ -88,6 +89,19 @@ class MatterStorePort(Protocol):
         created_by_membership_id: UUID,
         description: str | None = None,
     ) -> Matter: ...
+
+    async def add_party(
+        self,
+        *,
+        tenant_id: UUID,
+        matter_id: UUID,
+        display_name: str,
+        kind: str,
+    ) -> MatterParty: ...
+
+    async def list_parties(
+        self, context: TenantContext, matter_id: UUID
+    ) -> tuple[MatterParty, ...]: ...
 
 
 class DocumentHeaderStorePort(Protocol):
@@ -364,6 +378,35 @@ class MatterDocumentHttpService:
             return tuple(
                 await uow.documents.headers_for_matter(context.tenant_id, matter_id)
             )
+
+    async def add_party(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        display_name: str,
+        kind: str,
+    ) -> MatterParty:
+        require_uuid7(matter_id, field="matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            await self._require_matter(uow, context, matter_id)
+            try:
+                return await uow.matters.add_party(
+                    tenant_id=context.tenant_id,
+                    matter_id=matter_id,
+                    display_name=display_name,
+                    kind=kind,
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+
+    async def list_parties(
+        self, *, context: TenantContext, matter_id: UUID
+    ) -> tuple[MatterParty, ...]:
+        require_uuid7(matter_id, field="matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            await self._require_matter(uow, context, matter_id)
+            return tuple(await uow.matters.list_parties(context, matter_id))
 
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID

@@ -108,6 +108,17 @@ def _matter_model(matter: Matter) -> TenantMatterModel:
     )
 
 
+def _party(model: TenantMatterPartyModel) -> MatterParty:
+    return MatterParty(
+        id=model.id,
+        tenant_id=model.tenant_id,
+        matter_id=model.matter_id,
+        display_name=model.display_name,
+        kind=model.kind,
+        version=model.version,
+    )
+
+
 class SqlAlchemyMatterRepository:
     """Tenant-scoped Matter repository; get_by_id is impossible without tenant."""
 
@@ -162,6 +173,14 @@ class SqlAlchemyMatterRepository:
     ) -> MatterParty:
         require_uuid7(tenant_id, field="party tenant_id")
         require_uuid7(matter_id, field="party matter_id")
+        matter = await self._session.scalar(
+            select(TenantMatterModel).where(
+                TenantMatterModel.tenant_id == tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+        )
+        if matter is None:
+            raise ValueError("matter does not belong to this tenant")
         party = MatterParty(
             id=new_uuid7(),
             tenant_id=tenant_id,
@@ -181,6 +200,29 @@ class SqlAlchemyMatterRepository:
         )
         await self._session.flush()
         return party
+
+    async def list_parties(
+        self, context: TenantContext, matter_id: UUID
+    ) -> tuple[MatterParty, ...]:
+        _require_context(context)
+        require_uuid7(matter_id, field="matter_id")
+        matter = await self._session.scalar(
+            select(TenantMatterModel).where(
+                TenantMatterModel.tenant_id == context.tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+        )
+        if matter is None:
+            return ()
+        rows = await self._session.scalars(
+            select(TenantMatterPartyModel)
+            .where(
+                TenantMatterPartyModel.tenant_id == context.tenant_id,
+                TenantMatterPartyModel.matter_id == matter_id,
+            )
+            .order_by(TenantMatterPartyModel.created_at)
+        )
+        return tuple(_party(model) for model in rows)
 
 
 def _aware(value: datetime | None) -> datetime | None:

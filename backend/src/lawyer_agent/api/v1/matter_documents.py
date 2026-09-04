@@ -23,6 +23,7 @@ from lawyer_agent.domain.matter_documents import (
     DocumentVersion,
     Matter,
     MatterKind,
+    MatterParty,
 )
 
 router = APIRouter(
@@ -99,6 +100,26 @@ class DocumentHeaderSummary(StrictModel):
     id: UUID
     display_name: str
     current_version_no: int
+
+
+class CreatePartyBody(StrictModel):
+    display_name: str = Field(min_length=1, max_length=256)
+    kind: str = Field(min_length=1, max_length=64)
+
+    @field_validator("display_name", "kind")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class PartySummary(StrictModel):
+    id: UUID
+    matter_id: UUID
+    display_name: str
+    kind: str
+    version: int
 
 
 def _require_service(services: Services) -> MatterDocumentHttpService:
@@ -236,4 +257,63 @@ def _document_summary(version: DocumentVersion) -> DocumentSummary:
         review_status=version.review_status.value
         if version.review_status is not None
         else None,
+    )
+
+
+@router.post(
+    "/matters/{matter_id}/parties",
+    response_model=PartySummary,
+    status_code=201,
+)
+async def add_matter_party(
+    tenant_id: UUID,
+    matter_id: UUID,
+    body: CreatePartyBody,
+    actor: TenantActorDependency,
+    services: Services,
+) -> PartySummary:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        party = await service.add_party(
+            context=actor.context,
+            matter_id=matter_id,
+            display_name=body.display_name.strip(),
+            kind=body.kind.strip(),
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
+        raise _map_error(exc) from None
+    return _party_summary(party)
+
+
+@router.get(
+    "/matters/{matter_id}/parties",
+    response_model=list[PartySummary],
+)
+async def list_matter_parties(
+    tenant_id: UUID,
+    matter_id: UUID,
+    actor: TenantActorDependency,
+    services: Services,
+) -> list[PartySummary]:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        parties = await service.list_parties(
+            context=actor.context, matter_id=matter_id
+        )
+    except MatterDocumentNotFound as exc:
+        raise _map_error(exc) from None
+    return [_party_summary(party) for party in parties]
+
+
+def _party_summary(party: MatterParty) -> PartySummary:
+    return PartySummary(
+        id=party.id,
+        matter_id=party.matter_id,
+        display_name=party.display_name,
+        kind=party.kind,
+        version=party.version,
     )
