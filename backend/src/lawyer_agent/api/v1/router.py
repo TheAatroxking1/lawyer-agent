@@ -9,6 +9,7 @@ from lawyer_agent.api.v1 import (
     platform,
     reviews,
     rule_checks,
+    rule_packs,
     tenants,
 )
 
@@ -22,3 +23,4 @@ api_v1_router.include_router(ai_jobs.router)
 api_v1_router.include_router(rule_checks.router)
 api_v1_router.include_router(matter_documents.router)
 api_v1_router.include_router(reviews.router)
+api_v1_router.include_router(rule_packs.router)
