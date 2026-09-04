@@ -143,45 +143,85 @@ class RuleCheckHttpService:
         trace_id: str | None = None,
     ) -> RiskIssue:
         require_uuid7(issue_id, field="issue_id")
-        async with cast(RuleCheckUnitOfWorkPort, self._uow_factory()) as uow:
-            issue = await uow.rule_check.find_issue(context, issue_id)
-            if issue is None:
-                raise RuleCheckIssueNotFound
-            service = RuleCheckService(
-                rule_store=uow.rule_check,
-                engine=RuleEngine(),
-            )
-            try:
-                disposed = await service.dispose(
+        try:
+            async with cast(RuleCheckUnitOfWorkPort, self._uow_factory()) as uow:
+                issue = await uow.rule_check.find_issue(context, issue_id)
+                if issue is None:
+                    raise RuleCheckIssueNotFound
+                service = RuleCheckService(
+                    rule_store=uow.rule_check,
+                    engine=RuleEngine(),
+                )
+                try:
+                    disposed = await service.dispose(
+                        context=context,
+                        issue_id=issue_id,
+                        status=status,
+                        reason=reason,
+                        now=now,
+                    )
+                except ValueError as exc:
+                    if "only open risk issues can be disposed" in str(exc):
+                        raise RuleCheckConflict from exc
+                    raise RuleCheckInvalidRequest from exc
+                if not disposed:
+                    raise RuleCheckConflict
+                await _append_tenant_audit(
+                    uow,
                     context=context,
-                    issue_id=issue_id,
+                    action="risk_issue.dispose",
+                    reason_code="disposed",
+                    target_type="risk_issue",
+                    target_id=issue_id,
+                    trace_id=trace_id,
+                    now=now,
+                )
+                # Project the committed disposition without relying on a second read.
+                return dispose_risk_issue(
+                    issue=issue,
                     status=status,
                     reason=reason,
                     now=now,
                 )
-            except ValueError as exc:
-                if "only open risk issues can be disposed" in str(exc):
-                    raise RuleCheckConflict from exc
-                raise RuleCheckInvalidRequest from exc
-            if not disposed:
-                raise RuleCheckConflict
-            await _append_tenant_audit(
-                uow,
+        except RuleCheckIssueNotFound as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
                 context=context,
                 action="risk_issue.dispose",
-                reason_code="disposed",
+                result="denied",
+                reason_code=exc.code,
                 target_type="risk_issue",
                 target_id=issue_id,
                 trace_id=trace_id,
                 now=now,
             )
-            # Project the committed disposition without relying on a second read.
-            return dispose_risk_issue(
-                issue=issue,
-                status=status,
-                reason=reason,
+            raise
+        except RuleCheckConflict as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="risk_issue.dispose",
+                result="denied",
+                reason_code=exc.code,
+                target_type="risk_issue",
+                target_id=issue_id,
+                trace_id=trace_id,
                 now=now,
             )
+            raise
+        except RuleCheckInvalidRequest as exc:
+            await _append_rejected_audit(
+                self._uow_factory,
+                context=context,
+                action="risk_issue.dispose",
+                result="failure",
+                reason_code=exc.code,
+                target_type="risk_issue",
+                target_id=issue_id,
+                trace_id=trace_id,
+                now=now,
+            )
+            raise
 
     async def export_report(
         self,
@@ -223,6 +263,7 @@ async def _append_tenant_audit(
     target_id: UUID,
     trace_id: str | None,
     now: datetime,
+    result: str = "success",
 ) -> None:
     audit = getattr(uow, "audit", None)
     user_id = getattr(context, "membership_user_id", None)
@@ -241,7 +282,39 @@ async def _append_tenant_audit(
             trace_id=trace_id,
             target_type=target_type,
             target_id=target_id,
-            result="success",
+            result=result,
             occurred_at=now,
         )
     )
+
+
+async def _append_rejected_audit(
+    uow_factory: Callable[[], Any],
+    *,
+    context: TenantScoped,
+    action: str,
+    result: str,
+    reason_code: str,
+    target_type: str,
+    target_id: UUID,
+    trace_id: str | None,
+    now: datetime,
+) -> None:
+    """Record a rejected/failed write attempt in its own committed transaction.
+
+    The failing business UoW has already rolled back when an error handler calls
+    this, so the audit append opens a fresh short-lived UoW whose clean exit
+    commits only the audit row.
+    """
+    async with cast(RuleCheckUnitOfWorkPort, uow_factory()) as uow:
+        await _append_tenant_audit(
+            uow,
+            context=context,
+            action=action,
+            reason_code=reason_code,
+            target_type=target_type,
+            target_id=target_id,
+            trace_id=trace_id,
+            now=now,
+            result=result,
+        )
