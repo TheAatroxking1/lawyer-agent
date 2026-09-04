@@ -55,6 +55,13 @@ class AIJobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class InboxStatus(StrEnum):
+    ACCEPTED = "accepted"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+
+
 class PublicAIJobStatus(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"

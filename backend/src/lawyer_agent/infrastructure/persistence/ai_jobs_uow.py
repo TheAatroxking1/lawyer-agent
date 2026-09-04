@@ -6,11 +6,15 @@ from typing import Self
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from lawyer_agent.infrastructure.persistence.repositories.ai_jobs import (
+    SqlAlchemyAIJobAuthorityLoader,
     SqlAlchemyAIJobRepository,
 )
 from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepository
 from lawyer_agent.infrastructure.persistence.repositories.idempotency import (
     SqlAlchemyIdempotencyRepository,
+)
+from lawyer_agent.infrastructure.persistence.repositories.message_security import (
+    MessageSecurityRejectionRepository,
 )
 
 
@@ -20,6 +24,8 @@ class SqlAlchemyAIJobUnitOfWork:
         self._session: AsyncSession | None = None
         self.jobs: SqlAlchemyAIJobRepository
         self.runtime: SqlAlchemyAIJobRepository
+        self.authority: SqlAlchemyAIJobAuthorityLoader
+        self.security_rejections: MessageSecurityRejectionRepository
         self.idempotency: SqlAlchemyIdempotencyRepository
         self.audit: AuditRepository
 
@@ -30,6 +36,8 @@ class SqlAlchemyAIJobUnitOfWork:
         repository = SqlAlchemyAIJobRepository(self._session)
         self.jobs = repository
         self.runtime = repository
+        self.authority = SqlAlchemyAIJobAuthorityLoader(self._session)
+        self.security_rejections = MessageSecurityRejectionRepository(self._session)
         self.idempotency = SqlAlchemyIdempotencyRepository(self._session)
         self.audit = AuditRepository(self._session)
         return self

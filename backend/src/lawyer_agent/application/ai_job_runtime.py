@@ -28,6 +28,27 @@ class OutboxStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class DeliveryDecision(StrEnum):
+    """Broker-facing outcome of one worker delivery (never requeues hot messages)."""
+
+    ACK_DUPLICATE = "ack_duplicate"
+    ACK_TERMINAL = "ack_terminal"
+    ACK_CLAIMED = "ack_claimed"
+    REJECT_NO_REQUEUE = "reject_no_requeue"
+
+
+class InboxDisposition(StrEnum):
+    """First-seen result before the authoritative Claim transaction."""
+
+    NEW = "new"
+    EXACT_DIGEST_DUPLICATE = "exact_digest_duplicate"
+    DIGEST_CONFLICT = "digest_conflict"
+    NONCE_CONFLICT = "nonce_conflict"
+    CLOCK_OUT_OF_WINDOW = "clock_out_of_window"
+    JOB_UNAVAILABLE = "job_unavailable"
+    AUTHORIZATION_REVOKED = "authorization_revoked"
+
+
 class PublisherErrorCode(StrEnum):
     RABBIT_UNROUTABLE = "rabbit_unroutable"
     RABBIT_NACK = "rabbit_nack"

@@ -50,6 +50,7 @@ from lawyer_agent.infrastructure.persistence.models import (
     AIJobAccessGrantModel,
     AIJobAttemptModel,
     AIJobExecutionGrantModel,
+    AIJobInboxModel,
     AIJobModel,
     AIJobOutboxModel,
     MembershipRoleAssignmentModel,
@@ -431,6 +432,156 @@ class SqlAlchemyAIJobRepository:
             ),
         )
         return changed.rowcount == 1
+
+    async def inbox_row(
+        self,
+        tenant_id: UUID,
+        message_id: UUID,
+    ) -> AIJobInboxModel | None:
+        """Look up an Inbox row by its verified (tenant, message) identity."""
+        require_uuid7(tenant_id, field="inbox tenant_id")
+        require_uuid7(message_id, field="inbox message_id")
+        model = await self._session.scalar(
+            select(AIJobInboxModel).where(
+                AIJobInboxModel.tenant_id == tenant_id,
+                AIJobInboxModel.message_id == message_id,
+            )
+        )
+        return None if model is None else model
+
+    async def complete_inbox_terminal(
+        self,
+        inbox_id: UUID,
+        *,
+        rejection_code: str | None,
+        now: datetime,
+    ) -> bool:
+        """Mark an Inbox row Completed without a Handling Attempt (fail closed)."""
+        require_uuid7(inbox_id, field="inbox id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobInboxModel)
+                .where(
+                    AIJobInboxModel.id == inbox_id,
+                    AIJobInboxModel.handling_attempt_id.is_(None),
+                    AIJobInboxModel.handling_fence.is_(None),
+                    AIJobInboxModel.status.in_(("accepted", "processing")),
+                )
+                .values(
+                    status="completed",
+                    completed_at=_naive(now),
+                    rejection_code=rejection_code,
+                )
+            ),
+        )
+        return result.rowcount == 1
+
+    async def bind_inbox_processing(
+        self,
+        inbox_id: UUID,
+        *,
+        attempt_id: UUID,
+        lease_fence: int,
+        now: datetime,
+    ) -> bool:
+        """Attach a Claimed Attempt to an Inbox row with the four-column fence."""
+        require_uuid7(inbox_id, field="inbox id")
+        require_uuid7(attempt_id, field="attempt id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobInboxModel)
+                .where(
+                    AIJobInboxModel.id == inbox_id,
+                    AIJobInboxModel.handling_attempt_id.is_(None),
+                    AIJobInboxModel.handling_fence.is_(None),
+                    AIJobInboxModel.status == "accepted",
+                )
+                .values(
+                    status="processing",
+                    handling_attempt_id=attempt_id,
+                    handling_fence=lease_fence,
+                    last_received_at=_naive(now),
+                )
+            ),
+        )
+        return result.rowcount == 1
+
+    async def insert_inbox_accepted(
+        self,
+        inbox_id: UUID,
+        *,
+        tenant_id: UUID,
+        message_id: UUID,
+        job_id: UUID,
+        envelope_digest: bytes,
+        nonce_digest: bytes,
+        now: datetime,
+    ) -> None:
+        """Insert the first-seen Inbox row with no Handling Attempt yet."""
+        require_uuid7(inbox_id, field="inbox id")
+        require_uuid7(tenant_id, field="inbox tenant_id")
+        require_uuid7(message_id, field="inbox message_id")
+        require_uuid7(job_id, field="inbox job_id")
+        if not isinstance(envelope_digest, bytes) or len(envelope_digest) != 32:
+            raise ValueError("inbox envelope digest must be 32 bytes")
+        if not isinstance(nonce_digest, bytes) or len(nonce_digest) != 32:
+            raise ValueError("inbox nonce digest must be 32 bytes")
+        self._session.add(
+            AIJobInboxModel(
+                id=inbox_id,
+                tenant_id=tenant_id,
+                message_id=message_id,
+                job_id=job_id,
+                schema_version=1,
+                envelope_digest=envelope_digest,
+                nonce_digest=nonce_digest,
+                status="accepted",
+                first_received_at=_naive(now),
+                last_received_at=_naive(now),
+                delivery_count=1,
+            )
+        )
+        await self._session.flush()
+
+    async def fail_job_without_attempt(
+        self,
+        *,
+        tenant_id: UUID,
+        job_id: UUID,
+        failure_class: str,
+        failure_code: str,
+        now: datetime,
+    ) -> bool:
+        """Terminal transition for a claimable Job that lost its authority."""
+        require_uuid7(tenant_id, field="fail job tenant_id")
+        require_uuid7(job_id, field="fail job job_id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobModel)
+                .where(
+                    AIJobModel.tenant_id == tenant_id,
+                    AIJobModel.id == job_id,
+                    AIJobModel.status.in_(
+                        (AIJobStatus.QUEUED.value, AIJobStatus.RETRY_SCHEDULED.value)
+                    ),
+                    AIJobModel.lease_owner.is_(None),
+                    AIJobModel.lease_token.is_(None),
+                )
+                .values(
+                    status=AIJobStatus.FAILED.value,
+                    failure_class=failure_class,
+                    failure_code=failure_code,
+                    completed_at=_naive(now),
+                    next_attempt_at=None,
+                    version=AIJobModel.version + 1,
+                    updated_at=_naive(now),
+                )
+            ),
+        )
+        return result.rowcount == 1
 
 
 def _job(model: AIJobModel) -> AIJob:
