@@ -41,6 +41,14 @@ _RULE_ADD_ROUTE = (
     "/api/v1/tenants/{tenant_id}/rule-packs/{pack_id}/rules"
 )
 _RULE_RESULT_TYPE = "rule_pack.rule"
+_SET_RULE_ENABLED_OPERATION = "rule_pack.set_rule_enabled"
+_SET_RULE_ENABLED_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/rule-packs/{pack_id}/rules/{rule_id}"
+)
+_ACTIVATE_PACK_OPERATION = "rule_pack.activate"
+_ACTIVATE_PACK_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/rule-packs/{pack_id}/activate"
+)
 
 
 class RulePackAdminError(Exception):
@@ -342,31 +350,125 @@ class RulePackAdminHttpService:
         pack_id: UUID,
         rule_id: UUID,
         enabled: bool,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
     ) -> None:
         require_uuid7(pack_id, field="pack_id")
         require_uuid7(rule_id, field="rule_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
+            if idempotency_key and self._idempotency is not None:
+                if membership_id is None:
+                    raise RulePackAdminConflict
+                reservation = await self._reserve_rule_toggle(
+                    uow,
+                    tenant_id=context.tenant_id,
+                    membership_id=membership_id,
+                    pack_id=pack_id,
+                    rule_id=rule_id,
+                    enabled=enabled,
+                    idempotency_key=idempotency_key,
+                    now=effective_now,
+                )
+                if reservation.is_replay:
+                    return
             await self._require_pack(uow, context, pack_id)
             changed = await uow.rule_pack.set_rule_enabled(
                 context, pack_id, rule_id, enabled=enabled
             )
             if not changed:
                 raise RulePackAdminNotFound
+            if reservation is not None:
+                assert self._idempotency is not None
+                await self._idempotency.complete(
+                    uow.idempotency,
+                    reservation,
+                    IdempotencyResultReference(_RULE_RESULT_TYPE, rule_id),
+                    now=effective_now,
+                )
+
+    async def _reserve_rule_toggle(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        pack_id: UUID,
+        rule_id: UUID,
+        enabled: bool,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_SET_RULE_ENABLED_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="PATCH",
+                canonical_route=_SET_RULE_ENABLED_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "pack_id": str(pack_id),
+                        "rule_id": str(rule_id),
+                        "enabled": enabled,
+                    },
+                    business_paths=frozenset(
+                        {("pack_id",), ("rule_id",), ("enabled",)}
+                    ),
+                ),
+            ),
+            now=now,
+        )
 
     async def activate_pack(
         self,
         *,
         context: TenantContext,
         pack_id: UUID,
+        idempotency_key: str | None = None,
         trace_id: str | None = None,
+        now: datetime | None = None,
     ) -> RulePack:
         require_uuid7(pack_id, field="pack_id")
+        membership_id = context.membership_id
+        effective_now = now or datetime.now(UTC)
+        reservation = None
         try:
             async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
+                if idempotency_key and self._idempotency is not None:
+                    if membership_id is None:
+                        raise RulePackAdminConflict
+                    reservation = await self._reserve_pack_activate(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        pack_id=pack_id,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.is_replay:
+                        assert reservation.replay is not None
+                        return await self._require_pack(uow, context, pack_id)
                 await self._require_pack(uow, context, pack_id)
                 activated = await uow.rule_pack.activate_pack(context, pack_id)
                 if not activated:
                     raise RulePackAdminConflict
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(_PACK_RESULT_TYPE, pack_id),
+                        now=effective_now,
+                    )
                 await _append_audit(
                     uow,
                     context=context,
@@ -401,6 +503,37 @@ class RulePackAdminHttpService:
                 trace_id=trace_id,
             )
             raise
+
+    async def _reserve_pack_activate(
+        self,
+        uow: RulePackAdminUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        pack_id: UUID,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_ACTIVATE_PACK_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_ACTIVATE_PACK_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={"pack_id": str(pack_id)},
+                    business_paths=frozenset({("pack_id",)}),
+                ),
+            ),
+            now=now,
+        )
 
     async def _require_pack(
         self,

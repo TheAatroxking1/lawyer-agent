@@ -167,6 +167,7 @@ async def set_rule_enabled(
     actor: TenantActorDependency,
     services: Services,
     response: Response,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -177,6 +178,7 @@ async def set_rule_enabled(
             pack_id=pack_id,
             rule_id=rule_id,
             enabled=body.enabled,
+            idempotency_key=idempotency_key,
         )
     except (RulePackAdminNotFound, RulePackAdminInvalidRequest) as exc:
         raise _map_error(exc) from None
@@ -194,6 +196,7 @@ async def activate_rule_pack(
     actor: TenantActorDependency,
     services: Services,
     request: Request,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RulePackSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -202,6 +205,7 @@ async def activate_rule_pack(
         pack = await service.activate_pack(
             context=actor.context,
             pack_id=pack_id,
+            idempotency_key=idempotency_key,
             trace_id=getattr(request.state, "trace_id", None),
         )
     except (RulePackAdminNotFound, RulePackAdminConflict) as exc:
