@@ -102,6 +102,13 @@ class OpenSearchRestClient:
             if response.status_code not in (200, 201):
                 await self._raise(response)
 
+    async def delete_index(self, index_name: str) -> None:
+        """Remove a test/derived index; 404 is treated as already-absent."""
+        async with self._client() as client:
+            response = await client.delete(f"/{index_name}")
+            if response.status_code not in (200, 404):
+                await self._raise(response)
+
     async def replace_documents(
         self,
         index_name: str,
