@@ -20,7 +20,7 @@ class _FakeStore:
     def __init__(self) -> None:
         self.saved = []
 
-    async def save_document_version(self, version) -> None:
+    async def save_document_version(self, version, *, matter_id) -> None:
         self.saved.append(version)
 
 
