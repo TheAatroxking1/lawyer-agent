@@ -53,7 +53,9 @@ async def test_ensure_index_with_vector_dimension_adds_knn_mapping() -> None:
     await client.ensure_index("legal_corpus_v2", vector_dimension=1792)
     payload = _json_body(transport.requests[0])
     props = payload["mappings"]["properties"]
-    assert props["content_vector"] == {"type": "knn_vector", "dimension": 1792}
+    assert props["content_vector"]["type"] == "knn_vector"
+    assert props["content_vector"]["dimension"] == 1792
+    assert payload["settings"]["index"]["knn"] is True
 
 
 async def test_ensure_index_without_vector_dimension_keeps_text_only() -> None:
@@ -86,21 +88,22 @@ async def test_search_knn_builds_query_and_parses_hits() -> None:
         version_id=VERSION,
     )
     payload = _json_body(transport.requests[0])
-    assert payload["query"]["bool"]["must"][0]["knn"]["field"] == "content_vector"
-    assert payload["query"]["bool"]["must"][0]["knn"]["query_vector"] == [0.1, 0.2, 0.3]
-    assert payload["query"]["bool"]["must"][0]["knn"]["k"] == 5
-    assert payload["query"]["bool"]["filter"][0]["term"]["version_id"] == str(VERSION)
+    knn = payload["query"]["knn"]["content_vector"]
+    assert knn["vector"] == [0.1, 0.2, 0.3]
+    assert knn["k"] == 5
+    assert knn["filter"]["term"]["version_id"] == str(VERSION)
     assert hits == (_hit(CHUNK_A, PROVISION_A, 0.9),)
 
 
-async def test_search_knn_without_filter_uses_top_level_knn() -> None:
+async def test_search_knn_without_filter_omits_filter_key() -> None:
     response_body = {"hits": {"hits": []}}
     transport = RecordingTransport([httpx.Response(200, json=response_body)])
     client = OpenSearchRestClient(transport=transport)
     await client.search_knn("idx", query_vector=(0.5,), limit=3)
     payload = _json_body(transport.requests[0])
-    assert payload["query"]["knn"]["field"] == "content_vector"
-    assert "bool" not in payload["query"]
+    knn = payload["query"]["knn"]["content_vector"]
+    assert knn["vector"] == [0.5]
+    assert "filter" not in knn
 
 
 async def test_search_knn_rejects_bad_vector_and_maps_http_error() -> None:
