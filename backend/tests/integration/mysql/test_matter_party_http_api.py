@@ -325,3 +325,37 @@ def test_matter_party_http_flow_over_real_mysql(migrated_mysql_url: URL) -> None
         )
         assert stolen_delete_resource.status_code == 404
         assert stolen_delete_resource.json()["code"] == "matter_document_not_found"
+
+        # 11. add/update/remove each register a matter.party audit row in tenant A.
+        party_audit = client.get(f"{base_a}/audit?action=matter.", headers=headers_a)
+        assert party_audit.status_code == 200, party_audit.text
+        events = [
+            event
+            for event in party_audit.json()["events"]
+            if event["action"].startswith("matter.party.")
+        ]
+        added = [e for e in events if e["reason_code"] == "added"]
+        updated = [e for e in events if e["reason_code"] == "updated"]
+        removed = [e for e in events if e["reason_code"] == "removed"]
+        assert len(added) == 2  # 甲公司 and 乙公司
+        assert len(updated) == 2  # display_name rename + kind change
+        assert len(removed) == 1
+        assert {e["action"] for e in events} == {
+            "matter.party.add",
+            "matter.party.update",
+            "matter.party.remove",
+        }
+
+        # 12. Tenant B never sees tenant A's matter.party audit rows.
+        stolen_audit = client.get(
+            f"{base_a}/audit?action=matter.",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert stolen_audit.status_code == 404
+        assert stolen_audit.json()["code"] == "tenant_resource_not_found"
+        b_audit = client.get(
+            f"{base_b}/audit?action=matter.",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert b_audit.status_code == 200, b_audit.text
+        assert b_audit.json()["events"] == []
