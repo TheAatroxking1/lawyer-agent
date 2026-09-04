@@ -9,6 +9,9 @@ from lawyer_agent.infrastructure.persistence.repositories.audit import AuditRepo
 from lawyer_agent.infrastructure.persistence.repositories.documents import (
     SqlAlchemyDocumentRepository,
 )
+from lawyer_agent.infrastructure.persistence.repositories.idempotency import (
+    SqlAlchemyIdempotencyRepository,
+)
 from lawyer_agent.infrastructure.persistence.repositories.rule_pack import (
     SqlAlchemyRulePackRepository,
 )
@@ -23,6 +26,7 @@ class SqlAlchemyRuleCheckUnitOfWork:
         self.rule_check: SqlAlchemyRulePackRepository
         self.documents: SqlAlchemyDocumentRepository
         self.audit: AuditRepository
+        self.idempotency: SqlAlchemyIdempotencyRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
@@ -31,6 +35,7 @@ class SqlAlchemyRuleCheckUnitOfWork:
         self.rule_check = SqlAlchemyRulePackRepository(self._session)
         self.documents = SqlAlchemyDocumentRepository(self._session)
         self.audit = AuditRepository(self._session)
+        self.idempotency = SqlAlchemyIdempotencyRepository(self._session)
         return self
 
     async def __aexit__(

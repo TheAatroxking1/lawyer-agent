@@ -226,7 +226,7 @@ async def application_services(
             )
         ),
         ai_jobs=_build_ai_job_service(session_factory, idempotency),
-        rule_check_http=_build_rule_check_http_service(session_factory),
+        rule_check_http=_build_rule_check_http_service(session_factory, idempotency),
         matter_document_http=_build_matter_document_http_service(
             session_factory, idempotency
         ),
@@ -269,7 +269,9 @@ def _build_ai_job_service(
     )
 
 
-def _build_rule_check_http_service(session_factory: Any) -> Any:
+def _build_rule_check_http_service(
+    session_factory: Any, idempotency: IdempotencyService | None = None
+) -> Any:
     """Composition root for the deterministic Rule Check HTTP service."""
     from lawyer_agent.application.rule_check_api import RuleCheckHttpService
     from lawyer_agent.infrastructure.persistence.rule_check_uow import (
@@ -277,7 +279,8 @@ def _build_rule_check_http_service(session_factory: Any) -> Any:
     )
 
     return RuleCheckHttpService(
-        lambda: SqlAlchemyRuleCheckUnitOfWork(session_factory)
+        lambda: SqlAlchemyRuleCheckUnitOfWork(session_factory),
+        idempotency=idempotency,
     )
 
 

@@ -14,6 +14,16 @@ from typing import Any, Protocol, cast
 from uuid import UUID
 
 from lawyer_agent.application.audit import new_tenant_user_audit_event
+from lawyer_agent.application.idempotency import (
+    IdempotencyFingerprintPayload,
+    IdempotencyRepositoryPort,
+    IdempotencyRequest,
+    IdempotencyReservation,
+    IdempotencyResultReference,
+    IdempotencyScope,
+    IdempotencyScopeType,
+    IdempotencyService,
+)
 from lawyer_agent.application.report_export import (
     ReportDocumentPort,
     RiskReportService,
@@ -31,6 +41,10 @@ from lawyer_agent.domain.rule_pack import (
     RiskIssueStatus,
     dispose_risk_issue,
 )
+
+_DISPOSE_OPERATION = "risk_issue.dispose"
+_DISPOSE_ROUTE = "/api/v1/tenants/{tenant_id}/risk-issues/{issue_id}/disposition"
+_DISPOSE_RESULT_TYPE = "risk_issue"
 
 
 class RuleCheckError(Exception):
@@ -78,6 +92,7 @@ class RuleCheckDocumentPort(ReportDocumentPort, Protocol):
 class RuleCheckUnitOfWorkPort(Protocol):
     rule_check: RiskIssueStorePort
     documents: RuleCheckDocumentPort
+    idempotency: IdempotencyRepositoryPort
 
     async def __aenter__(self) -> RuleCheckUnitOfWorkPort: ...
 
@@ -87,10 +102,17 @@ class RuleCheckUnitOfWorkPort(Protocol):
 class RuleCheckHttpService:
     """Composition facade used by the tenant HTTP endpoints."""
 
-    def __init__(self, uow_factory: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        uow_factory: Callable[[], Any],
+        idempotency: IdempotencyService | None = None,
+    ) -> None:
         if not callable(uow_factory):
             raise ValueError("rule check http service requires a unit of work factory")
+        if idempotency is not None and not isinstance(idempotency, IdempotencyService):
+            raise ValueError("rule check http service requires an idempotency service")
         self._uow_factory = uow_factory
+        self._idempotency = idempotency
 
     async def run_checks(
         self,
@@ -140,11 +162,33 @@ class RuleCheckHttpService:
         status: RiskIssueStatus,
         reason: str,
         now: datetime,
+        idempotency_key: str | None = None,
         trace_id: str | None = None,
     ) -> RiskIssue:
         require_uuid7(issue_id, field="issue_id")
+        membership_id = getattr(context, "membership_id", None)
+        reservation = None
         try:
             async with cast(RuleCheckUnitOfWorkPort, self._uow_factory()) as uow:
+                if idempotency_key and self._idempotency is not None:
+                    if membership_id is None:
+                        raise RuleCheckConflict
+                    reservation = await self._reserve_dispose(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        issue_id=issue_id,
+                        status=status,
+                        reason=reason,
+                        idempotency_key=idempotency_key,
+                        now=now,
+                    )
+                    if reservation.is_replay:
+                        assert reservation.replay is not None
+                        issue = await uow.rule_check.find_issue(context, issue_id)
+                        if issue is None:
+                            raise RuleCheckConflict
+                        return issue
                 issue = await uow.rule_check.find_issue(context, issue_id)
                 if issue is None:
                     raise RuleCheckIssueNotFound
@@ -166,6 +210,16 @@ class RuleCheckHttpService:
                     raise RuleCheckInvalidRequest from exc
                 if not disposed:
                     raise RuleCheckConflict
+                if reservation is not None:
+                    assert self._idempotency is not None
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(
+                            _DISPOSE_RESULT_TYPE, issue_id
+                        ),
+                        now=now,
+                    )
                 await _append_tenant_audit(
                     uow,
                     context=context,
@@ -222,6 +276,45 @@ class RuleCheckHttpService:
                 now=now,
             )
             raise
+
+    async def _reserve_dispose(
+        self,
+        uow: RuleCheckUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        issue_id: UUID,
+        status: RiskIssueStatus,
+        reason: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_DISPOSE_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_DISPOSE_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "issue_id": str(issue_id),
+                        "status": status.value,
+                        "reason": reason,
+                    },
+                    business_paths=frozenset(
+                        {("issue_id",), ("status",), ("reason",)}
+                    ),
+                ),
+            ),
+            now=now,
+        )
 
     async def export_report(
         self,
