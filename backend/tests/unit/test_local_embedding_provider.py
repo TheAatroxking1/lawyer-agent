@@ -73,20 +73,13 @@ def test_provider_rejects_blank_model_name() -> None:
 
 
 def test_provider_missing_dependency_maps_to_stable_error(monkeypatch) -> None:
-    import builtins
+    import sys
 
-    real_import = builtins.__import__
-
-    def blocked(name: str, *args: object, **kwargs: object) -> object:
-        if name == "sentence_transformers":
-            raise ImportError("not installed")
-        return real_import(name, *args, **kwargs)
-
+    # importlib.import_module returns sys.modules entries verbatim; None makes
+    # the lazy loader fail fast as if the dependency were absent.
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
     provider = LocalSentenceTransformerEmbeddingProvider(model_name_or_path="fake")
-    monkeypatch.setattr(builtins, "__import__", blocked)
     with pytest.raises(ModelProviderUnavailable, match="not installed"):
-        # Force lazy load through a coroutine-free helper path is impossible;
-        # instead exercise the same import branch used by embed's encoder.
         import asyncio
 
         async def run() -> None:
