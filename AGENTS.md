@@ -43,6 +43,7 @@
 - 阶段 1 非 Embedding 先行切片已完成（2026-09-04 计划）：法规版本模型/条文/Chunk/数据集快照 Schema、时点查询、DOCX 只读解析（真实样本 134 条）、盘点/Manifest/质量门禁与 dataset_v1 发布、Evidence Bundle 与 Citation Gate 后端校验；OpenSearch/Embedding/Reranker/DeepSeek/SSE 与完整问答链路仍为待授权延后项。
 - 阶段 2 非模型先行切片已完成（2026-09-05 计划）：租户 Matter、Document 版本、对象引用白名单、上传会话/校验（NEEDS_REVIEW 不绕过）、Review 状态骨架与跨租户反向测试；条款/风险 AI、RAG、Drafting/导出、MinIO 预签名直传仍为延后项。
 - 阶段 2 增补“Rule Pack 与确定性合同风险检查”非模型切片已完成（2026-09-05 计划）：版本化 Rule Pack/规则/RiskIssue 三表与迁移、租户范围仓储与跨租户反向测试、正则白名单 RuleEngine、OPEN→ACCEPTED/REJECTED/MODIFIED 人工处置状态机、DOCX→引擎→处置→重跑真实 MySQL 集成流；规则命中固定 `evidence_level=rule_based`，高风险/时限一律人工确认，条款识别 AI、法规 RAG、正式结论输出仍为延后项。
+- 阶段 2 增补“Rule Check DOCX 报告导出”非模型切片已完成（2026-09-05 计划）：stdlib 只写 DOCX（XML 转义、拒控制字符/超长、无 DOCTYPE/ENTITY/外部关系）、报告组装服务只消费已入库文档元数据与 RiskIssue/处置记录、免责声明与「待人工核验/无命中≠无风险」措辞、DOCX 写→读回闭环与真实 MySQL seed→检查→处置→导出流、跨租户导出反向测试；PDF、正式 LegalReport 发布/审批/版本化、模板引擎、派生版本落库与下载 API 仍为延后项。
 - 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。
 
 ## 多租户与授权不变量
