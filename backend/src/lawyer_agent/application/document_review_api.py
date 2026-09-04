@@ -105,6 +105,25 @@ class DocumentReviewHttpService:
         self._uow_factory = uow_factory
         self._idempotency = idempotency
 
+    async def get_version(
+        self,
+        *,
+        context: TenantContext,
+        document_id: UUID,
+        version_no: int,
+    ) -> DocumentVersion:
+        """Read one tenant document version's upload/review state (read-only)."""
+        require_uuid7(document_id, field="document_id")
+        if isinstance(version_no, bool) or not isinstance(version_no, int) or version_no < 1:
+            raise DocumentReviewInvalidRequest
+        async with cast(DocumentReviewUnitOfWorkPort, self._uow_factory()) as uow:
+            version = await uow.documents.find_version(
+                context.tenant_id, document_id, version_no
+            )
+            if version is None:
+                raise DocumentReviewNotFound
+            return version
+
     async def apply_review(
         self,
         *,

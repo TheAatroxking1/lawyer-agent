@@ -39,6 +39,18 @@ class DocumentReviewResponse(StrictModel):
     review_reason: str | None = None
 
 
+class DocumentVersionResponse(StrictModel):
+    """White-list read projection of one tenant document version."""
+
+    document_id: UUID
+    version_no: int
+    kind: str
+    file_name: str | None = None
+    upload_status: str
+    review_status: str | None = None
+    review_reason: str | None = None
+
+
 def _require_service(services: Services) -> DocumentReviewHttpService:
     value = getattr(services, "document_review_http", None)
     if value is None:
@@ -86,6 +98,43 @@ async def apply_document_review(
     return DocumentReviewResponse(
         document_id=version.document_id,
         version_no=version.version_no,
+        review_status=version.review_status.value
+        if version.review_status is not None
+        else None,
+        review_reason=version.review_reason,
+    )
+
+
+@router.get(
+    "/documents/{document_id}/versions/{version_no}",
+    response_model=DocumentVersionResponse,
+)
+async def get_document_version(
+    tenant_id: UUID,
+    document_id: UUID,
+    version_no: int,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+) -> DocumentVersionResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        version = await service.get_version(
+            context=actor.context,
+            document_id=document_id,
+            version_no=version_no,
+        )
+    except (DocumentReviewNotFound, DocumentReviewInvalidRequest) as exc:
+        raise _map_error(exc) from None
+    response.headers["ETag"] = f'"{version.version_no}"'
+    return DocumentVersionResponse(
+        document_id=version.document_id,
+        version_no=version.version_no,
+        kind=version.kind.value,
+        file_name=version.file_name,
+        upload_status=version.upload_status.value,
         review_status=version.review_status.value
         if version.review_status is not None
         else None,
