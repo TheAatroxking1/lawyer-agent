@@ -15,7 +15,12 @@ from lawyer_agent.application.legal_corpus import (
     CorpusFile,
     LegalCorpusInventoryService,
 )
+from lawyer_agent.application.legal_corpus_publish import (
+    LegalCorpusPublishService,
+    LegalCorpusQualityGate,
+)
 from lawyer_agent.domain.legal_corpus import (
+    DatasetState,
     LegalVersionStatus,
     ProvisionLevel,
     content_sha256,
@@ -199,5 +204,49 @@ def test_legal_corpus_inventory_writes_batch(mysql_url: URL) -> None:
     command.upgrade(config, "head")
     try:
         asyncio.run(_run_inventory_check(mysql_url))
+    finally:
+        asyncio.run(_cleanup(mysql_url))
+
+
+async def _run_publish_check(mysql_url: URL) -> None:
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    try:
+        async with factory() as session:
+            repo = SqlAlchemyLegalCorpusInventoryRepository(session)
+            inventory = LegalCorpusInventoryService(repo, repo, "docx-zip-v1")
+            result = await inventory.inventory(
+                (CorpusFile("object://corpus/c1.docx", "正文".encode()),)
+            )
+            await session.commit()
+
+            publish = LegalCorpusPublishService(repo, LegalCorpusQualityGate())
+            published, report = await publish.publish(
+                batch_id=result.batch.id,
+                article_count=2,
+                article_numbers=("第一条", "第二条"),
+                required_field_missing=(),
+                parse_failures=0,
+                manifest=result.manifest,
+            )
+            await session.commit()
+            assert published.state is DatasetState.PUBLISHED
+            assert report.passed
+
+            stored = await repo.find_dataset("dataset_v1")
+            assert stored is not None
+            assert stored.state is DatasetState.PUBLISHED
+            completed = await repo.find_batch(result.batch.id)
+            assert completed is not None
+            assert completed.item_counts["articles"] == 2
+    finally:
+        await engine.dispose()
+
+
+def test_legal_corpus_publish_publishes_dataset_v1(mysql_url: URL) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    try:
+        asyncio.run(_run_publish_check(mysql_url))
     finally:
         asyncio.run(_cleanup(mysql_url))

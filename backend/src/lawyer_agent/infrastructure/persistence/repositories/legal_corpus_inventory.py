@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
+from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.legal_corpus import (
@@ -98,6 +101,36 @@ class SqlAlchemyLegalCorpusInventoryRepository:
             model.quality_metrics_json = snapshot.quality_metrics
             model.released_at = _naive_optional(snapshot.released_at)
         await self._session.flush()
+
+    async def find_batch(self, batch_id: UUID) -> LoadBatch | None:
+        model = await self._session.scalar(
+            select(LegalLoadBatchModel).where(LegalLoadBatchModel.id == batch_id)
+        )
+        return None if model is None else _load_batch(model)
+
+    async def complete_batch(
+        self,
+        batch_id: UUID,
+        *,
+        item_counts: dict[str, int],
+        now: datetime,
+    ) -> bool:
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(LegalLoadBatchModel)
+                .where(
+                    LegalLoadBatchModel.id == batch_id,
+                    LegalLoadBatchModel.status == "inventoried",
+                )
+                .values(
+                    status="completed",
+                    item_counts_json=item_counts,
+                    completed_at=_naive_optional(now),
+                )
+            ),
+        )
+        return result.rowcount == 1
 
 
 def _batch_model(batch: LoadBatch) -> LegalLoadBatchModel:
