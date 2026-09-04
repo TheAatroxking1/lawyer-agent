@@ -159,6 +159,16 @@ class MatterStorePort(Protocol):
         target_status: MatterStatus,
     ) -> Matter | None: ...
 
+    async def update_matter_metadata(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        title: str | None,
+        description: str | None,
+    ) -> Matter | None: ...
+
 class DocumentHeaderStorePort(Protocol):
     async def headers_for_matter(
         self, tenant_id: UUID, matter_id: UUID
@@ -907,6 +917,48 @@ class MatterDocumentHttpService:
                 uow,
                 context=context,
                 action="matter.status",
+                reason_code="changed",
+                target_id=matter_id,
+                trace_id=trace_id,
+            )
+            return updated
+
+    async def update_matter_metadata(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        expected_version: int | None,
+        title: str | None,
+        description: str | None,
+        trace_id: str | None = None,
+    ) -> Matter:
+        require_uuid7(matter_id, field="matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            existing = await uow.matters.get_matter(context, matter_id)
+            if existing is None:
+                raise MatterDocumentNotFound
+            from lawyer_agent.domain.matter_documents import validate_matter_metadata
+
+            try:
+                validate_matter_metadata(title=title, description=description)
+                updated = await uow.matters.update_matter_metadata(
+                    context,
+                    matter_id,
+                    expected_version=(
+                        existing.version if expected_version is None else expected_version
+                    ),
+                    title=title,
+                    description=description,
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+            if updated is None:
+                raise MatterDocumentConflict
+            await _append_matter_audit(
+                uow,
+                context=context,
+                action="matter.update",
                 reason_code="changed",
                 target_id=matter_id,
                 trace_id=trace_id,

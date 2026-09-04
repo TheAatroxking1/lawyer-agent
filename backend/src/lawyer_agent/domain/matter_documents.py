@@ -17,6 +17,26 @@ from lawyer_agent.domain.common import require_uuid7
 
 MAX_OBJECT_KEY_BYTES = 512
 MAX_DOCUMENT_NAME_BYTES = 256
+MAX_MATTER_TITLE_CHARS = 512
+MAX_MATTER_DESCRIPTION_CHARS = 4000
+
+
+def validate_matter_metadata(
+    *,
+    title: str | None,
+    description: str | None,
+) -> None:
+    """Validate merged Matter metadata edits (title/description only)."""
+    if title is not None:
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("matter title must be non-empty text")
+        if len(title.strip()) > MAX_MATTER_TITLE_CHARS:
+            raise ValueError("matter title is too long")
+    if description is not None:
+        if not isinstance(description, str):
+            raise ValueError("matter description must be text or null")
+        if len(description.strip()) > MAX_MATTER_DESCRIPTION_CHARS:
+            raise ValueError("matter description is too long")
 
 
 class MatterKind(StrEnum):

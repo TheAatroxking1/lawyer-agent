@@ -215,6 +215,57 @@ class MatterStatusResponse(StrictModel):
     matter: MatterSummary
 
 
+class UpdateMatterMetadataBody(StrictModel):
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    description: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_blank_optional(cls, value: str | None) -> str | None:
+        if value is not None:
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("title must not be blank")
+            return stripped
+        return value
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> UpdateMatterMetadataBody:
+        if self.title is None and self.description is None:
+            raise ValueError("at least one of title or description is required")
+        return self
+
+
+@router.patch("/matters/{matter_id}", response_model=MatterStatusResponse, status_code=200)
+async def update_matter_metadata(
+    tenant_id: UUID,
+    matter_id: UUID,
+    body: UpdateMatterMetadataBody,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+    request: Request,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> MatterStatusResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    expected_version = None if if_match is None else StrongETag.parse(if_match).version
+    try:
+        matter = await service.update_matter_metadata(
+            context=actor.context,
+            matter_id=matter_id,
+            expected_version=expected_version,
+            title=body.title,
+            description=body.description,
+            trace_id=getattr(request.state, "trace_id", None),
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest, MatterDocumentConflict) as exc:
+        raise _map_error(exc) from None
+    response.headers["ETag"] = StrongETag.format(matter.version)
+    return MatterStatusResponse(matter=_matter_summary(matter))
+
+
 @router.get("/matters", response_model=MatterPage)
 async def list_matters(
     tenant_id: UUID,

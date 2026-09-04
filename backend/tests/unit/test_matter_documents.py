@@ -16,6 +16,7 @@ from lawyer_agent.domain.matter_documents import (
     MatterStatusTransitionInvalid,
     ReviewStatus,
     require_matter_status_transition,
+    validate_matter_metadata,
 )
 
 
@@ -157,3 +158,21 @@ def test_status_transition_rejects_backward_and_jumps(
 def test_status_transition_rejects_untyped_endpoints() -> None:
     with pytest.raises(ValueError, match="strongly typed"):
         require_matter_status_transition(MatterStatus.OPEN, "active")  # type: ignore[arg-type]
+
+
+def test_matter_metadata_validation_accepts_edits() -> None:
+    validate_matter_metadata(title="更名后的租赁案件", description=None)
+    validate_matter_metadata(title=None, description="补充描述")
+    validate_matter_metadata(title="案件", description="")
+
+
+def test_matter_metadata_validation_rejects_blank_title() -> None:
+    with pytest.raises(ValueError, match="title"):
+        validate_matter_metadata(title="   ", description=None)
+
+
+def test_matter_metadata_validation_rejects_overlong_fields() -> None:
+    with pytest.raises(ValueError, match="title"):
+        validate_matter_metadata(title="案" * 513, description=None)
+    with pytest.raises(ValueError, match="description"):
+        validate_matter_metadata(title=None, description="描" * 4001)

@@ -18,6 +18,7 @@ from lawyer_agent.domain.matter_documents import (
     MatterStatus,
     ReviewStatus,
     require_matter_status_transition,
+    validate_matter_metadata,
 )
 from lawyer_agent.domain.tenancy import TenantContext
 from lawyer_agent.infrastructure.persistence.models.matter_documents import (
@@ -263,6 +264,56 @@ class SqlAlchemyMatterRepository:
                     status=target_status.value,
                     version=TenantMatterModel.version + 1,
                 )
+            ),
+        )
+        if result.rowcount != 1:
+            return None
+        await self._session.flush()
+        return _matter(model)
+
+    async def update_matter_metadata(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        title: str | None,
+        description: str | None,
+    ) -> Matter | None:
+        """CAS update of a Matter's editable text metadata (title/description)."""
+        _require_context(context)
+        require_uuid7(matter_id, field="matter_id")
+        if isinstance(expected_version, bool) or not isinstance(
+            expected_version, int
+        ) or expected_version < 1:
+            raise ValueError("matter expected_version must be a positive integer")
+        validate_matter_metadata(title=title, description=description)
+        model = await self._session.scalar(
+            select(TenantMatterModel)
+            .where(
+                TenantMatterModel.tenant_id == context.tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+            .with_for_update()
+        )
+        if model is None:
+            return None
+        values: dict[str, object] = {}
+        if title is not None:
+            values["title"] = title.strip()
+        if description is not None:
+            stripped = description.strip()
+            values["description"] = None if not stripped else stripped
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantMatterModel)
+                .where(
+                    TenantMatterModel.tenant_id == context.tenant_id,
+                    TenantMatterModel.id == matter_id,
+                    TenantMatterModel.version == expected_version,
+                )
+                .values(**values, version=TenantMatterModel.version + 1)
             ),
         )
         if result.rowcount != 1:
