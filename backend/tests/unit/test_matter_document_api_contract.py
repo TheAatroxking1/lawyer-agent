@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from lawyer_agent.api.v1.matter_documents import (
+    AssignMatterOwnerBody,
     CreateMatterBody,
     PartyConflictCheckBody,
     RegisterDocumentBody,
@@ -153,4 +154,24 @@ def test_conflict_check_body_rejects_extra_fields() -> None:
     with pytest.raises(ValidationError, match="extra"):
         PartyConflictCheckBody.model_validate(
             {"display_name": "甲公司", "surprise": True}
+        )
+
+
+def test_assign_owner_body_accepts_valid_membership_id() -> None:
+    membership_id = "018f6f60-0000-7000-8000-000000000001"
+    body = AssignMatterOwnerBody.model_validate(
+        {"owner_membership_id": membership_id}
+    )
+    assert str(body.owner_membership_id) == membership_id
+
+
+def test_assign_owner_body_rejects_missing_membership_id() -> None:
+    with pytest.raises(ValidationError, match="owner_membership_id"):
+        AssignMatterOwnerBody.model_validate({})
+
+
+def test_assign_owner_body_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="extra"):
+        AssignMatterOwnerBody.model_validate(
+            {"owner_membership_id": "018f6f60-0000-7000-8000-000000000001", "x": 1}
         )

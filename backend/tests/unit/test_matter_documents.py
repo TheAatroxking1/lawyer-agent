@@ -15,6 +15,7 @@ from lawyer_agent.domain.matter_documents import (
     MatterStatus,
     MatterStatusTransitionInvalid,
     ReviewStatus,
+    matter_owner_assignable,
     require_matter_status_transition,
     validate_matter_metadata,
 )
@@ -176,3 +177,27 @@ def test_matter_metadata_validation_rejects_overlong_fields() -> None:
         validate_matter_metadata(title="案" * 513, description=None)
     with pytest.raises(ValueError, match="description"):
         validate_matter_metadata(title=None, description="描" * 4001)
+
+
+def test_matter_owner_assignable_accepts_active_own_staff() -> None:
+    assert matter_owner_assignable("owner", "active") is True
+    assert matter_owner_assignable("internal", "active") is True
+
+
+@pytest.mark.parametrize(
+    ("member_type", "status"),
+    [
+        ("owner", "invited"),
+        ("owner", "suspended"),
+        ("owner", "revoked"),
+        ("internal", "invited"),
+        ("internal", "suspended"),
+        ("external_client", "active"),
+        ("student", "active"),
+        ("", "active"),
+    ],
+)
+def test_matter_owner_assignable_rejects_non_firm_members(
+    member_type: str, status: str
+) -> None:
+    assert matter_owner_assignable(member_type, status) is False
