@@ -166,6 +166,7 @@ async def register_document(
     body: RegisterDocumentBody,
     actor: TenantActorDependency,
     services: Services,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> DocumentSummary:
     if tenant_id != actor.context.tenant_id:
         raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
@@ -178,6 +179,7 @@ async def register_document(
             file_name=body.file_name,
             mime_type=body.mime_type,
             payload=payload,
+            idempotency_key=idempotency_key,
         )
     except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
         raise _map_error(exc) from None

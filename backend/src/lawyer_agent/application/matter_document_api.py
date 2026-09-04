@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -39,6 +40,11 @@ from lawyer_agent.domain.tenancy import TenantContext
 _MATTER_CREATE_OPERATION = "matter.create"
 _MATTER_CREATE_ROUTE = "/api/v1/tenants/{tenant_id}/matters"
 _MATTER_RESULT_TYPE = "matter.matter"
+_DOCUMENT_REGISTER_OPERATION = "document.register"
+_DOCUMENT_REGISTER_ROUTE = (
+    "/api/v1/tenants/{tenant_id}/matters/{matter_id}/documents"
+)
+_DOCUMENT_RESULT_TYPE = "document.document_version"
 
 
 class MatterDocumentError(Exception):
@@ -91,7 +97,9 @@ class DocumentHeaderStorePort(Protocol):
 
 
 class _DocumentStoreForUow(DocumentStorePort, DocumentHeaderStorePort, Protocol):
-    pass
+    async def find_version(
+        self, tenant_id: UUID, document_id: UUID
+    ) -> DocumentVersion | None: ...
 
 
 class MatterDocumentUnitOfWorkPort(Protocol):
@@ -236,14 +244,57 @@ class MatterDocumentHttpService:
         file_name: str,
         mime_type: str,
         payload: bytes,
+        idempotency_key: str | None = None,
+        now: datetime | None = None,
     ) -> DocumentVersion:
         require_uuid7(matter_id, field="matter_id")
         if not isinstance(payload, bytes) or not payload:
             raise MatterDocumentInvalidRequest
         user_id, membership_id = _actor_ids(context)
+        effective_now = now or datetime.now(UTC)
         async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
             await self._require_matter(uow, context, matter_id)
             try:
+                if idempotency_key and self._idempotency is not None:
+                    reservation = await self._reserve_document_register(
+                        uow,
+                        tenant_id=context.tenant_id,
+                        membership_id=membership_id,
+                        matter_id=matter_id,
+                        file_name=file_name,
+                        mime_type=mime_type,
+                        payload=payload,
+                        idempotency_key=idempotency_key,
+                        now=effective_now,
+                    )
+                    if reservation.replay is not None:
+                        document_id = reservation.replay.result_id
+                        version = await uow.documents.find_version(
+                            context.tenant_id, document_id
+                        )
+                        if version is None:
+                            raise MatterDocumentConflict
+                        return version
+                    created = await _complete_upload(
+                        uow, DocumentCreateCommand(
+                            tenant_id=context.tenant_id,
+                            matter_id=matter_id,
+                            file_name=file_name,
+                            mime_type=mime_type,
+                            payload=payload,
+                            created_by_user_id=user_id,
+                            created_by_membership_id=membership_id,
+                        )
+                    )
+                    await self._idempotency.complete(
+                        uow.idempotency,
+                        reservation,
+                        IdempotencyResultReference(
+                            _DOCUMENT_RESULT_TYPE, created.document_id
+                        ),
+                        now=effective_now,
+                    )
+                    return created
                 version = await _complete_upload(
                     uow, DocumentCreateCommand(
                         tenant_id=context.tenant_id,
@@ -258,6 +309,51 @@ class MatterDocumentHttpService:
             except ValueError as exc:
                 raise MatterDocumentInvalidRequest from exc
             return version
+
+    async def _reserve_document_register(
+        self,
+        uow: MatterDocumentUnitOfWorkPort,
+        *,
+        tenant_id: UUID,
+        membership_id: UUID,
+        matter_id: UUID,
+        file_name: str,
+        mime_type: str,
+        payload: bytes,
+        idempotency_key: str,
+        now: datetime,
+    ) -> IdempotencyReservation:
+        assert self._idempotency is not None
+        payload_sha256 = sha256(payload).digest()
+        return await self._idempotency.reserve(
+            uow.idempotency,
+            scope=IdempotencyScope(
+                IdempotencyScopeType.MEMBERSHIP,
+                membership_id,
+                tenant_id=tenant_id,
+            ),
+            operation=_DOCUMENT_REGISTER_OPERATION,
+            request=IdempotencyRequest(
+                key=idempotency_key,
+                method="POST",
+                canonical_route=_DOCUMENT_REGISTER_ROUTE,
+                body=IdempotencyFingerprintPayload(
+                    values={
+                        "file_name": file_name,
+                        "mime_type": mime_type,
+                        "payload_sha256": payload_sha256.hex(),
+                    },
+                    business_paths=frozenset(
+                        {
+                            ("file_name",),
+                            ("mime_type",),
+                            ("payload_sha256",),
+                        }
+                    ),
+                ),
+            ),
+            now=now,
+        )
 
     async def list_documents(
         self, *, context: TenantContext, matter_id: UUID
