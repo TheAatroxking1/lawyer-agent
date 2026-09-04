@@ -345,8 +345,15 @@ def test_matter_party_http_flow_over_real_mysql(migrated_mysql_url: URL) -> None
             "matter.party.update",
             "matter.party.remove",
         }
+        # A's own resource-layer 404 attempts (PATCH/DELETE a deleted party)
+        # are denied rows in A, not silent no-ops.
+        denied_a = [e for e in events if e["result"] == "denied"]
+        assert denied_a
+        assert all(e["reason_code"] == "matter_document_not_found" for e in denied_a)
 
-        # 12. Tenant B never sees tenant A's matter.party audit rows.
+        # 12. Tenant B never sees tenant A's matter.party audit rows, and B's
+        #     list only ever contains its own denied attempts (never A's success
+        #     actions, which never leak across the tenant boundary).
         stolen_audit = client.get(
             f"{base_a}/audit?action=matter.",
             headers={"Authorization": f"Bearer {token_b}"},
@@ -358,4 +365,14 @@ def test_matter_party_http_flow_over_real_mysql(migrated_mysql_url: URL) -> None
             headers={"Authorization": f"Bearer {token_b}"},
         )
         assert b_audit.status_code == 200, b_audit.text
-        assert b_audit.json()["events"] == []
+        b_events = [
+            event
+            for event in b_audit.json()["events"]
+            if event["action"].startswith("matter.party.")
+        ]
+        assert all(event["result"] == "denied" for event in b_events)
+        assert all(
+            event["reason_code"] == "matter_document_not_found"
+            for event in b_events
+        )
+        assert len(b_events) >= 2  # B's own resource-layer patch/delete attempts
