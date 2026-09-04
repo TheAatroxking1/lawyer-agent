@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -283,6 +283,41 @@ class SqlAlchemyMatterRepository:
             ),
         )
         return result.rowcount == 1
+
+    async def count_other_party_matters(
+        self,
+        *,
+        tenant_id: UUID,
+        display_name: str,
+        kind: str | None,
+        exclude_matter_id: UUID | None,
+    ) -> int:
+        """Count other tenant Matters that name this party (no content leakage).
+
+        Only returns how many distinct other Matters mention the party; the
+        response never exposes which Matters they are or their contents.
+        """
+        require_uuid7(tenant_id, field="conflict tenant_id")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError("conflict party display name must be non-empty text")
+        if exclude_matter_id is not None:
+            require_uuid7(exclude_matter_id, field="conflict exclude_matter_id")
+        statement = select(
+            func.count(func.distinct(TenantMatterPartyModel.matter_id))
+        ).where(
+            TenantMatterPartyModel.tenant_id == tenant_id,
+            TenantMatterPartyModel.display_name == display_name,
+        )
+        if kind is not None:
+            if not isinstance(kind, str) or not kind.strip():
+                raise ValueError("conflict party kind must be non-empty text")
+            statement = statement.where(TenantMatterPartyModel.kind == kind)
+        if exclude_matter_id is not None:
+            statement = statement.where(
+                TenantMatterPartyModel.matter_id != exclude_matter_id
+            )
+        value = await self._session.scalar(statement)
+        return int(value or 0)
 
 
 def _aware(value: datetime | None) -> datetime | None:

@@ -36,6 +36,7 @@ from lawyer_agent.domain.matter_documents import (
     Matter,
     MatterKind,
     MatterParty,
+    PartyConflictCheck,
 )
 from lawyer_agent.domain.tenancy import TenantContext
 
@@ -130,6 +131,15 @@ class MatterStorePort(Protocol):
         matter_id: UUID,
         party_id: UUID,
     ) -> bool: ...
+
+    async def count_other_party_matters(
+        self,
+        *,
+        tenant_id: UUID,
+        display_name: str,
+        kind: str | None,
+        exclude_matter_id: UUID | None,
+    ) -> int: ...
 
 
 class DocumentHeaderStorePort(Protocol):
@@ -786,6 +796,36 @@ class MatterDocumentHttpService:
                 ),
             ),
             now=now,
+        )
+
+    async def check_party_conflicts(
+        self,
+        *,
+        context: TenantContext,
+        display_name: str,
+        kind: str | None,
+        exclude_matter_id: UUID | None,
+    ) -> PartyConflictCheck:
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise MatterDocumentInvalidRequest
+        if kind is not None and (not isinstance(kind, str) or not kind.strip()):
+            raise MatterDocumentInvalidRequest
+        if exclude_matter_id is not None:
+            require_uuid7(exclude_matter_id, field="exclude_matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            try:
+                count = await uow.matters.count_other_party_matters(
+                    tenant_id=context.tenant_id,
+                    display_name=display_name,
+                    kind=kind,
+                    exclude_matter_id=exclude_matter_id,
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+        return PartyConflictCheck(
+            tenant_id=context.tenant_id,
+            conflict=count > 0,
+            other_matter_count=count,
         )
 
     async def _require_matter(

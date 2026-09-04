@@ -124,6 +124,30 @@ class MatterParty:
 
 
 @dataclass(frozen=True, slots=True)
+class PartyConflictCheck:
+    """Conflict-of-interest existence result (never leaks other Matters).
+
+    Only answers whether the party appears in other Matters of the tenant and
+    how many; never exposes their identifiers or contents.
+    """
+
+    tenant_id: UUID
+    conflict: bool
+    other_matter_count: int
+
+    def __post_init__(self) -> None:
+        require_uuid7(self.tenant_id, field="conflict tenant_id")
+        if isinstance(self.other_matter_count, bool) or not isinstance(
+            self.other_matter_count, int
+        ):
+            raise ValueError("conflict matter count must be an integer")
+        if self.other_matter_count < 0:
+            raise ValueError("conflict matter count must not be negative")
+        if self.conflict != (self.other_matter_count > 0):
+            raise ValueError("conflict flag must match the other-matter count")
+
+
+@dataclass(frozen=True, slots=True)
 class DocumentHeader:
     """Tenant document header row (stable identity across versions)."""
 

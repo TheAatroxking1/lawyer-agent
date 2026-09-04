@@ -143,6 +143,27 @@ class PartySummary(StrictModel):
     version: int
 
 
+class PartyConflictCheckBody(StrictModel):
+    display_name: str = Field(min_length=1, max_length=256)
+    kind: str | None = Field(default=None, min_length=1, max_length=64)
+    exclude_matter_id: UUID | None = None
+
+    @field_validator("display_name", "kind")
+    @classmethod
+    def _not_blank_optional(cls, value: str | None) -> str | None:
+        if value is not None:
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("must not be blank")
+            return stripped
+        return value
+
+
+class PartyConflictCheckResponse(StrictModel):
+    conflict: bool
+    other_matter_count: int
+
+
 def _require_service(services: Services) -> MatterDocumentHttpService:
     value = getattr(services, "matter_document_http", None)
     if value is None:
@@ -332,6 +353,35 @@ async def list_matter_parties(
     except MatterDocumentNotFound as exc:
         raise _map_error(exc) from None
     return [_party_summary(party) for party in parties]
+
+
+@router.post(
+    "/matter-party-conflict-checks",
+    response_model=PartyConflictCheckResponse,
+    status_code=200,
+)
+async def check_matter_party_conflicts(
+    tenant_id: UUID,
+    body: PartyConflictCheckBody,
+    actor: TenantActorDependency,
+    services: Services,
+) -> PartyConflictCheckResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        result = await service.check_party_conflicts(
+            context=actor.context,
+            display_name=body.display_name,
+            kind=body.kind,
+            exclude_matter_id=body.exclude_matter_id,
+        )
+    except MatterDocumentInvalidRequest as exc:
+        raise _map_error(exc) from None
+    return PartyConflictCheckResponse(
+        conflict=result.conflict,
+        other_matter_count=result.other_matter_count,
+    )
 
 
 @router.patch(

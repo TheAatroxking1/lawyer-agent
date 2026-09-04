@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from lawyer_agent.api.v1.matter_documents import (
     CreateMatterBody,
+    PartyConflictCheckBody,
     RegisterDocumentBody,
     UpdatePartyBody,
 )
@@ -127,3 +128,29 @@ def test_update_party_accepts_kind_only() -> None:
     body = UpdatePartyBody.model_validate({"kind": "lawyer"})
     assert body.kind == "lawyer"
     assert body.display_name is None
+
+
+def test_conflict_check_body_accepts_valid_input() -> None:
+    body = PartyConflictCheckBody.model_validate(
+        {"display_name": "甲公司", "kind": "tenant"}
+    )
+    assert body.display_name == "甲公司"
+    assert body.kind == "tenant"
+    assert body.exclude_matter_id is None
+
+
+def test_conflict_check_body_rejects_blank_display_name() -> None:
+    with pytest.raises(ValidationError):
+        PartyConflictCheckBody.model_validate({"display_name": "   "})
+
+
+def test_conflict_check_body_rejects_blank_kind() -> None:
+    with pytest.raises(ValidationError):
+        PartyConflictCheckBody.model_validate({"display_name": "甲", "kind": "  "})
+
+
+def test_conflict_check_body_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError, match="extra"):
+        PartyConflictCheckBody.model_validate(
+            {"display_name": "甲公司", "surprise": True}
+        )
