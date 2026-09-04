@@ -27,6 +27,12 @@ class LegalCorpusVersionNotFound(LegalCorpusQueryError):
     title = "No legal version is effective at the requested date"
 
 
+class LegalCorpusInstrumentNotFound(LegalCorpusQueryError):
+    status = 404
+    code = "legal_corpus_instrument_not_found"
+    title = "Legal instrument not found"
+
+
 class LegalCorpusQueryPort(Protocol):
     async def version_at(
         self, instrument_id: UUID, as_of: date
@@ -35,6 +41,12 @@ class LegalCorpusQueryPort(Protocol):
     async def provisions_for_version(
         self, version_id: UUID
     ) -> tuple[Provision, ...]: ...
+
+    async def instrument_exists(self, instrument_id: UUID) -> bool: ...
+
+    async def versions_for_instrument(
+        self, instrument_id: UUID
+    ) -> tuple[LegalVersion, ...]: ...
 
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
@@ -68,3 +80,13 @@ class LegalCorpusQueryService:
         async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
             provisions = await uow.corpus.provisions_for_version(version_id)
         return tuple(provisions)
+
+    async def versions_for_instrument(
+        self, *, instrument_id: UUID
+    ) -> tuple[LegalVersion, ...]:
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            exists = await uow.corpus.instrument_exists(instrument_id)
+            if not exists:
+                raise LegalCorpusInstrumentNotFound()
+            versions = await uow.corpus.versions_for_instrument(instrument_id)
+        return tuple(versions)

@@ -74,6 +74,12 @@ class LegalCorpusQueryPort(Protocol):
         self, version_id: UUID
     ) -> tuple[Provision, ...]: ...
 
+    async def instrument_exists(self, instrument_id: UUID) -> bool: ...
+
+    async def versions_for_instrument(
+        self, instrument_id: UUID
+    ) -> tuple[LegalVersion, ...]: ...
+
 
 class LegalCorpusChunkPort(Protocol):
     """Read/write boundary for derived legal corpus chunks (re-indexable)."""
@@ -192,6 +198,30 @@ class SqlAlchemyLegalCorpusRepository:
         if row is None:
             return None
         return _to_version(row[0]), _to_instrument(row[1])
+
+    async def instrument_exists(self, instrument_id: UUID) -> bool:
+        model = await self._session.scalar(
+            select(LegalInstrumentModel.id).where(
+                LegalInstrumentModel.id == instrument_id
+            )
+        )
+        return model is not None
+
+    async def versions_for_instrument(
+        self, instrument_id: UUID
+    ) -> tuple[LegalVersion, ...]:
+        # MySQL has no NULLS LAST; sort dated rows first, then by date desc.
+        rows = await self._session.scalars(
+            select(LegalVersionModel)
+            .where(LegalVersionModel.instrument_id == instrument_id)
+            .order_by(
+                LegalVersionModel.published_on.is_not(None),
+                LegalVersionModel.published_on.desc(),
+                LegalVersionModel.effective_on.desc(),
+                LegalVersionModel.id,
+            )
+        )
+        return tuple(_to_version(model) for model in rows)
 
 
 class SqlAlchemyLegalCorpusChunkRepository:

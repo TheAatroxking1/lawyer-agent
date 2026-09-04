@@ -16,6 +16,7 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusQueryError,
     LegalCorpusQueryService,
 )
+from lawyer_agent.domain.legal_corpus import LegalVersion
 
 
 class StrictModel(BaseModel):
@@ -63,6 +64,22 @@ def _map_error(exc: LegalCorpusQueryError) -> ApiProblem:
     return ApiProblem(exc.status, exc.code, exc.title)
 
 
+def _version_summary(version: LegalVersion) -> LegalVersionSummary:
+    return LegalVersionSummary(
+        id=version.id,
+        instrument_id=version.instrument_id,
+        version_label=version.version_label,
+        status=version.status.value,
+        published_on=version.published_on,
+        effective_on=version.effective_on,
+        repealed_on=version.repealed_on,
+        law_number=version.law_number,
+        source_ref=version.source_ref,
+        dataset_version=version.dataset_version,
+        parser_version=version.parser_version,
+    )
+
+
 @router.get(
     "/instruments/{instrument_id}/version",
     response_model=LegalVersionSummary,
@@ -79,19 +96,25 @@ async def get_version_at(
         version = await service.version_at(instrument_id=instrument_id, as_of=as_of)
     except LegalCorpusQueryError as exc:
         raise _map_error(exc) from None
-    return LegalVersionSummary(
-        id=version.id,
-        instrument_id=version.instrument_id,
-        version_label=version.version_label,
-        status=version.status.value,
-        published_on=version.published_on,
-        effective_on=version.effective_on,
-        repealed_on=version.repealed_on,
-        law_number=version.law_number,
-        source_ref=version.source_ref,
-        dataset_version=version.dataset_version,
-        parser_version=version.parser_version,
-    )
+    return _version_summary(version)
+
+
+@router.get(
+    "/instruments/{instrument_id}/versions",
+    response_model=list[LegalVersionSummary],
+)
+async def get_versions_for_instrument(
+    instrument_id: UUID,
+    current: AccountSession,
+    services: Services,
+) -> list[LegalVersionSummary]:
+    del current
+    service = _require_service(services)
+    try:
+        versions = await service.versions_for_instrument(instrument_id=instrument_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return [_version_summary(version) for version in versions]
 
 
 @router.get(
