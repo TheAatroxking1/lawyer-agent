@@ -55,6 +55,7 @@ class MatterSummary(StrictModel):
     title: str
     kind: str
     status: str
+    description: str | None = None
     owner_membership_id: UUID | None = None
     version: int
 
@@ -456,6 +457,7 @@ def _matter_summary(matter: Matter) -> MatterSummary:
         title=matter.title,
         kind=matter.kind.value,
         status=matter.status.value,
+        description=matter.description,
         owner_membership_id=matter.owner_membership_id,
         version=matter.version,
     )
