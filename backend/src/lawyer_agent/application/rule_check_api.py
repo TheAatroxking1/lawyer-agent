@@ -158,6 +158,8 @@ class RuleCheckHttpService:
                     now=now,
                 )
             except ValueError as exc:
+                if "only open risk issues can be disposed" in str(exc):
+                    raise RuleCheckConflict from exc
                 raise RuleCheckInvalidRequest from exc
             if not disposed:
                 raise RuleCheckConflict
