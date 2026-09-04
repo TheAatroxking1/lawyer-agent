@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.domain.common import new_uuid7, require_uuid7
 from lawyer_agent.domain.rule_pack import (
     RiskIssue,
     RiskIssueStatus,
@@ -16,6 +17,7 @@ from lawyer_agent.domain.rule_pack import (
     RulePackRule,
     RuleTriggerKind,
 )
+from lawyer_agent.domain.rule_pack_management import next_pack_version
 from lawyer_agent.domain.tenancy import TenantContext
 from lawyer_agent.infrastructure.persistence.models.rule_pack import (
     TenantContractRiskIssueModel,
@@ -56,6 +58,144 @@ class SqlAlchemyRulePackRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def list_packs(self, context: TenantContext) -> tuple[RulePack, ...]:
+        _require_context(context)
+        rows = await self._session.scalars(
+            select(TenantRulePackModel)
+            .where(TenantRulePackModel.tenant_id == context.tenant_id)
+            .order_by(
+                TenantRulePackModel.name,
+                TenantRulePackModel.version.desc(),
+            )
+        )
+        return tuple(_rule_pack(row) for row in rows)
+
+    async def create_pack(
+        self, context: TenantContext, *, name: str
+    ) -> RulePack:
+        _require_context(context)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("rule pack name must be non-empty text")
+        if len(name.encode("utf-8")) > 256:
+            raise ValueError("rule pack name is too long")
+        existing_versions = tuple(
+            await self._session.scalars(
+                select(TenantRulePackModel.version).where(
+                    TenantRulePackModel.tenant_id == context.tenant_id,
+                    TenantRulePackModel.name == name,
+                )
+            )
+        )
+        pack = RulePack(
+            id=new_uuid7(),
+            tenant_id=context.tenant_id,
+            name=name,
+            version=next_pack_version(existing_versions),
+            active=False,
+        )
+        self._session.add(
+            TenantRulePackModel(
+                id=pack.id,
+                tenant_id=pack.tenant_id,
+                name=pack.name,
+                version=pack.version,
+                active=False,
+            )
+        )
+        await self._session.flush()
+        return pack
+
+    async def add_rule(self, context: TenantContext, rule: RulePackRule) -> RulePackRule:
+        _require_context(context)
+        require_uuid7(rule.id, field="rule id")
+        require_uuid7(rule.pack_id, field="rule pack_id")
+        if rule.tenant_id != context.tenant_id:
+            raise ValueError("cannot add a rule outside the tenant")
+        pack = await self._session.scalar(
+            select(TenantRulePackModel).where(
+                TenantRulePackModel.tenant_id == context.tenant_id,
+                TenantRulePackModel.id == rule.pack_id,
+            )
+        )
+        if pack is None:
+            raise ValueError("rule pack does not belong to this tenant")
+        self._session.add(
+            TenantRulePackRuleModel(
+                id=rule.id,
+                tenant_id=rule.tenant_id,
+                pack_id=rule.pack_id,
+                trigger_kind=rule.trigger_kind.value,
+                label=rule.label,
+                pattern=rule.pattern,
+                risk_level=rule.risk_level.value,
+                suggestion_template=rule.suggestion_template,
+                enabled=bool(rule.enabled),
+            )
+        )
+        await self._session.flush()
+        return rule
+
+    async def set_rule_enabled(
+        self,
+        context: TenantContext,
+        pack_id: UUID,
+        rule_id: UUID,
+        *,
+        enabled: bool,
+    ) -> bool:
+        _require_context(context)
+        require_uuid7(pack_id, field="pack_id")
+        require_uuid7(rule_id, field="rule_id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantRulePackRuleModel)
+                .where(
+                    TenantRulePackRuleModel.tenant_id == context.tenant_id,
+                    TenantRulePackRuleModel.pack_id == pack_id,
+                    TenantRulePackRuleModel.id == rule_id,
+                )
+                .values(enabled=bool(enabled))
+            ),
+        )
+        return result.rowcount == 1
+
+    async def activate_pack(
+        self, context: TenantContext, pack_id: UUID
+    ) -> bool:
+        """Make one pack the tenant's unique active version."""
+        _require_context(context)
+        require_uuid7(pack_id, field="pack_id")
+        target = await self._session.scalar(
+            select(TenantRulePackModel).where(
+                TenantRulePackModel.tenant_id == context.tenant_id,
+                TenantRulePackModel.id == pack_id,
+            )
+        )
+        if target is None:
+            return False
+        await self._session.execute(
+            update(TenantRulePackModel)
+            .where(
+                TenantRulePackModel.tenant_id == context.tenant_id,
+                TenantRulePackModel.active.is_(True),
+                TenantRulePackModel.id != pack_id,
+            )
+            .values(active=False)
+        )
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantRulePackModel)
+                .where(
+                    TenantRulePackModel.tenant_id == context.tenant_id,
+                    TenantRulePackModel.id == pack_id,
+                )
+                .values(active=True)
+            ),
+        )
+        return result.rowcount == 1
 
     async def get_active_pack(self, context: TenantContext) -> RulePack | None:
         _require_context(context)
