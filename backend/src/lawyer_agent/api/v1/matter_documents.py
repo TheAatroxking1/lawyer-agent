@@ -307,6 +307,39 @@ async def assign_matter_owner(
     return MatterStatusResponse(matter=_matter_summary(matter))
 
 
+@router.delete(
+    "/matters/{matter_id}/owner",
+    response_model=MatterStatusResponse,
+    status_code=200,
+)
+async def clear_matter_owner(
+    tenant_id: UUID,
+    matter_id: UUID,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+    request: Request,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> MatterStatusResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    expected_version = (
+        None if if_match is None else StrongETag.parse(if_match).version
+    )
+    try:
+        matter = await service.clear_matter_owner(
+            context=actor.context,
+            matter_id=matter_id,
+            expected_version=expected_version,
+            trace_id=getattr(request.state, "trace_id", None),
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest, MatterDocumentConflict) as exc:
+        raise _map_error(exc) from None
+    response.headers["ETag"] = StrongETag.format(matter.version)
+    return MatterStatusResponse(matter=_matter_summary(matter))
+
+
 @router.get("/matters", response_model=MatterPage)
 async def list_matters(
     tenant_id: UUID,

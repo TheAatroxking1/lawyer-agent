@@ -182,6 +182,14 @@ class MatterStorePort(Protocol):
         owner_membership_id: UUID,
     ) -> Matter | None: ...
 
+    async def clear_owner(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+    ) -> Matter | None: ...
+
 class DocumentHeaderStorePort(Protocol):
     async def headers_for_matter(
         self, tenant_id: UUID, matter_id: UUID
@@ -1036,6 +1044,41 @@ class MatterDocumentHttpService:
                 context=context,
                 action="matter.owner",
                 reason_code="assigned",
+                target_id=matter_id,
+                trace_id=trace_id,
+            )
+            return updated
+
+    async def clear_matter_owner(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        expected_version: int | None,
+        trace_id: str | None = None,
+    ) -> Matter:
+        require_uuid7(matter_id, field="matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            existing = await uow.matters.get_matter(context, matter_id)
+            if existing is None:
+                raise MatterDocumentNotFound
+            try:
+                updated = await uow.matters.clear_owner(
+                    context,
+                    matter_id,
+                    expected_version=(
+                        existing.version if expected_version is None else expected_version
+                    ),
+                )
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
+            if updated is None:
+                raise MatterDocumentConflict
+            await _append_matter_audit(
+                uow,
+                context=context,
+                action="matter.owner",
+                reason_code="unassigned",
                 target_id=matter_id,
                 trace_id=trace_id,
             )

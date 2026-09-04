@@ -408,6 +408,55 @@ class SqlAlchemyMatterRepository:
         await self._session.flush()
         return _matter(model)
 
+    async def clear_owner(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+    ) -> Matter | None:
+        """Clear the Matter's responsible owner (version CAS).
+
+        ``owner_membership_id`` is set back to NULL. Clearing when no owner is
+        assigned is a legal no-op that still bumps the version, mirroring the
+        assign path's write-always semantics.
+        """
+        _require_context(context)
+        require_uuid7(matter_id, field="matter_id")
+        if isinstance(expected_version, bool) or not isinstance(
+            expected_version, int
+        ) or expected_version < 1:
+            raise ValueError("matter expected_version must be a positive integer")
+        model = await self._session.scalar(
+            select(TenantMatterModel)
+            .where(
+                TenantMatterModel.tenant_id == context.tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+            .with_for_update()
+        )
+        if model is None:
+            return None
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantMatterModel)
+                .where(
+                    TenantMatterModel.tenant_id == context.tenant_id,
+                    TenantMatterModel.id == matter_id,
+                    TenantMatterModel.version == expected_version,
+                )
+                .values(
+                    owner_membership_id=None,
+                    version=TenantMatterModel.version + 1,
+                )
+            ),
+        )
+        if result.rowcount != 1:
+            return None
+        await self._session.flush()
+        return _matter(model)
+
     async def add_party(
         self,
         *,
