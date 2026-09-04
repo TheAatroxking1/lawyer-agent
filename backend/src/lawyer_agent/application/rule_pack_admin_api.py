@@ -103,6 +103,10 @@ class RulePackAdminStorePort(Protocol):
         self, context: TenantContext, pack_id: UUID
     ) -> tuple[RulePackRule, ...]: ...
 
+    async def list_pack_rules(
+        self, context: TenantContext, pack_id: UUID
+    ) -> tuple[RulePackRule, ...]: ...
+
 
 class RulePackAdminUnitOfWorkPort(Protocol):
     rule_pack: RulePackAdminStorePort
@@ -210,6 +214,14 @@ class RulePackAdminHttpService:
     async def list_packs(self, *, context: TenantContext) -> tuple[RulePack, ...]:
         async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
             return tuple(await uow.rule_pack.list_packs(context))
+
+    async def list_pack_rules(
+        self, *, context: TenantContext, pack_id: UUID
+    ) -> tuple[RulePackRule, ...]:
+        require_uuid7(pack_id, field="pack_id")
+        async with cast(RulePackAdminUnitOfWorkPort, self._uow_factory()) as uow:
+            await self._require_pack(uow, context, pack_id)
+            return tuple(await uow.rule_pack.list_pack_rules(context, pack_id))
 
     async def add_rule(
         self,

@@ -123,6 +123,29 @@ async def list_rule_packs(
     return [_pack_summary(pack) for pack in packs]
 
 
+@router.get(
+    "/rule-packs/{pack_id}/rules",
+    response_model=list[RuleSummary],
+)
+async def list_pack_rules(
+    tenant_id: UUID,
+    pack_id: UUID,
+    actor: TenantActorDependency,
+    services: Services,
+) -> list[RuleSummary]:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        rules = await service.list_pack_rules(
+            context=actor.context,
+            pack_id=pack_id,
+        )
+    except RulePackAdminNotFound as exc:
+        raise _map_error(exc) from None
+    return [_rule_summary(rule) for rule in rules]
+
+
 @router.post(
     "/rule-packs/{pack_id}/rules",
     response_model=RuleSummary,

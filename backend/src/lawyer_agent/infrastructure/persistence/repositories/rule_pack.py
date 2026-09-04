@@ -222,6 +222,29 @@ class SqlAlchemyRulePackRepository:
         )
         return tuple(_rule(row) for row in rows)
 
+    async def list_pack_rules(
+        self, context: TenantContext, pack_id: UUID
+    ) -> tuple[RulePackRule, ...]:
+        """All rules of one tenant pack (enabled and disabled), created order.
+
+        Read-back for Rule Pack management; the engine keeps using the
+        enabled-only ``rules_for_pack``.
+        """
+        _require_context(context)
+        require_uuid7(pack_id, field="pack_id")
+        rows = await self._session.scalars(
+            select(TenantRulePackRuleModel)
+            .where(
+                TenantRulePackRuleModel.tenant_id == context.tenant_id,
+                TenantRulePackRuleModel.pack_id == pack_id,
+            )
+            .order_by(
+                TenantRulePackRuleModel.created_at,
+                TenantRulePackRuleModel.id,
+            )
+        )
+        return tuple(_rule(row) for row in rows)
+
     async def find_issue(
         self, context: TenantContext, issue_id: UUID
     ) -> RiskIssue | None:
