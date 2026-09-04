@@ -56,6 +56,10 @@ class LegalCorpusQueryPort(Protocol):
         self, instrument_id: UUID
     ) -> tuple[LegalVersion, ...]: ...
 
+    async def version_with_instrument(
+        self, version_id: UUID
+    ) -> tuple[LegalVersion, LegalInstrument] | None: ...
+
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
     corpus: LegalCorpusQueryPort
@@ -105,3 +109,10 @@ class LegalCorpusQueryService:
         if instrument is None:
             raise LegalCorpusInstrumentNotFound()
         return instrument
+
+    async def version(self, *, version_id: UUID) -> LegalVersion:
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            loaded = await uow.corpus.version_with_instrument(version_id)
+        if loaded is None:
+            raise LegalCorpusVersionNotFound()
+        return loaded[0]

@@ -227,6 +227,24 @@ async def get_version_diff(
 
 
 @router.get(
+    "/versions/{version_id}",
+    response_model=LegalVersionSummary,
+)
+async def get_version(
+    version_id: UUID,
+    current: AccountSession,
+    services: Services,
+) -> LegalVersionSummary:
+    del current
+    service = _require_service(services)
+    try:
+        version = await service.version(version_id=version_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return _version_summary(version)
+
+
+@router.get(
     "/versions/{version_id}/provisions",
     response_model=list[ProvisionSummary],
 )
