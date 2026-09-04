@@ -91,6 +91,7 @@ class ApplicationServices:
     csrf: Any
     token_service: Any
     accounts: AccountQueryPort
+    ai_jobs: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -218,6 +219,7 @@ async def application_services(
                 SqlAlchemyAccountQueryUnitOfWork(session_factory),
             )
         ),
+        ai_jobs=_build_ai_job_service(session_factory, idempotency),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -231,6 +233,22 @@ async def application_services(
             await redis.aclose()
         finally:
             await engine.dispose()
+
+
+def _build_ai_job_service(
+    session_factory: Any,
+    idempotency: IdempotencyService,
+) -> Any:
+    """Composition root for the synthetic AI Job HTTP service."""
+    from lawyer_agent.application.ai_job_service import AIJobService
+    from lawyer_agent.infrastructure.persistence.ai_jobs_uow import (
+        SqlAlchemyAIJobUnitOfWork,
+    )
+
+    return AIJobService(
+        lambda: SqlAlchemyAIJobUnitOfWork(session_factory),
+        idempotency,
+    )
 
 
 def services(request: Request) -> ApplicationServices:
