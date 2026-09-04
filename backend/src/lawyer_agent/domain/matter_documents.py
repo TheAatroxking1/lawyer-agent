@@ -34,6 +34,33 @@ class MatterStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+_MATTER_STATUS_TRANSITIONS: frozenset[tuple[MatterStatus, MatterStatus]] = frozenset(
+    {
+        (MatterStatus.OPEN, MatterStatus.ACTIVE),
+        (MatterStatus.OPEN, MatterStatus.CLOSED),
+        (MatterStatus.ACTIVE, MatterStatus.CLOSED),
+        (MatterStatus.CLOSED, MatterStatus.ARCHIVED),
+    }
+)
+
+
+class MatterStatusTransitionInvalid(ValueError):
+    def __init__(self, source: MatterStatus, target: MatterStatus) -> None:
+        self.source = source
+        self.target = target
+        super().__init__(f"invalid matter status transition: {source.value} -> {target.value}")
+
+
+def require_matter_status_transition(
+    source: MatterStatus, target: MatterStatus
+) -> None:
+    """Reject any status transition outside the approved conservative set."""
+    if not isinstance(source, MatterStatus) or not isinstance(target, MatterStatus):
+        raise ValueError("matter status transition endpoints must be strongly typed")
+    if (source, target) not in _MATTER_STATUS_TRANSITIONS:
+        raise MatterStatusTransitionInvalid(source, target)
+
+
 class DocumentKind(StrEnum):
     ORIGINAL = "original"
     DERIVED = "derived"

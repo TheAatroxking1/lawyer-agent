@@ -13,7 +13,9 @@ from lawyer_agent.domain.matter_documents import (
     MatterKind,
     MatterParty,
     MatterStatus,
+    MatterStatusTransitionInvalid,
     ReviewStatus,
+    require_matter_status_transition,
 )
 
 
@@ -114,3 +116,44 @@ def test_version_rejects_bad_sha_and_overlong_key() -> None:
             sha256=bytes(32),
             upload_status=base.upload_status,
         )
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (MatterStatus.OPEN, MatterStatus.ACTIVE),
+        (MatterStatus.OPEN, MatterStatus.CLOSED),
+        (MatterStatus.ACTIVE, MatterStatus.CLOSED),
+        (MatterStatus.CLOSED, MatterStatus.ARCHIVED),
+    ],
+)
+def test_status_transition_accepts_forward_set(
+    source: MatterStatus, target: MatterStatus
+) -> None:
+    require_matter_status_transition(source, target)
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (MatterStatus.OPEN, MatterStatus.ARCHIVED),
+        (MatterStatus.ACTIVE, MatterStatus.ARCHIVED),
+        (MatterStatus.ACTIVE, MatterStatus.OPEN),
+        (MatterStatus.CLOSED, MatterStatus.OPEN),
+        (MatterStatus.CLOSED, MatterStatus.ACTIVE),
+        (MatterStatus.ARCHIVED, MatterStatus.OPEN),
+        (MatterStatus.ARCHIVED, MatterStatus.ACTIVE),
+        (MatterStatus.ARCHIVED, MatterStatus.CLOSED),
+        (MatterStatus.ARCHIVED, MatterStatus.ARCHIVED),
+    ],
+)
+def test_status_transition_rejects_backward_and_jumps(
+    source: MatterStatus, target: MatterStatus
+) -> None:
+    with pytest.raises(MatterStatusTransitionInvalid):
+        require_matter_status_transition(source, target)
+
+
+def test_status_transition_rejects_untyped_endpoints() -> None:
+    with pytest.raises(ValueError, match="strongly typed"):
+        require_matter_status_transition(MatterStatus.OPEN, "active")  # type: ignore[arg-type]

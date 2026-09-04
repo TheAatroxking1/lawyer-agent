@@ -36,6 +36,7 @@ from lawyer_agent.domain.matter_documents import (
     Matter,
     MatterKind,
     MatterParty,
+    MatterStatus,
     PartyConflictCheck,
 )
 from lawyer_agent.domain.tenancy import TenantContext
@@ -149,6 +150,14 @@ class MatterStorePort(Protocol):
         exclude_matter_id: UUID | None,
     ) -> int: ...
 
+    async def transition_matter_status(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        target_status: MatterStatus,
+    ) -> Matter | None: ...
 
 class DocumentHeaderStorePort(Protocol):
     async def headers_for_matter(
@@ -863,6 +872,47 @@ class MatterDocumentHttpService:
             other_matter_count=count,
         )
 
+    async def transition_matter_status(
+        self,
+        *,
+        context: TenantContext,
+        matter_id: UUID,
+        expected_version: int | None,
+        target_status: MatterStatus,
+        trace_id: str | None = None,
+    ) -> Matter:
+        require_uuid7(matter_id, field="matter_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            existing = await uow.matters.get_matter(context, matter_id)
+            if existing is None:
+                raise MatterDocumentNotFound
+            from lawyer_agent.domain.matter_documents import (
+                MatterStatusTransitionInvalid,
+            )
+
+            try:
+                updated = await uow.matters.transition_matter_status(
+                    context,
+                    matter_id,
+                    expected_version=(
+                        existing.version if expected_version is None else expected_version
+                    ),
+                    target_status=target_status,
+                )
+            except (ValueError, MatterStatusTransitionInvalid) as exc:
+                raise MatterDocumentConflict from exc
+            if updated is None:
+                raise MatterDocumentConflict
+            await _append_matter_audit(
+                uow,
+                context=context,
+                action="matter.status",
+                reason_code="changed",
+                target_id=matter_id,
+                trace_id=trace_id,
+            )
+            return updated
+
     async def _require_matter(
         self, uow: MatterDocumentUnitOfWorkPort, context: TenantContext, matter_id: UUID
     ) -> None:
@@ -895,6 +945,33 @@ async def _find_party_by_id(
         if party.id == party_id:
             return party
     return None
+
+
+async def _append_matter_audit(
+    uow: object,
+    *,
+    context: TenantContext,
+    action: str,
+    reason_code: str,
+    target_id: UUID,
+    trace_id: str | None,
+) -> None:
+    audit = getattr(uow, "audit", None)
+    user_id = context.membership_user_id
+    membership_id = context.membership_id
+    if audit is None or user_id is None or membership_id is None:
+        return
+    event = new_tenant_user_audit_event(
+        tenant_id=context.tenant_id,
+        actor_user_id=user_id,
+        actor_membership_id=membership_id,
+        action=action,
+        reason_code=reason_code,
+        trace_id=trace_id or "http",
+        target_type="matter",
+        target_id=target_id,
+    )
+    await audit.append_structured(event)
 
 
 async def _append_party_audit(

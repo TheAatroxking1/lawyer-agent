@@ -14,16 +14,19 @@ from lawyer_agent.api.dependencies import (
 from lawyer_agent.api.errors import ApiProblem
 from lawyer_agent.api.v1.tenants import StrictModel
 from lawyer_agent.application.matter_document_api import (
+    MatterDocumentConflict,
     MatterDocumentError,
     MatterDocumentHttpService,
     MatterDocumentInvalidRequest,
     MatterDocumentNotFound,
 )
+from lawyer_agent.application.tenancy import StrongETag
 from lawyer_agent.domain.matter_documents import (
     DocumentVersion,
     Matter,
     MatterKind,
     MatterParty,
+    MatterStatus,
 )
 
 router = APIRouter(
@@ -204,6 +207,14 @@ async def create_matter(
     return _matter_summary(matter)
 
 
+class MatterStatusBody(StrictModel):
+    status: Literal["open", "active", "closed", "archived"]
+
+
+class MatterStatusResponse(StrictModel):
+    matter: MatterSummary
+
+
 @router.get("/matters", response_model=MatterPage)
 async def list_matters(
     tenant_id: UUID,
@@ -226,6 +237,41 @@ async def list_matters(
     items = [_matter_summary(matter) for matter in matters]
     next_cursor = items[-1].id if len(items) == limit else None
     return MatterPage(items=items, next_before_id=next_cursor)
+
+
+@router.post(
+    "/matters/{matter_id}/status",
+    response_model=MatterStatusResponse,
+    status_code=200,
+)
+async def transition_matter_status(
+    tenant_id: UUID,
+    matter_id: UUID,
+    body: MatterStatusBody,
+    actor: TenantActorDependency,
+    services: Services,
+    response: Response,
+    request: Request,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> MatterStatusResponse:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    expected_version = (
+        None if if_match is None else StrongETag.parse(if_match).version
+    )
+    try:
+        matter = await service.transition_matter_status(
+            context=actor.context,
+            matter_id=matter_id,
+            expected_version=expected_version,
+            target_status=MatterStatus(body.status),
+            trace_id=getattr(request.state, "trace_id", None),
+        )
+    except (MatterDocumentNotFound, MatterDocumentConflict) as exc:
+        raise _map_error(exc) from None
+    response.headers["ETag"] = StrongETag.format(matter.version)
+    return MatterStatusResponse(matter=_matter_summary(matter))
 
 
 @router.get("/matters/{matter_id}", response_model=MatterSummary)

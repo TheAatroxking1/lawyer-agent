@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,7 @@ from lawyer_agent.domain.matter_documents import (
     MatterParty,
     MatterStatus,
     ReviewStatus,
+    require_matter_status_transition,
 )
 from lawyer_agent.domain.tenancy import TenantContext
 from lawyer_agent.infrastructure.persistence.models.matter_documents import (
@@ -214,6 +215,60 @@ class SqlAlchemyMatterRepository:
         self._session.add(_matter_model(matter))
         await self._session.flush()
         return matter
+
+    async def transition_matter_status(
+        self,
+        context: TenantContext,
+        matter_id: UUID,
+        *,
+        expected_version: int,
+        target_status: MatterStatus,
+    ) -> Matter | None:
+        """Atomically transition one tenant Matter with a version CAS.
+
+        Returns the updated Matter or None when the row does not exist / the
+        version guard fails; callers map None to NotFound/Conflict by re-read.
+        """
+        _require_context(context)
+        require_uuid7(matter_id, field="matter_id")
+        if isinstance(expected_version, bool) or not isinstance(
+            expected_version, int
+        ) or expected_version < 1:
+            raise ValueError("matter expected_version must be a positive integer")
+        if not isinstance(target_status, MatterStatus):
+            raise ValueError("matter target status must be strongly typed")
+        model = await self._session.scalar(
+            select(TenantMatterModel)
+            .where(
+                TenantMatterModel.tenant_id == context.tenant_id,
+                TenantMatterModel.id == matter_id,
+            )
+            .with_for_update()
+        )
+        if model is None:
+            return None
+        current = _MATTER_STATUS_MAP[model.status]
+        require_matter_status_transition(current, target_status)
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(TenantMatterModel)
+                .where(
+                    TenantMatterModel.tenant_id == context.tenant_id,
+                    TenantMatterModel.id == matter_id,
+                    TenantMatterModel.status == current.value,
+                    TenantMatterModel.version == expected_version,
+                )
+                .values(
+                    status=target_status.value,
+                    version=TenantMatterModel.version + 1,
+                )
+            ),
+        )
+        if result.rowcount != 1:
+            return None
+        await self._session.flush()
+        return _matter(model)
 
     async def add_party(
         self,
