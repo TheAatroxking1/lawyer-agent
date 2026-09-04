@@ -4,7 +4,7 @@ import base64
 from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Request, Response
+from fastapi import APIRouter, Header, Query, Request, Response
 from pydantic import Field, field_validator, model_validator
 
 from lawyer_agent.api.dependencies import (
@@ -53,6 +53,11 @@ class MatterSummary(StrictModel):
     kind: str
     status: str
     version: int
+
+
+class MatterPage(StrictModel):
+    items: list[MatterSummary]
+    next_before_id: UUID | None = None
 
 
 class RegisterDocumentBody(StrictModel):
@@ -197,6 +202,30 @@ async def create_matter(
     except MatterDocumentInvalidRequest as exc:
         raise _map_error(exc) from None
     return _matter_summary(matter)
+
+
+@router.get("/matters", response_model=MatterPage)
+async def list_matters(
+    tenant_id: UUID,
+    actor: TenantActorDependency,
+    services: Services,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    before_id: Annotated[UUID | None, Query(alias="before_id")] = None,
+) -> MatterPage:
+    if tenant_id != actor.context.tenant_id:
+        raise ApiProblem(404, "tenant_resource_not_found", "Resource not found")
+    service = _require_service(services)
+    try:
+        matters = await service.list_matters(
+            context=actor.context,
+            limit=limit,
+            before_id=before_id,
+        )
+    except (MatterDocumentNotFound, MatterDocumentInvalidRequest) as exc:
+        raise _map_error(exc) from None
+    items = [_matter_summary(matter) for matter in matters]
+    next_cursor = items[-1].id if len(items) == limit else None
+    return MatterPage(items=items, next_before_id=next_cursor)
 
 
 @router.get("/matters/{matter_id}", response_model=MatterSummary)

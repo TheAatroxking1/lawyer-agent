@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,6 +79,10 @@ def _require_context(context: TenantContext) -> None:
     require_uuid7(context.tenant_id, field="matter tenant_id")
 
 
+class MatterListCursorInvalid(ValueError):
+    """Raised when a keyset cursor does not belong to the caller's tenant."""
+
+
 def _matter(model: TenantMatterModel) -> Matter:
     return Matter(
         id=model.id,
@@ -138,6 +142,53 @@ class SqlAlchemyMatterRepository:
             )
         )
         return None if model is None else _matter(model)
+
+    async def list_matters(
+        self,
+        context: TenantContext,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[Matter, ...]:
+        """Keyset list of the tenant's Matters newest first (created_at, id).
+
+        ``before_id`` anchors the previous page's last item; a cursor that is
+        not in this tenant raises a NotFound-style marker via None return
+        semantics of the caller.
+        """
+        _require_context(context)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("matter list limit must be between 1 and 100")
+        statement = select(TenantMatterModel).where(
+            TenantMatterModel.tenant_id == context.tenant_id
+        )
+        if before_id is not None:
+            require_uuid7(before_id, field="before_id")
+            anchor = await self._session.scalar(
+                select(TenantMatterModel.created_at).where(
+                    TenantMatterModel.tenant_id == context.tenant_id,
+                    TenantMatterModel.id == before_id,
+                )
+            )
+            if anchor is None:
+                raise MatterListCursorInvalid("matter list cursor is not in this tenant")
+            statement = statement.where(
+                or_(
+                    TenantMatterModel.created_at < anchor,
+                    and_(
+                        TenantMatterModel.created_at == anchor,
+                        TenantMatterModel.id < before_id,
+                    ),
+                )
+            )
+        models = (
+            await self._session.scalars(
+                statement.order_by(
+                    TenantMatterModel.created_at.desc(), TenantMatterModel.id.desc()
+                ).limit(limit)
+            )
+        ).all()
+        return tuple(_matter(model) for model in models)
 
     async def create_matter(
         self,

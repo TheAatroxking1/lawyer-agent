@@ -90,6 +90,14 @@ class MatterStorePort(Protocol):
         self, context: TenantContext, matter_id: UUID
     ) -> Matter | None: ...
 
+    async def list_matters(
+        self,
+        context: TenantContext,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[Matter, ...]: ...
+
     async def create_matter(
         self,
         *,
@@ -287,6 +295,33 @@ class MatterDocumentHttpService:
             if matter is None:
                 raise MatterDocumentNotFound
             return matter
+
+    async def list_matters(
+        self,
+        *,
+        context: TenantContext,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[Matter, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise MatterDocumentInvalidRequest
+        if before_id is not None:
+            require_uuid7(before_id, field="before_id")
+        async with cast(MatterDocumentUnitOfWorkPort, self._uow_factory()) as uow:
+            from lawyer_agent.infrastructure.persistence.repositories.matters import (
+                MatterListCursorInvalid,
+            )
+
+            try:
+                return await uow.matters.list_matters(
+                    context,
+                    limit=limit,
+                    before_id=before_id,
+                )
+            except MatterListCursorInvalid as exc:
+                raise MatterDocumentNotFound from exc
+            except ValueError as exc:
+                raise MatterDocumentInvalidRequest from exc
 
     async def register_document(
         self,
