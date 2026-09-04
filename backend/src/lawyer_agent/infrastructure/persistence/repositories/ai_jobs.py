@@ -583,6 +583,81 @@ class SqlAlchemyAIJobRepository:
         )
         return result.rowcount == 1
 
+    async def cancel_claimable_job(
+        self,
+        *,
+        tenant_id: UUID,
+        job_id: UUID,
+        now: datetime,
+    ) -> bool:
+        """Cancel a Job that has not started (queued or retry_scheduled)."""
+        require_uuid7(tenant_id, field="cancel job tenant_id")
+        require_uuid7(job_id, field="cancel job job_id")
+        result = cast(
+            CursorResult[Any],
+            await self._session.execute(
+                update(AIJobModel)
+                .where(
+                    AIJobModel.tenant_id == tenant_id,
+                    AIJobModel.id == job_id,
+                    AIJobModel.status.in_(
+                        (AIJobStatus.QUEUED.value, AIJobStatus.RETRY_SCHEDULED.value)
+                    ),
+                    AIJobModel.lease_owner.is_(None),
+                    AIJobModel.lease_token.is_(None),
+                )
+                .values(
+                    status=AIJobStatus.CANCELLED.value,
+                    completed_at=_naive(now),
+                    next_attempt_at=None,
+                    version=AIJobModel.version + 1,
+                    updated_at=_naive(now),
+                )
+            ),
+        )
+        return result.rowcount == 1
+
+    async def lookup_membership_permissions(
+        self,
+        tenant_id: UUID,
+        membership_id: UUID,
+    ) -> frozenset[str]:
+        """Reload current role permission codes for an HTTP Job request."""
+        require_uuid7(tenant_id, field="membership tenant_id")
+        require_uuid7(membership_id, field="membership id")
+        role_rows = (
+            await self._session.execute(
+                select(TenantRoleModel.code, PermissionModel.code)
+                .join(
+                    MembershipRoleAssignmentModel,
+                    and_(
+                        MembershipRoleAssignmentModel.tenant_id == TenantRoleModel.tenant_id,
+                        MembershipRoleAssignmentModel.tenant_role_id == TenantRoleModel.id,
+                    ),
+                )
+                .outerjoin(
+                    TenantRolePermissionModel,
+                    and_(
+                        TenantRolePermissionModel.tenant_id == TenantRoleModel.tenant_id,
+                        TenantRolePermissionModel.tenant_role_id == TenantRoleModel.id,
+                    ),
+                )
+                .outerjoin(
+                    PermissionModel,
+                    and_(
+                        PermissionModel.id == TenantRolePermissionModel.permission_id,
+                        PermissionModel.status == "active",
+                    ),
+                )
+                .where(
+                    TenantRoleModel.tenant_id == tenant_id,
+                    TenantRoleModel.status == "active",
+                    MembershipRoleAssignmentModel.membership_id == membership_id,
+                )
+            )
+        ).all()
+        return frozenset(row[1] for row in role_rows if row[1] is not None)
+
 
 def _job(model: AIJobModel) -> AIJob:
     return AIJob(
