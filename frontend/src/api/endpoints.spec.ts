@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiClient } from './client'
 import {
+  askQuestion,
   chat,
   getInstrument,
   getVersion,
@@ -56,5 +57,15 @@ describe('endpoint path composition', () => {
     await chat(client, [{ role: 'user', content: '你好' }])
     expect(calls[0].url).toBe('/legal/chat')
     expect(calls[0].init).toEqual({ method: 'POST', body: { messages: [{ role: 'user', content: '你好' }] } })
+  })
+
+  it('posts a retrieval question to /legal/questions', async () => {
+    const { client, calls } = recordingClient()
+    await askQuestion(client, { question: '违约金怎么算？', target_date: '2026-09-10' })
+    expect(calls[0].url).toBe('/legal/questions')
+    expect(calls[0].init).toEqual({
+      method: 'POST',
+      body: { question: '违约金怎么算？', target_date: '2026-09-10' },
+    })
   })
 })
