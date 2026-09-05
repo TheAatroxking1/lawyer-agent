@@ -172,6 +172,10 @@ class Settings(BaseSettings):
     jwt_ed25519_key_ring_file: Path | None = Field(
         default=None, repr=False, exclude=True
     )
+    deepseek_api_key: str | None = Field(default=None, repr=False, exclude=True)
+    deepseek_api_key_file: Path | None = Field(
+        default=None, repr=False, exclude=True
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -219,6 +223,48 @@ class Settings(BaseSettings):
                     raise ValueError(f"{file_field} must contain valid JSON") from exc
             else:
                 loaded[target_field] = text_value
+        raw_deepseek_file = loaded.get("deepseek_api_key_file")
+        if raw_deepseek_file is not None:
+            if loaded.get("deepseek_api_key") is not None:
+                raise ValueError(
+                    "deepseek_api_key and deepseek_api_key_file cannot both be configured"
+                )
+            path = Path(raw_deepseek_file)
+            if not path.is_absolute():
+                raise ValueError("deepseek_api_key_file must be an absolute path")
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("deepseek_api_key_file cannot be read") from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("deepseek_api_key_file must be a regular file")
+            try:
+                with path.open("rb") as secret_stream:
+                    payload = secret_stream.read(_MAX_SECRET_FILE_BYTES + 1)
+            except OSError as exc:
+                raise ValueError("deepseek_api_key_file cannot be read") from exc
+            if not payload or len(payload) > _MAX_SECRET_FILE_BYTES:
+                raise ValueError("deepseek_api_key_file has an invalid size")
+            try:
+                text_value = payload.decode("utf-8").rstrip("\r\n")
+            except UnicodeDecodeError as exc:
+                raise ValueError("deepseek_api_key_file must contain UTF-8 text") from exc
+            if not text_value or "\x00" in text_value:
+                raise ValueError("deepseek_api_key_file has invalid content")
+            try:
+                parsed = json.loads(
+                    text_value,
+                    object_pairs_hook=_reject_duplicate_json_object_pairs,
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError("deepseek_api_key_file must contain valid JSON") from exc
+            if not isinstance(parsed, dict) or set(parsed) != {"api_key"}:
+                raise ValueError(
+                    "deepseek_api_key_file must be a JSON object with a single api_key field"
+                )
+            if not isinstance(parsed["api_key"], str):
+                raise ValueError("deepseek_api_key_file api_key must be text")
+            loaded["deepseek_api_key"] = parsed["api_key"]
         return loaded
 
     @field_validator(
@@ -336,6 +382,16 @@ class Settings(BaseSettings):
         if len(set(decoded)) != len(decoded):
             raise ValueError("jwt_ed25519_key_ring must not repeat decoded key material")
         return value
+
+    @field_validator("deepseek_api_key")
+    @classmethod
+    def normalize_deepseek_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("deepseek_api_key must be text")
+        stripped = value.strip()
+        return stripped if stripped else None
 
     @model_validator(mode="after")
     def validate_active_jwt_key(self) -> "Settings":

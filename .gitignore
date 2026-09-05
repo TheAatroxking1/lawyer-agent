@@ -2,6 +2,7 @@
 .worktrees/
 deploy/.env
 deploy/secrets/
+deploy/deepseek.config.json
 .env
 .venv/
 __pycache__/
