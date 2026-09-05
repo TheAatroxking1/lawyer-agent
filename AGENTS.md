@@ -134,6 +134,25 @@
   （ChatView gzip 2.0 kB）；真实回复需用户配置 key 后手工验证（无 key 503
   语义已由后端全栈覆盖）。SSE 流式问答编排、上传下载页面、MCP 白名单化
   工具、Nginx 托管入 compose 仍为后续。
+- 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
+  spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
+  拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
+  `build_claims_system_prompt`（条目按序编号 `[n]（依据编号 uuid）…`、超长
+  条文显式截断加「条文过长已截断…核验以编号对应权威条文为准」标记、总
+  预算 12000 字/条上限 3000 字、坏参数稳定 ValueError）与
+  `LegalRetrievalQaService.answer(alias, question, model_ref, dimension,
+  target_date, version_id?, limit=12, bm25=80, knn=80) ->
+  LegalRetrievalAnswer{text, refused, reason, claims, citations(EvidenceItem),
+  usage}`：检索空 → 拒答 `no_evidence`（零模型调用）；有据 → system+user →
+  chat 一次 → `parse_claims_text`（失败 → `claim_parse_failed` 拒答保留
+  usage）→ `LegalClaimGate(CitationGate).verify(target_date)` 不通过 →
+  拒答 reason 原样 `claim_not_supported:<code>`（含 out-of-bundle/未授权/
+  生效前/已废止/状态未知）；通过 → claims 编号成 text、citations 按引用
+  首现去重保序；provider 故障以类型化 `ModelGatewayError` 上抛不并入拒答；
+  拒答文案确定性中文；15 项离线单测（allowed 全链/解析/五类引用拒答/解析
+  失败/no_evidence 零调用/网关上抛/非法输入族/prompt 顺序·截断·预算）green
+  + ruff/mypy 零错 + 全 unit **1105 passed + 1 skipped**；无 Schema/DB 改动。
+  检索问答 HTTP/SSE、装配、前端流式界面仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
