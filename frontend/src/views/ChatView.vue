@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
 
-import { ApiError, apiClient, chat } from '../api'
-import type { ChatUsage } from '../api'
+import { ApiError } from '../api'
+import { chatStream } from '../api/sse'
 import AuthModal from '../components/AuthModal.vue'
 import { authState, refreshAuth } from '../auth/state'
 import { session } from '../auth/session'
@@ -13,7 +13,6 @@ const turns = ref<ChatTurn[]>([])
 const draft = ref('')
 const sending = ref(false)
 const error = ref<ApiError | null>(null)
-const usage = ref<ChatUsage | null>(null)
 const transcript = ref<HTMLElement | null>(null)
 const showLogin = ref(false)
 const pendingSend = ref(false)
@@ -40,23 +39,65 @@ function onLoggedOut401(): void {
   openLogin()
 }
 
+function errorFromEvent(data: Record<string, unknown>): ApiError {
+  const status = typeof data['status'] === 'number' ? data['status'] : 0
+  const code =
+    typeof data['code'] === 'string' && data['code'].length > 0
+      ? data['code']
+      : 'chat_stream_error'
+  const title =
+    typeof data['title'] === 'string' && data['title'].length > 0
+      ? data['title']
+      : '回答未完整生成，请重试。'
+  return new ApiError({ status, code, title })
+}
+
+function scrollTranscript(): void {
+  void nextTick().then(() => {
+    if (transcript.value) {
+      transcript.value.scrollTop = transcript.value.scrollHeight
+    }
+  })
+}
+
 async function doSend(content: string): Promise<void> {
-  usage.value = null
   const history: ChatTurn[] = [...turns.value, { role: 'user', content }]
-  turns.value = history
+  // Reserve the assistant bubble immediately; deltas then render token by token.
+  turns.value = [...history, { role: 'assistant', content: '…' }]
+  const assistantIndex = turns.value.length - 1
   sending.value = true
+  const parts: string[] = []
+  let failed: ApiError | null = null
   try {
-    const reply = await chat(apiClient, composeChatMessages(history))
-    turns.value = [...turns.value, { role: 'assistant', content: reply.text }]
-    usage.value = reply.usage
+    const stream = await chatStream(composeChatMessages(history))
+    for await (const frame of stream) {
+      if (frame.event === 'delta') {
+        const text = frame.data['text']
+        if (typeof text === 'string' && text.length > 0) parts.push(text)
+        turns.value[assistantIndex] = { role: 'assistant', content: parts.join('') }
+        scrollTranscript()
+      } else if (frame.event === 'error') {
+        failed = errorFromEvent(frame.data)
+      } else if (frame.event === 'done') {
+        break
+      }
+    }
   } catch (cause) {
-    error.value =
+    failed =
       cause instanceof ApiError
         ? cause
         : new ApiError({ status: 0, code: 'network_error', title: '无法连接服务，请稍后重试' })
   } finally {
     sending.value = false
   }
+  if (failed) {
+    error.value = failed
+    if (parts.length === 0) {
+      // Nothing was generated: drop the placeholder bubble and keep the banner.
+      turns.value = turns.value.filter((_, index) => index !== assistantIndex)
+    }
+  }
+  scrollTranscript()
 }
 
 function requestSend(): void {
@@ -91,7 +132,6 @@ function onModalSuccess(): void {
 function clearConversation(): void {
   turns.value = []
   error.value = null
-  usage.value = null
 }
 
 watch(
@@ -125,7 +165,6 @@ watch(
         <div class="who">{{ turn.role === 'user' ? '我' : '律师 Agent' }}</div>
         <div class="body">{{ turn.content }}</div>
       </article>
-      <p v-if="sending" class="thinking">正在思考…</p>
     </div>
 
     <div class="compose">
@@ -144,9 +183,6 @@ watch(
         </button>
       </p>
       <p v-if="error && guidanceFor(error.code)" class="guidance">{{ guidanceFor(error.code) }}</p>
-      <p v-if="usage" class="usage">
-        本次回答 tokens：{{ usage.completion_tokens }}（累计 {{ usage.total_tokens }}）
-      </p>
       <form class="compose-row" @submit.prevent="requestSend">
         <textarea
           v-model="draft"

@@ -1,14 +1,15 @@
-// Consumes the retrieval Q&A SSE endpoint
-// (POST /api/v1/legal/questions/stream) over fetch ReadableStream.
+// Consumes the SSE chat/Q&A endpoints
+// (POST /api/v1/legal/questions/stream, POST /api/v1/legal/chat/stream) over a
+// fetch ReadableStream.
 //
-// The transport frames are stable: started -> answer|error -> done. JSON data
-// is parsed per event; non-2xx responses are mapped to ApiError just like the
-// JSON endpoints.
+// The transport frames are stable: started -> answer|delta*|error -> done.
+// JSON data is parsed per event; non-2xx responses are mapped to ApiError just
+// like the JSON endpoints.
 
 import { ApiError } from './client'
 import { session } from '../auth/session'
 import { parseSseBlock } from '../lib/sse'
-import type { ApiProblemBody, RetrievalQuestionInput } from './types'
+import type { ApiProblemBody, ChatMessageInput, RetrievalQuestionInput } from './types'
 
 const apiBase: string =
   (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api/v1'
@@ -44,17 +45,22 @@ async function readErrorBody(response: Response): Promise<ApiError> {
   })
 }
 
-export async function askQuestionStream(
-  input: RetrievalQuestionInput,
+/**
+ * Opens one SSE POST and yields its frames until the transport closes.
+ * Throws ApiError before yielding when the response is not 2xx.
+ */
+async function postEventStream(
+  path: string,
+  payload: unknown,
   signal?: AbortSignal,
 ): Promise<AsyncIterable<AskStreamEvent>> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token = session.readToken()
   if (token) headers.Authorization = `Bearer ${token}`
-  const response = await fetch(`${apiBase}/legal/questions/stream`, {
+  const response = await fetch(`${apiBase}${path}`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(input),
+    body: JSON.stringify(payload),
     signal,
   })
   if (!response.ok || !response.body) {
@@ -95,4 +101,18 @@ export async function askQuestionStream(
     }
   }
   return events()
+}
+
+export function askQuestionStream(
+  input: RetrievalQuestionInput,
+  signal?: AbortSignal,
+): Promise<AsyncIterable<AskStreamEvent>> {
+  return postEventStream('/legal/questions/stream', input, signal)
+}
+
+export function chatStream(
+  messages: ChatMessageInput[],
+  signal?: AbortSignal,
+): Promise<AsyncIterable<AskStreamEvent>> {
+  return postEventStream('/legal/chat/stream', { messages }, signal)
 }
