@@ -10,7 +10,9 @@ import {
   listProvisionsForVersion,
   listVersionsForInstrument,
   login,
+  myTenants,
   registerAccount,
+  switchTenant,
 } from './endpoints'
 
 function recordingClient() {
@@ -66,6 +68,24 @@ describe('endpoint path composition', () => {
     expect(calls[0].init).toEqual({
       method: 'POST',
       body: { question: '违约金怎么算？', target_date: '2026-09-10' },
+    })
+  })
+
+  it('lists my tenants and switches to one of them', async () => {
+    const { client, calls } = recordingClient()
+    await myTenants(client)
+    await switchTenant(client, {
+      tenant_id: '11111111-1111-7111-8111-111111111111',
+      membership_id: '22222222-2222-7222-8222-222222222222',
+    })
+    expect(calls[0].url).toBe('/accounts/me/tenants')
+    expect(calls[1].url).toBe('/auth/switch-tenant')
+    expect(calls[1].init).toEqual({
+      method: 'POST',
+      body: {
+        tenant_id: '11111111-1111-7111-8111-111111111111',
+        membership_id: '22222222-2222-7222-8222-222222222222',
+      },
     })
   })
 })

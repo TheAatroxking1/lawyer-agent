@@ -32,6 +32,19 @@ describe('createSession', () => {
     expect(session.isAuthenticated()).toBe(false)
   })
 
+  it('persists a tenant access token separately from the account token', () => {
+    const storage = memoryStorage()
+    const session = createSession(storage)
+    session.saveToken('account-token')
+    expect(session.readTenantToken()).toBeNull()
+    session.saveTenantToken('tenant-token')
+    expect(session.readTenantToken()).toBe('tenant-token')
+    expect(session.readToken()).toBe('account-token')
+    session.clearTenantToken()
+    expect(session.readTenantToken()).toBeNull()
+    expect(session.readToken()).toBe('account-token')
+  })
+
   it('treats an empty stored token as not authenticated', () => {
     const storage = memoryStorage()
     storage.setItem('lawyer_agent.access_token', '')
