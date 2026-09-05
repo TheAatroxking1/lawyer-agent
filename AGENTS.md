@@ -84,6 +84,28 @@
   修复为 `disable_existing_loggers=False`（只配置 alembic 自己的
   logger，不误伤无关 logger），publisher/consumer+recorder 最小复现与
   rabbitmq 目录全绿；SSE/证据检索问答编排、前端仍为后续。
+- 已完成“Vue 3 前端骨架（frontend/ 工程）”非模型切片（2026-09-10 计划）：
+  仓库此前零前端代码——新增 `frontend/` 独立 npm 工程（node v24/npm 11、
+  Vite+Vue 3.5+TS strict（vue-tsc）、vue-router 4，仅 vue/vue-router 两个
+  运行时依赖；`npm install` 0 漏洞）：`src/api/` 类型化 API 客户端
+  （fetch 封装：Bearer 注入、非 2xx 按 Problem Details `{status,code,title,
+  trace_id,errors}` 映射稳定 `ApiError`、请求超时 AbortController，base
+  默认同源 `/api/v1`、Vite dev proxy `/api`→`http://127.0.0.1:8000`）+
+  端点函数镜像后端 auth（register/login）/legal/instruments 契约（仅取后端
+  回显字段）；`src/auth/session.ts` Access Token 会话（localStorage 键
+  `lawyer_agent.access_token`，Storage 可注入、无 DOM 环境降级 no-op，
+  Refresh Token 为 httpOnly Cookie 由浏览器携带不读取）；`src/auth/guard.ts`
+  路由守卫决策纯函数 + 全局 beforeEach（匿名访问受保护页 → `/login?next=`、
+  已登录访问 login/register → 首页）；页面：登录/注册（本地校验 + 后端
+  code/title 展示、成功后落 token 跳 next）、AppShell（顶栏导航/退出）、
+  首页、语料目录列表（title 检索 + limit/before_id keyset 翻页，读链路
+  最小可用）、对话占位页（说明 JSON key 配置三步 + 未配置 503 语义）、
+  404；无 UI 框架，语义化 CSS 令牌；验证 `npm run typecheck` 0 错误 +
+  vitest 18 项（Bearer 注入/Problem 映射/401/500 派生/超时 AbortError/
+  坏 body 抛 ApiError、session 持久化/空 token/无存储降级、guard 决策矩阵）
+  全绿 + `npm run build`（vue-tsc && vite build）产物正常分包；后端零改动。
+  语料详情（版本/条文全文）、法规对话界面与 SSE、上传下载页面、Nginx 托管
+  入 compose 仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
