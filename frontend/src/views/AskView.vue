@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-import { ApiError, apiClient, askQuestion } from '../api'
+import { ApiError } from '../api'
 import type { RetrievalQuestionReply } from '../api'
+import { askQuestionStream } from '../api/sse'
 import AuthModal from '../components/AuthModal.vue'
 import { authState, refreshAuth } from '../auth/state'
 import { session } from '../auth/session'
 
 const question = ref('')
 const busy = ref(false)
+const phase = ref<'idle' | 'searching'>('idle')
 const error = ref<ApiError | null>(null)
 const reply = ref<RetrievalQuestionReply | null>(null)
 const showLogin = ref(false)
@@ -55,13 +57,32 @@ async function submit(): Promise<void> {
 
 async function ask(content: string): Promise<void> {
   reply.value = null
+  error.value = null
   busy.value = true
+  phase.value = 'searching'
   try {
-    const result = await askQuestion(apiClient, {
+    const events = await askQuestionStream({
       question: content,
       target_date: new Date().toISOString().slice(0, 10),
     })
-    reply.value = result
+    for await (const event of events) {
+      if (event.event === 'answer') {
+        reply.value = event.data as unknown as RetrievalQuestionReply
+      } else if (event.event === 'error') {
+        const failure = event.data as unknown as {
+          status?: number
+          code?: string
+          title?: string
+        }
+        error.value = new ApiError({
+          status: failure.status ?? 502,
+          code: failure.code ?? 'retrieval_failed',
+          title: failure.title ?? '检索问答失败',
+        })
+      } else if (event.event === 'done') {
+        break
+      }
+    }
   } catch (cause) {
     error.value =
       cause instanceof ApiError
@@ -69,6 +90,7 @@ async function ask(content: string): Promise<void> {
         : new ApiError({ status: 0, code: 'network_error', title: '无法连接服务，请稍后重试' })
   } finally {
     busy.value = false
+    phase.value = 'idle'
   }
 }
 
