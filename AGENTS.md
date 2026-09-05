@@ -201,6 +201,20 @@
   当前租户」清租户 token；验证 typecheck 0 + vitest 40/40（session 租户/账号
   token 独立 + endpoints 两调用断言）+ build；后端零改动。租户内案件/文档
   上传下载列表、规则报告下载 UI 仍为后续。
+- 已完成“租户内案件列表/新建 + 文档上传登记”非模型切片（2026-09-10 计划）：
+  进入租户后补齐案件与上传闭环——`api/types` 镜像
+  MatterSummary/MatterPage/CreateMatterInput（kind 五枚举）/
+  RegisterDocumentInput/DocumentSummary/DocumentHeaderSummary；
+  `api/tenant.ts` 租户专用客户端（tokenProvider=session.readTenantToken 与
+  账号 token 隔离）与 listMatters（GET /tenants/{id}/matters?limit=50）、
+  createMatter、listDocuments、registerDocument（POST payload_b64）；
+  `DocumentsView` 扩展：案件列表（类型/状态胶囊、「文档 ▼」展开）、新建
+  案件（名称+类型，创建后刷新）、案件内 DOCX 上传（.docx/对应 MIME、
+  ≤25MB 前置拦截）→ arrayBuffer→base64→registerDocument（后端白名单校验
+  201）→ 展示最近登记版本 upload/review 状态与版本列表、分块错误横幅；验证
+  typecheck 0 + vitest 40/40 保持 + build（DocumentsView gzip 3.8 kB）。
+  Rule Check 运行/报告下载按钮、案件详情、原始文件下载与 MinIO 预签名仍为
+  后续。
 - 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
   （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
   MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
