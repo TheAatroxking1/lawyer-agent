@@ -304,7 +304,7 @@
    流结束零增量 → invalid response、中途故障记 error 并稳定映射、正常结束记
    success（流式 usage 未知如实 None）；验证 ruff/mypy strict（164 文件）零错 +
    全 unit **1144 passed + 1 skipped**（provider 流 8 项 + gateway 流 6 项）。
-   ChatView 消费逐 token 渲染仍为后续一步。
+  对话流式化第 2/3、3/3 步见下两条。
 - 已完成“真实逐 token 流式对话 · /legal/chat/stream SSE 端点”非模型切片
   （2026-09-10 计划，对话流式化第 2/3 步）：`LegalChatHttpService` 增
   `gateway_available` 属性与 `chat_stream(messages) -> AsyncIterator[str]`
@@ -318,8 +318,19 @@
   done 收尾）；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1149 passed
   + 1 skipped**（chat_stream 服务单测 +5）+ 真实 MySQL+Redis 全栈
   **6 passed**（stream 401、无 key 503、坏 role/空 422、Fake 服务
-  started/delta/delta/done、中途超时 → error 事件 504）。ChatView 消费逐
-  token 渲染仍为后续一步。
+  started/delta/delta/done、中途超时 → error 事件 504）。ChatView 逐 token 消费见下条（第 3/3 步）。
+- 已完成“真实逐 token 流式对话 · ChatView 消费逐 token 渲染”非模型切片
+  （2026-09-10 计划，对话流式化第 3/3 步）：`api/sse.ts` 把 SSE 流消费提取为
+  通用 `postEventStream(path, payload, signal)`（非 2xx 映射 ApiError、finally
+  releaseLock），原 `askQuestionStream` 变薄封装、新增
+  `chatStream(messages, signal)` → POST /legal/chat/stream；`ChatView.vue` 发送
+  改为先入 `{role:'assistant', content:'…'}` 占位气泡，`delta` 事件逐段原地
+  追加（每帧滚底）、`error` 事件构造 ApiError（缺省兜底 chat_stream_error）、
+  `done` 结束；零增量失败移除占位气泡只留横幅、部分增量失败保留已生成文本并
+  报错（不假装完整）；移除一次性 POST/usage 展示（流式无 usage 诚实不展示）；
+  验证 typecheck 0 错误 + vitest 41/41 保持 + build 分包（ChatView gzip
+  2.44 kB）。真实逐 token 体验需用户配置 DeepSeek key 后手工验证（无 key
+  503/事件序/error 语义均有后端真实 MySQL+Redis 全栈覆盖）。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
