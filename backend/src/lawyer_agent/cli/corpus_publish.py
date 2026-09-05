@@ -54,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-ref", default=None, help="embedding 模型名（缺省用 Settings）")
     parser.add_argument("--dimension", type=int, default=None, help="embedding 维度（缺省同上）")
     parser.add_argument("--batch-size", type=int, default=20, help="embedding 批大小")
+    parser.add_argument(
+        "--import-only",
+        action="store_true",
+        help="只导入+分块入库（不 embed/不发布），配合集合发布批量试点使用",
+    )
     return parser
 
 
@@ -196,6 +201,9 @@ async def _run(args: argparse.Namespace) -> None:
             f"imported instrument={imported.instrument_id} version={imported.version_id} "
             f"replayed={imported.replayed} articles={len(provisions)} chunks={len(chunks)}"
         )
+        if args.import_only:
+            print("import_only completed")
+            return
 
         # 2) Embed, index into OpenSearch and atomically publish the alias.
         embed_gateway = ModelGateway(
