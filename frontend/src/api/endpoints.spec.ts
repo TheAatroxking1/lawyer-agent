@@ -3,9 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ApiClient } from './client'
 import {
   askQuestion,
+  callAgentTool,
   chat,
   getInstrument,
   getVersion,
+  listAgentTools,
   listInstruments,
   listProvisionsForVersion,
   listVersionsForInstrument,
@@ -87,5 +89,14 @@ describe('endpoint path composition', () => {
         membership_id: '22222222-2222-7222-8222-222222222222',
       },
     })
+  })
+
+  it('lists and calls agent gateway tools', async () => {
+    const { client, calls } = recordingClient()
+    await listAgentTools(client)
+    await callAgentTool(client, { tool: 'meta.list_tools' })
+    expect(calls[0].url).toBe('/platform/agent/tools')
+    expect(calls[1].url).toBe('/platform/agent/tools/call')
+    expect(calls[1].init).toEqual({ method: 'POST', body: { tool: 'meta.list_tools', args: {} } })
   })
 })
