@@ -26,6 +26,7 @@ function goLogin(): void {
         <RouterLink :to="{ name: 'ask' }" :class="{ active: $route.name === 'ask' }">法规问答</RouterLink>
         <RouterLink :to="{ name: 'corpus' }" :class="{ active: $route.name === 'corpus' || $route.name === 'corpus-instrument' }">法规语料</RouterLink>
         <RouterLink :to="{ name: 'documents' }" :class="{ active: $route.name === 'documents' }">案件文档</RouterLink>
+        <RouterLink :to="{ name: 'agent-tools' }" :class="{ active: $route.name === 'agent-tools' }">智能工具</RouterLink>
         <RouterLink :to="{ name: 'chat' }" :class="{ active: $route.name === 'chat' }">法规对话</RouterLink>
       </nav>
       <div v-if="authState.authenticated" class="account">

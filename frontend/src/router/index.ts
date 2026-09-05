@@ -50,6 +50,12 @@ const router = createRouter({
           meta: { title: '案件文档' },
         },
         {
+          path: 'agent-tools',
+          name: 'agent-tools',
+          component: () => import('../views/AgentToolsView.vue'),
+          meta: { title: '智能工具' },
+        },
+        {
           path: 'corpus',
           name: 'corpus',
           component: () => import('../views/CorpusView.vue'),

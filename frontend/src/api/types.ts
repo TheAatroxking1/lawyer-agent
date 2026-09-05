@@ -182,6 +182,24 @@ export interface DocumentHeaderSummary {
   current_version_no: number
 }
 
+// Agent tool gateway (backend/api/v1/agent_gateway.py)
+export interface AgentToolInfo {
+  name: string
+  description: string
+}
+
+export interface AgentToolCallResult {
+  ok: boolean
+  output: unknown | null
+  error_code: string | null
+  error_message: string | null
+}
+
+export interface AgentToolCallInput {
+  tool: string
+  args?: Record<string, unknown>
+}
+
 // Problem Details body produced by backend/api/errors.py
 export interface ProblemErrors {
   field?: string

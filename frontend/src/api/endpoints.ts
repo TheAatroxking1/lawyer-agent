@@ -6,6 +6,9 @@ import { queryString } from './client'
 import type {
   AccessTokenResponse,
   AccountTenantList,
+  AgentToolCallInput,
+  AgentToolCallResult,
+  AgentToolInfo,
   ChatMessageInput,
   ChatReply,
   InstrumentListQuery,
@@ -117,5 +120,21 @@ export async function switchTenant(
   return client.request<AccessTokenResponse>('/auth/switch-tenant', {
     method: 'POST',
     body: input,
+  })
+}
+
+export async function listAgentTools(
+  client: ApiClient,
+): Promise<AgentToolInfo[]> {
+  return client.request<AgentToolInfo[]>('/platform/agent/tools')
+}
+
+export async function callAgentTool(
+  client: ApiClient,
+  input: AgentToolCallInput,
+): Promise<AgentToolCallResult> {
+  return client.request<AgentToolCallResult>('/platform/agent/tools/call', {
+    method: 'POST',
+    body: { tool: input.tool, args: input.args ?? {} },
   })
 }
