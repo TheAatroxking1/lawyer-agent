@@ -7,7 +7,10 @@ import type {
   AccessTokenResponse,
   InstrumentListQuery,
   InstrumentPage,
+  InstrumentSummary,
+  LegalVersionSummary,
   LoginInput,
+  ProvisionSummary,
   RegisterInput,
 } from './types'
 
@@ -37,4 +40,40 @@ export async function listInstruments(
 ): Promise<InstrumentPage> {
   const suffix = queryString({ ...query })
   return client.request<InstrumentPage>(`/legal/instruments${suffix}`)
+}
+
+export async function getInstrument(
+  client: ApiClient,
+  instrumentId: string,
+): Promise<InstrumentSummary> {
+  return client.request<InstrumentSummary>(
+    `/legal/instruments/${encodeURIComponent(instrumentId)}`,
+  )
+}
+
+export async function listVersionsForInstrument(
+  client: ApiClient,
+  instrumentId: string,
+): Promise<LegalVersionSummary[]> {
+  return client.request<LegalVersionSummary[]>(
+    `/legal/instruments/${encodeURIComponent(instrumentId)}/versions`,
+  )
+}
+
+export async function getVersion(
+  client: ApiClient,
+  versionId: string,
+): Promise<LegalVersionSummary> {
+  return client.request<LegalVersionSummary>(
+    `/legal/versions/${encodeURIComponent(versionId)}`,
+  )
+}
+
+export async function listProvisionsForVersion(
+  client: ApiClient,
+  versionId: string,
+): Promise<ProvisionSummary[]> {
+  return client.request<ProvisionSummary[]>(
+    `/legal/versions/${encodeURIComponent(versionId)}/provisions`,
+  )
 }

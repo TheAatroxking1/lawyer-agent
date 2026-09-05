@@ -35,6 +35,12 @@ const router = createRouter({
           meta: { title: '法规语料' },
         },
         {
+          path: 'corpus/:instrumentId',
+          name: 'corpus-instrument',
+          component: () => import('../views/CorpusInstrumentView.vue'),
+          meta: { title: '法规详情' },
+        },
+        {
           path: 'chat',
           name: 'chat',
           component: () => import('../views/ChatView.vue'),

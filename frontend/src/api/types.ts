@@ -32,7 +32,7 @@ export interface InstrumentSummary {
   title: string
   issuing_authority: string
   jurisdiction: string
-  region_code: string
+  region_code: string | null
 }
 
 export interface InstrumentPage {
@@ -47,6 +47,32 @@ export interface InstrumentListQuery {
   issuing_authority?: string
   jurisdiction?: string
   region_code?: string
+}
+
+// GET /api/v1/legal/instruments/{id}/versions and /legal/versions/{id}
+export interface LegalVersionSummary {
+  id: string
+  instrument_id: string
+  version_label: string
+  status: string
+  published_on: string | null
+  effective_on: string | null
+  repealed_on: string | null
+  law_number: string | null
+  source_ref: string | null
+  dataset_version: string | null
+  parser_version: string | null
+}
+
+// GET /api/v1/legal/versions/{id}/provisions
+export interface ProvisionSummary {
+  id: string
+  version_id: string
+  provision_no: string
+  level: string
+  structure_path: string[]
+  title: string | null
+  full_text: string
 }
 
 // Problem Details body produced by backend/api/errors.py

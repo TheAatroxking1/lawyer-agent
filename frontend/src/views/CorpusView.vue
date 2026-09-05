@@ -75,15 +75,17 @@ onMounted(() => {
     <p v-if="loading" class="state">加载中…</p>
     <p v-else-if="items.length === 0 && !error" class="state">暂无匹配的法规。</p>
     <ul v-else class="list">
-      <li v-for="item in items" :key="item.id" class="row">
-        <div class="title-line">
-          <strong>{{ item.title }}</strong>
-          <span class="jurisdiction">{{ item.jurisdiction }}</span>
-        </div>
-        <div class="meta">
-          <span>{{ item.issuing_authority }}</span>
-          <span v-if="item.region_code">{{ item.region_code }}</span>
-        </div>
+      <li v-for="item in items" :key="item.id">
+        <RouterLink class="row" :to="`/corpus/${item.id}`">
+          <div class="title-line">
+            <strong>{{ item.title }}</strong>
+            <span class="jurisdiction">{{ item.jurisdiction }}</span>
+          </div>
+          <div class="meta">
+            <span>{{ item.issuing_authority }}</span>
+            <span v-if="item.region_code">{{ item.region_code }}</span>
+          </div>
+        </RouterLink>
       </li>
     </ul>
     <nav v-if="items.length > 0" class="pager">
@@ -133,10 +135,17 @@ onMounted(() => {
   gap: 0.6rem;
 }
 .row {
+  display: block;
   padding: 0.8rem 1rem;
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--color-surface);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.15s ease;
+}
+.row:hover {
+  border-color: var(--color-accent);
 }
 .title-line {
   display: flex;
