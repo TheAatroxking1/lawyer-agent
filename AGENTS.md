@@ -252,7 +252,7 @@
   全 unit 1129 passed + 1 skipped 保持 + **2 项真实 MySQL+Redis 全栈**（未
   认证 401；登录后 GET 含 meta 描述、调用成功、unknown_tool、多余参数
   invalid_arguments、未知键 422）。把语料/检索注册为网关工具并授予 Agent
-  白名单仍为后续。
+  工具白名单的显式收敛见最新条目。
 - 已完成“Agent 工具面板（对接 MCP 网关 HTTP）”非模型切片（2026-09-10 计划）：
   网关 HTTP 面就绪但无前端——`api/types` 增 AgentToolInfo/AgentToolCallResult/
   AgentToolCallInput；`endpoints.listAgentTools`（GET /platform/agent/tools）与
@@ -276,7 +276,7 @@
   skipped**（新增 async handler 成功/校验/未知映射 2 项）+ 真实 MySQL+Redis
   全栈（工具清单双工具、corpus 空库调用 ok true 输出 []、limit 字符串
   invalid_arguments、meta/unknown/422 保持）。Agent
-  白名单调用仍为后续。
+  工具白名单显式收敛见最新条目。
 - 已完成“语料按 id 深读注册为 Agent 网关工具（检索→身份→版本→条文链路）”
    非模型切片（2026-09-10 计划）：检索工具只能回目录行、Agent 无法继续读
    版本与条文——`_build_mcp_gateway_http_service` 继续在同一 closed registry
@@ -331,6 +331,18 @@
   验证 typecheck 0 错误 + vitest 41/41 保持 + build 分包（ChatView gzip
   2.44 kB）。真实逐 token 体验需用户配置 DeepSeek key 后手工验证（无 key
   503/事件序/error 语义均有后端真实 MySQL+Redis 全栈覆盖）。
+- 已完成“Agent 网关工具白名单显式收敛（specs() 投影 + 装配 allowlist）”非模型
+  切片（2026-09-10 计划）：网关 `allowlist` 此前从未在 HTTP 装配层传入、且
+  `specs()` 返回全部 registry 工具（未来新登记工具会无意识暴露给调用方）——
+  `MCPClientGateway.specs()` 改为在配置 allowlist 时只投影允许子集（调用方看
+  不到未授权工具）；`_build_mcp_gateway_http_service` 传显式 allowlist
+  （meta.list_tools + corpus.instruments_search/instrument_get/versions_list/
+  provisions_list 共 5 个），未来登记新工具不自动暴露、需刻意扩元组；内置
+  meta.list_tools 保持注册表范围；验证 ruff/mypy strict（164 文件）零错 +
+  mcp_gateway 单测 **24 passed**（+1 specs 投影/允许判定）+ 全 unit **1150
+  passed + 1 skipped** + 真实 MySQL+Redis 网关全栈 **3 passed 保持**。另尝试
+  `docker compose build web`（Vue+Nginx 镜像）仍被 Docker Hub 网络不可达阻塞
+  （环境性，仓库内 npm 构建已绿）。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
