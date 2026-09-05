@@ -69,7 +69,7 @@ async def call_agent_tool(
 ) -> AgentToolCallResult:
     del current
     gateway = _gateway(services)
-    result = gateway.call(body.tool, body.args)
+    result = await gateway.call_async(body.tool, body.args)
     return AgentToolCallResult(
         ok=result.ok,
         output=result.output,

@@ -247,7 +247,7 @@ async def application_services(
         legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(
             settings, session_factory
         ),
-        mcp_gateway_http=_build_mcp_gateway_http_service(),
+        mcp_gateway_http=_build_mcp_gateway_http_service(session_factory),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -511,12 +511,61 @@ class _LegalEvidenceAssemblyQueryAdapter:
             ).provisions_for_version(version_id)
 
 
-def _build_mcp_gateway_http_service() -> Any:
+def _build_mcp_gateway_http_service(session_factory: Any) -> Any:
     """Composition root for the controlled agent tool gateway (no external
-    MCP server; only tools registered here may ever run)."""
+    MCP server; only tools registered here may ever run). Registers the public
+    corpus search as a real agent tool backed by the same read service the
+    corpus HTTP endpoints use."""
+
+    async def _corpus_instruments_search(args: dict[str, Any]) -> object:
+        from lawyer_agent.application.legal_corpus_read import (
+            LegalCorpusQueryService,
+        )
+        from lawyer_agent.infrastructure.persistence.legal_corpus_read_uow import (
+            SqlAlchemyLegalCorpusReadUnitOfWork,
+        )
+
+        limit = int(args.get("limit", 20))
+        title = args.get("title")
+        service = LegalCorpusQueryService(
+            lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
+        )
+        instruments = await service.instruments(
+            limit=limit,
+            before_id=None,
+            title=title if isinstance(title, str) and title.strip() else None,
+            issuing_authority=None,
+            jurisdiction=None,
+            region_code=None,
+        )
+        return [
+            {
+                "id": str(item.id),
+                "title": item.title,
+                "issuing_authority": item.issuing_authority,
+                "jurisdiction": item.jurisdiction,
+                "region_code": item.region_code,
+            }
+            for item in instruments
+        ]
+
     from lawyer_agent.application.mcp_gateway import AllowedToolRegistry, MCPClientGateway
 
-    return MCPClientGateway(AllowedToolRegistry())
+    registry = AllowedToolRegistry()
+    registry.register(
+        name="corpus.instruments_search",
+        description="按名称搜索已入库的公共法规目录（title 子串，可选 limit 1-100）",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "法规名称子串"},
+                "limit": {"type": "integer", "enum": [10, 20, 50, 100]},
+            },
+            "additionalProperties": False,
+        },
+        handler=_corpus_instruments_search,
+    )
+    return MCPClientGateway(registry)
 
 
 def services(request: Request) -> ApplicationServices:

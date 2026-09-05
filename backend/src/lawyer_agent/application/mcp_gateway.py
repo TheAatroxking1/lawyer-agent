@@ -11,6 +11,7 @@ nothing is silently coerced, dynamically imported or executed.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import time
@@ -241,6 +242,16 @@ class AllowedToolRegistry:
         entry = self._tools.get(name)
         return None if entry is None else entry[1]
 
+    def ensure_meta(self) -> None:
+        """Register the built-in introspection tool unless already present."""
+        if "meta.list_tools" not in self._tools:
+            self.register(
+                name="meta.list_tools",
+                description="列出当前网关内全部可用工具的名称与说明",
+                input_schema={"type": "object", "properties": {}},
+                handler=_list_tools(self),
+            )
+
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(
             entry[0]
@@ -276,13 +287,7 @@ class MCPClientGateway:
             raise TypeError("mcp gateway requires an AllowedToolRegistry")
         self._registry = registry
         self._allowlist = None if allowlist is None else frozenset(allowlist)
-        if not registry.specs():
-            registry.register(
-                name="meta.list_tools",
-                description="列出当前网关内全部可用工具的名称与说明",
-                input_schema={"type": "object", "properties": {}},
-                handler=_list_tools(registry),
-            )
+        registry.ensure_meta()
 
     def allowed(self, name: str) -> bool:
         if self._registry.spec(name) is None:
@@ -312,6 +317,48 @@ class MCPClientGateway:
                     ok=False, error_code="unknown_tool", error_message="unknown tool"
                 )
             output = handler(validated)
+        except MCPGatewayError as exc:
+            return ToolResult(ok=False, error_code=exc.code, error_message=exc.message)
+        except Exception:  # noqa: BLE001 - handler boundary
+            _logger.warning(
+                "mcp_tool_call name=%s ok=false code=handler_failure latency_ms=%d",
+                name,
+                int((time.perf_counter() - started) * 1000),
+            )
+            return ToolResult(
+                ok=False,
+                error_code="handler_failure",
+                error_message="tool handler failed",
+            )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        _logger.info(
+            "mcp_tool_call name=%s ok=true latency_ms=%d", name, elapsed_ms
+        )
+        return ToolResult(ok=True, output=output)
+
+    async def call_async(self, name: str, args: Any) -> ToolResult:
+        """Async dispatch: awaits handlers that return awaitables.
+
+        Registries may mix sync and async handlers; sync results pass through.
+        """
+        started = time.perf_counter()
+        spec = self._registry.spec(name)
+        if spec is None:
+            return ToolResult(ok=False, error_code="unknown_tool", error_message="unknown tool")
+        if self._allowlist is not None and name not in self._allowlist:
+            return ToolResult(
+                ok=False, error_code="tool_not_allowed", error_message="tool is not allowed"
+            )
+        try:
+            validated = validate_args(spec, args)
+            handler = self._registry.handler(name)
+            if handler is None:
+                return ToolResult(
+                    ok=False, error_code="unknown_tool", error_message="unknown tool"
+                )
+            output = handler(validated)
+            if inspect.isawaitable(output):
+                output = await output
         except MCPGatewayError as exc:
             return ToolResult(ok=False, error_code=exc.code, error_message=exc.message)
         except Exception:  # noqa: BLE001 - handler boundary
