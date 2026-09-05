@@ -228,8 +228,21 @@
   登记自动注册内置 `meta.list_tools`；验证 ruff+mypy strict（163 文件）零错
   + 21 项单测（调用/未知/白名单空集禁全部/重复/坏名坏 Schema 族/参数非法
   族/handler 失败不回显/meta 自注册/specs 稳定排序）green + 全 unit **1129
-  passed + 1 skipped**。Agent 侧接入网关工具、ApplicationServices/HTTP 暴露
-  仍为后续。
+  passed + 1 skipped**。Agent 侧接入网关工具仍为后续。
+- 已完成“MCP 网关 HTTP 面”非模型切片（2026-09-10 计划）：网关就绪但无
+  HTTP 暴露——`MCPClientGateway` 增公开只读 `specs()`；新
+  `api/v1/agent_gateway.py`（/platform/agent）：GET /tools →
+  list[AgentToolInfo{name,description}]、POST /tools/call 严格 body
+  {tool≤64, args 默认 {}} → `AgentToolCallResult{ok, output|error_code|
+  error_message}`（unknown_tool/tool_not_allowed/invalid_arguments/
+  handler_failure 原样透出、HTTP 200 语义化；服务缺失 503
+  agent_gateway_unavailable；extra=forbid）；dependencies 增
+  `ApplicationServices.mcp_gateway_http` + 空登记器装配（自动注册内置
+  meta.list_tools，零外部依赖）；验证 ruff/mypy strict（164 文件）零错 +
+  全 unit 1129 passed + 1 skipped 保持 + **2 项真实 MySQL+Redis 全栈**（未
+  认证 401；登录后 GET 含 meta 描述、调用成功、unknown_tool、多余参数
+  invalid_arguments、未知键 422）。把语料/检索注册为网关工具并授予 Agent
+  白名单仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
