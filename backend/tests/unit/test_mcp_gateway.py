@@ -185,3 +185,48 @@ def test_specs_are_sorted_by_name() -> None:
     )
     names = [spec.name for spec in registry.specs()]
     assert names == ["a.first", "z.last"]
+
+
+@pytest.mark.asyncio
+async def test_call_async_awaits_async_handlers() -> None:
+    registry = AllowedToolRegistry()
+
+    async def handler(args: dict[str, object]) -> object:
+        return {"echoed": args["text"]}
+
+    registry.register(
+        name="async.echo",
+        description="async echo",
+        input_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        handler=handler,
+    )
+    gateway = MCPClientGateway(registry)
+    result = await gateway.call_async("async.echo", {"text": "ok"})
+    assert result.ok is True
+    assert result.output == {"echoed": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_call_async_validates_and_maps_failures() -> None:
+    registry = AllowedToolRegistry()
+    registry.register(
+        name="async.fragile",
+        description="fails",
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda args: _boom(),
+    )
+    gateway = MCPClientGateway(registry)
+    invalid = await gateway.call_async("async.fragile", {"surprise": 1})
+    assert invalid.ok is False
+    assert invalid.error_code == "invalid_arguments"
+    unknown = await gateway.call_async("does.not.exist", {})
+    assert unknown.error_code == "unknown_tool"
+
+
+async def _boom() -> object:
+    raise RuntimeError("secret boom")

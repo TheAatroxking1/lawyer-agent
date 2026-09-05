@@ -155,6 +155,7 @@ def test_agent_gateway_lists_and_calls_tools_over_real_mysql(
         tools = listed.json()
         names = [tool["name"] for tool in tools]
         assert "meta.list_tools" in names
+        assert "corpus.instruments_search" in names
         meta = next(tool for tool in tools if tool["name"] == "meta.list_tools")
         assert meta["description"]
 
@@ -168,6 +169,16 @@ def test_agent_gateway_lists_and_calls_tools_over_real_mysql(
         assert body["ok"] is True
         assert any(entry["name"] == "meta.list_tools" for entry in body["output"])
 
+        # Real corpus tool: empty public corpus -> ok with an empty result list.
+        search = client.post(
+            "/api/v1/platform/agent/tools/call",
+            headers=headers,
+            json={"tool": "corpus.instruments_search", "args": {"title": "契"}},
+        )
+        assert search.status_code == 200
+        assert search.json()["ok"] is True
+        assert search.json()["output"] == []
+
         unknown = client.post(
             "/api/v1/platform/agent/tools/call",
             headers=headers,
@@ -180,7 +191,7 @@ def test_agent_gateway_lists_and_calls_tools_over_real_mysql(
         invalid = client.post(
             "/api/v1/platform/agent/tools/call",
             headers=headers,
-            json={"tool": "meta.list_tools", "args": {"surprise": 1}},
+            json={"tool": "corpus.instruments_search", "args": {"limit": "many"}},
         )
         assert invalid.status_code == 200
         assert invalid.json()["ok"] is False
