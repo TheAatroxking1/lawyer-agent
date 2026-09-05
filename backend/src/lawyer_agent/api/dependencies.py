@@ -99,6 +99,7 @@ class ApplicationServices:
     audit_query_http: Any = None
     legal_corpus_http: Any = None
     legal_version_diff_http: Any = None
+    legal_chat_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -240,6 +241,7 @@ async def application_services(
         audit_query_http=_build_audit_query_http_service(session_factory),
         legal_corpus_http=_build_legal_corpus_http_service(session_factory),
         legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
+        legal_chat_http=_build_legal_chat_http_service(settings),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -359,6 +361,31 @@ def _build_legal_corpus_http_service(session_factory: Any) -> Any:
     return LegalCorpusQueryService(
         lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
     )
+
+
+def _build_legal_chat_http_service(settings: Any) -> Any:
+    """Composition root for the public legal chat HTTP service.
+
+    Without a configured DeepSeek API key the gateway is None and every call
+    fails with a stable 503 ``model_provider_unavailable`` (never a fake reply).
+    """
+    from lawyer_agent.application.legal_chat import LegalChatHttpService
+    from lawyer_agent.application.model_gateway import ModelGateway
+    from lawyer_agent.domain.model_gateway import CallLimits
+    from lawyer_agent.infrastructure.providers.deepseek import DeepSeekChatProvider
+    from lawyer_agent.infrastructure.providers.recorder import (
+        LoggingModelCallRecorder,
+    )
+
+    api_key = getattr(settings, "deepseek_api_key", None)
+    if not api_key:
+        return LegalChatHttpService(gateway=None)
+    gateway = ModelGateway(
+        provider=DeepSeekChatProvider(api_key=api_key),
+        recorder=LoggingModelCallRecorder(),
+        limits=CallLimits(timeout_seconds=30.0, max_attempts=1),
+    )
+    return LegalChatHttpService(gateway=gateway)
 
 
 def _build_legal_version_diff_http_service(session_factory: Any) -> Any:
