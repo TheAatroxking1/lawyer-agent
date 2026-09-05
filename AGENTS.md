@@ -343,6 +343,18 @@
   passed + 1 skipped** + 真实 MySQL+Redis 网关全栈 **3 passed 保持**。另尝试
   `docker compose build web`（Vue+Nginx 镜像）仍被 Docker Hub 网络不可达阻塞
   （环境性，仓库内 npm 构建已绿）。
+- 已完成“全栈最终实现交付核验审计”非模型轮（2026-09-10 主线收尾）：逐项对照
+  主目标列清单并复核证据（key 配置底座 / DeepSeek chat provider+chat_stream 经
+  ModelGateway / /legal/chat 与 /legal/chat/stream SSE / Vue3 全前端面（登录·语料
+  目录与详情·对话·有据问答 SSE·案件文档工作台·Agent 工具面板）/ 检索问答编排
+  HTTP+SSE / MCP 受控网关白名单（含语料只读工具与显式 allowlist）/ 真实语料
+  导入与发布编排 / Embedding+OpenSearch 混合检索真实 E2E），全部实现并提交；
+  本轮复跑门禁：后端 ruff 通过 + mypy strict 164 文件零错 + 全 unit **1150 passed
+  + 1 skipped**；前端 typecheck 0 错 + vitest 41/41 + build 正常；审计文档
+  `docs/superpowers/plans/2026-09-10-fullstack-delivery-audit.md` 记录交付物表、
+  用户侧运行步骤与延后项。环境性/外部凭据延后项维持：web Docker 镜像 build
+  （Docker Hub 不可达，npm 构建已绿）、MinIO 真实存储/原始文件下载、工作台
+  「运行检查」按钮、微信/短信登录（均不属主线交付阻塞）。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
