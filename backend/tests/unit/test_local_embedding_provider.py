@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import pytest
@@ -26,13 +27,31 @@ def _provider(fake: object) -> LocalSentenceTransformerEmbeddingProvider:
     )
 
 
-async def test_provider_embed_returns_one_vector_per_text() -> None:
+def _unit(row: tuple[float, ...]) -> tuple[float, ...]:
+    norm = math.sqrt(sum(value * value for value in row))
+    return tuple(value / norm for value in row)
+
+
+async def test_provider_embed_returns_one_normalized_vector_per_text() -> None:
     provider = _provider(_fake_encoder())
     vectors = await provider.embed(
         texts=("第一条 内容。", "第二条 内容更长。"), dimension=2, timeout_seconds=5.0
     )
     assert len(vectors) == 2
-    assert [vector.values for vector in vectors] == [(7.0, 1.0), (9.0, 1.0)]
+    assert vectors[0].values == pytest.approx(_unit((7.0, 1.0)))
+    assert vectors[1].values == pytest.approx(_unit((9.0, 1.0)))
+
+
+async def test_provider_can_disable_normalization_for_raw_vectors() -> None:
+    provider = LocalSentenceTransformerEmbeddingProvider(
+        model_name_or_path="fake-model",
+        encode=_fake_encoder(),  # type: ignore[arg-type]
+        normalize_embeddings=False,
+    )
+    vectors = await provider.embed(
+        texts=("第一条 内容。",), dimension=2, timeout_seconds=5.0
+    )
+    assert vectors[0].values == (7.0, 1.0)
 
 
 async def test_provider_embed_rejects_empty_texts() -> None:
