@@ -71,6 +71,23 @@ class DatasetSnapshotSummary(StrictModel):
     quality_metrics: dict[str, int | float]
 
 
+class LoadBatchSummary(StrictModel):
+    id: UUID
+    batch_no: str
+    source_ref: str
+    parser_version: str
+    status: str
+    item_counts: dict[str, int]
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    error_message: str | None = None
+
+
+class LoadBatchPage(StrictModel):
+    items: list[LoadBatchSummary]
+    next_before_id: UUID | None = None
+
+
 class ProvisionSummary(StrictModel):
     id: UUID
     version_id: UUID
@@ -151,6 +168,59 @@ def _dataset_summary(snapshot: DatasetSnapshot) -> DatasetSnapshotSummary:
         released_at=snapshot.released_at,
         quality_metrics=metrics,
     )
+
+
+def _load_batch_summary(batch: Any) -> LoadBatchSummary:
+    return LoadBatchSummary(
+        id=batch.id,
+        batch_no=batch.batch_no,
+        source_ref=batch.source_ref,
+        parser_version=batch.parser_version,
+        status=batch.status.value,
+        item_counts=batch.item_counts,
+        started_at=batch.started_at,
+        completed_at=batch.completed_at,
+        error_message=batch.error_message,
+    )
+
+
+@router.get(
+    "/load-batches",
+    response_model=LoadBatchPage,
+)
+async def list_load_batches(
+    current: AccountSession,
+    services: Services,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    before_id: Annotated[UUID | None, Query(alias="before_id")] = None,
+) -> LoadBatchPage:
+    del current
+    service = _require_service(services)
+    try:
+        batches = await service.load_batches(limit=limit, before_id=before_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    items = [_load_batch_summary(batch) for batch in batches]
+    next_cursor = items[-1].id if len(items) == limit else None
+    return LoadBatchPage(items=items, next_before_id=next_cursor)
+
+
+@router.get(
+    "/load-batches/{batch_id}",
+    response_model=LoadBatchSummary,
+)
+async def get_load_batch(
+    batch_id: UUID,
+    current: AccountSession,
+    services: Services,
+) -> LoadBatchSummary:
+    del current
+    service = _require_service(services)
+    try:
+        batch = await service.load_batch(batch_id=batch_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return _load_batch_summary(batch)
 
 
 @router.get(

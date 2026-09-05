@@ -18,6 +18,8 @@ from lawyer_agent.domain.legal_corpus import (
     LegalInstrument,
     LegalVersion,
     LegalVersionStatus,
+    LoadBatch,
+    LoadStatus,
     Provision,
     ProvisionLevel,
 )
@@ -25,6 +27,7 @@ from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalChunkModel,
     LegalDatasetSnapshotModel,
     LegalInstrumentModel,
+    LegalLoadBatchModel,
     LegalProvisionModel,
     LegalVersionModel,
 )
@@ -34,6 +37,13 @@ _DATASET_STATE_MAP = {
     "published": DatasetState.PUBLISHED,
     "superseded": DatasetState.SUPERSEDED,
     "rejected": DatasetState.REJECTED,
+}
+
+_LOAD_STATUS_MAP = {
+    "inventoried": LoadStatus.INVENTORIED,
+    "parsing": LoadStatus.PARSING,
+    "completed": LoadStatus.COMPLETED,
+    "failed": LoadStatus.FAILED,
 }
 
 _VERSION_STATUS_MAP = {
@@ -78,6 +88,10 @@ class LegalCorpusInstrumentListCursorInvalid(ValueError):
     """A legal instrument list cursor references a row that does not exist."""
 
 
+class LegalCorpusLoadBatchCursorInvalid(ValueError):
+    """A legal corpus load batch list cursor references a missing row."""
+
+
 class LegalCorpusQueryPort(Protocol):
     """Explicit public-read boundary for national legal corpus data."""
 
@@ -110,6 +124,15 @@ class LegalCorpusQueryPort(Protocol):
         region_code: str | None = None,
     ) -> tuple[LegalInstrument, ...]: ...
 
+    async def load_batches(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[LoadBatch, ...]: ...
+
+    async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None: ...
+
 
 class LegalCorpusChunkPort(Protocol):
     """Read/write boundary for derived legal corpus chunks (re-indexable)."""
@@ -139,6 +162,21 @@ def _aware_utc(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is not None:
         return value
     return value.replace(tzinfo=UTC)
+
+
+def _to_load_batch(model: LegalLoadBatchModel) -> LoadBatch:
+    return LoadBatch(
+        id=model.id,
+        batch_no=model.batch_no,
+        source_ref=model.source_ref,
+        file_sha256=bytes(model.file_sha256),
+        parser_version=model.parser_version,
+        status=_LOAD_STATUS_MAP[model.status],
+        item_counts=model.item_counts_json,
+        started_at=_aware_utc(model.started_at),
+        completed_at=_aware_utc(model.completed_at),
+        error_message=model.error_message,
+    )
 
 
 def _to_instrument(model: LegalInstrumentModel) -> LegalInstrument:
@@ -363,6 +401,52 @@ class SqlAlchemyLegalCorpusRepository:
             )
         )
         return None if model is None else _to_dataset_snapshot(model)
+
+    async def load_batches(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[LoadBatch, ...]:
+        """Keyset list of corpus load batches newest first (created_at, id)."""
+        statement = select(LegalLoadBatchModel)
+        if before_id is not None:
+            require_uuid7(before_id, field="before_id")
+            anchor = await self._session.scalar(
+                select(LegalLoadBatchModel.created_at).where(
+                    LegalLoadBatchModel.id == before_id
+                )
+            )
+            if anchor is None:
+                raise LegalCorpusLoadBatchCursorInvalid(
+                    "load batch list cursor does not exist"
+                )
+            statement = statement.where(
+                or_(
+                    LegalLoadBatchModel.created_at < anchor,
+                    and_(
+                        LegalLoadBatchModel.created_at == anchor,
+                        LegalLoadBatchModel.id < before_id,
+                    ),
+                )
+            )
+        models = (
+            await self._session.scalars(
+                statement.order_by(
+                    LegalLoadBatchModel.created_at.desc(),
+                    LegalLoadBatchModel.id.desc(),
+                ).limit(limit)
+            )
+        ).all()
+        return tuple(_to_load_batch(model) for model in models)
+
+    async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None:
+        model = await self._session.scalar(
+            select(LegalLoadBatchModel).where(
+                LegalLoadBatchModel.id == batch_id
+            )
+        )
+        return None if model is None else _to_load_batch(model)
 
 
 class SqlAlchemyLegalCorpusChunkRepository:

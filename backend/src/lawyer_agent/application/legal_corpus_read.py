@@ -18,6 +18,7 @@ from lawyer_agent.domain.legal_corpus import (
     DatasetSnapshot,
     LegalInstrument,
     LegalVersion,
+    LoadBatch,
     Provision,
 )
 
@@ -71,6 +72,18 @@ class LegalCorpusDatasetSnapshotNotFound(LegalCorpusQueryError):
     title = "Legal dataset snapshot not found"
 
 
+class LegalCorpusLoadBatchNotFound(LegalCorpusQueryError):
+    status = 404
+    code = "legal_corpus_load_batch_not_found"
+    title = "Legal corpus load batch not found"
+
+
+class LegalCorpusLoadBatchCursorInvalid(LegalCorpusQueryError):
+    status = 404
+    code = "legal_corpus_load_batch_cursor_invalid"
+    title = "Legal corpus load batch list cursor is invalid"
+
+
 class LegalCorpusQueryPort(Protocol):
     async def version_at(
         self, instrument_id: UUID, as_of: date
@@ -110,6 +123,15 @@ class LegalCorpusQueryPort(Protocol):
     async def dataset_snapshot_by_name(
         self, dataset_name: str
     ) -> DatasetSnapshot | None: ...
+
+    async def load_batches(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[LoadBatch, ...]: ...
+
+    async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None: ...
 
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
@@ -205,6 +227,42 @@ class LegalCorpusQueryService:
                 )
             except LegalCorpusInstrumentListCursorInvalid as exc:
                 raise LegalCorpusInstrumentCursorInvalid() from exc
+
+    async def load_batches(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[LoadBatch, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise LegalCorpusInvalidRequest()
+        if before_id is not None:
+            try:
+                require_uuid7(before_id, field="before_id")
+            except ValueError as exc:
+                raise LegalCorpusInvalidRequest() from exc
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
+                LegalCorpusLoadBatchCursorInvalid as StoreBatchCursorInvalid,
+            )
+
+            try:
+                return await uow.corpus.load_batches(
+                    limit=limit, before_id=before_id
+                )
+            except StoreBatchCursorInvalid as exc:
+                raise LegalCorpusLoadBatchCursorInvalid() from exc
+
+    async def load_batch(self, *, batch_id: UUID) -> LoadBatch:
+        try:
+            require_uuid7(batch_id, field="batch_id")
+        except ValueError as exc:
+            raise LegalCorpusInvalidRequest() from exc
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            batch = await uow.corpus.load_batch_by_id(batch_id)
+        if batch is None:
+            raise LegalCorpusLoadBatchNotFound()
+        return batch
 
     async def datasets(self) -> tuple[DatasetSnapshot, ...]:
         async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
