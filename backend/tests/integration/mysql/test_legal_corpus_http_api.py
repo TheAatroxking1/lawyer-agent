@@ -979,3 +979,80 @@ async def _cleanup_batch_with_issues(
             )
     finally:
         await engine.dispose()
+
+
+def test_legal_chat_http_without_deepseek_key_over_real_mysql(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    prefix = f"lawyer-test-chat:{uuid4().hex}:"
+    settings = Settings(
+        environment="test",
+        secret_key="h" * 32,
+        database_url=migrated_mysql_url.render_as_string(hide_password=False),
+        redis_url=redis_url,
+        redis_key_prefix=prefix,
+        trusted_origins=(_ORIGIN,),
+        cookie_secure=True,
+        data_encryption_key_ring={7: _encoded(_CIPHER_KEY)},
+        data_encryption_active_key_version=7,
+        blind_index_key_ring={7: _encoded(_BLIND_KEY)},
+        blind_index_active_key_version=7,
+        blind_index_rollout_phase="legacy-compatible",
+        blind_index_legacy_key_version=7,
+        blind_index_legacy_writers_drained=False,
+    )
+    client = TestClient(create_app(settings), base_url="https://testserver")
+    with client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            headers={"Origin": _ORIGIN},
+            json={
+                "username": "corpus-chat-owner",
+                "password": _PASSWORD,
+                "display_name": "语料对话用户",
+            },
+        )
+        assert registered.status_code == 201, registered.text
+        account_token = registered.json()["access_token"]
+        base = "/api/v1/legal"
+        headers = {"Authorization": f"Bearer {account_token}"}
+
+        # 1. No DeepSeek API key configured -> stable 503, never a fake answer.
+        reply = client.post(
+            f"{base}/chat",
+            headers=headers,
+            json={
+                "messages": [
+                    {"role": "system", "content": "你是法律助手。"},
+                    {"role": "user", "content": "违约金怎么算？"},
+                ]
+            },
+        )
+        assert reply.status_code == 503
+        assert reply.json()["code"] == "model_provider_unavailable"
+
+        # 2. Invalid body -> 422 problem details.
+        bad_role = client.post(
+            f"{base}/chat",
+            headers=headers,
+            json={
+                "messages": [{"role": "admin", "content": "x"}]
+            },
+        )
+        assert bad_role.status_code == 422
+        empty = client.post(
+            f"{base}/chat", headers=headers, json={"messages": []}
+        )
+        assert empty.status_code == 422
+
+        # 3. Unauthenticated -> 401.
+        unauth = client.post(
+            f"{base}/chat",
+            json={
+                "messages": [{"role": "user", "content": "x"}]
+            },
+        )
+        assert unauth.status_code == 401
