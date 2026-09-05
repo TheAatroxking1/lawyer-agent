@@ -529,7 +529,8 @@ async def _seed_dataset_snapshots(mysql_url: URL) -> list[str]:
                     "VALUES (:id,'dataset_v1','docx-v1','published',"
                     "'{\"files\": 134}',"
                     "'{\"article_count\": 134, \"coverage\": 1.0, "
-                    "\"parse_failures\": 0, \"required_field_missing\": []}',"
+                    "\"parse_failures\": 0, \"indexed_documents\": 134, "
+                    "\"dimension\": 512}',"
                     "'2026-01-15 00:00:00.000000')"
                 ),
                 {"id": published_id.bytes},
@@ -605,6 +606,8 @@ def test_legal_dataset_snapshot_read_http_over_real_mysql(
                 "article_count": 134,
                 "coverage": 1.0,
                 "parse_failures": 0,
+                "indexed_documents": 134,
+                "dimension": 512,
             }
             assert rows[1]["state"] == "pending"
             assert rows[1]["released_at"] is None
