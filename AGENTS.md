@@ -119,6 +119,21 @@
   **25/25 绿**（endpoints 路径组/format）+ typecheck 0 错误 + build 分包
   （详情页 gzip 1.8 kB）；后端零改动。法规对话界面与 SSE、上传下载页面、
   Nginx 托管入 compose 仍为后续。
+- 已完成“法规对话页面（多轮会话接入 chat 端点）”非模型切片
+  （2026-09-10 计划）：占位页此前无真实对话——`types.ts` 镜像
+  `ChatMessageInput`（role system/user/assistant）/`ChatUsage`/
+  `ChatReply{text,usage}`；`endpoints.chat()` → POST `/legal/chat`；
+  `chat/messages.ts` 纯函数 `composeChatMessages(turns, maxTurns=12)`
+  （按轮保留最近历史保证配对完整、滤空白、不改写文本，超长交后端 422，
+  前端 textarea maxlength=4000 前置约束）；`ChatView` 重写为真实多轮会话：
+  滚动/自动滚底 + aria-live 会话区、气泡（我/律师 Agent）、Enter 发送 +
+  Shift+Enter 换行、发送中禁用与「正在思考…」、错误横幅 code+title 与
+  引导（503 → JSON key 三步；401 → 清 token 跳登录）、最近回答 token
+  用量、清空对话、空态快捷提问示例与免责声明；Home 卡片文案同步；
+  vitest +5 项合计 **30/30 绿** + typecheck 0 错误 + build 分包
+  （ChatView gzip 2.0 kB）；真实回复需用户配置 key 后手工验证（无 key 503
+  语义已由后端全栈覆盖）。SSE 流式问答编排、上传下载页面、MCP 白名单化
+  工具、Nginx 托管入 compose 仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
