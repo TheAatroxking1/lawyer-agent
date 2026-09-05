@@ -12,6 +12,7 @@ import type {
   MatterPage,
   MatterSummary,
   RegisterDocumentInput,
+  RiskIssueSummary,
 } from './types'
 
 const apiBase: string =
@@ -58,4 +59,31 @@ export async function registerDocument(
     `/tenants/${encodeURIComponent(tenantId)}/matters/${encodeURIComponent(matterId)}/documents`,
     { method: 'POST', body: input },
   )
+}
+
+export async function listRiskIssues(
+  tenantId: string,
+  documentId: string,
+): Promise<RiskIssueSummary[]> {
+  return tenantApiClient.request<RiskIssueSummary[]>(
+    `/tenants/${encodeURIComponent(tenantId)}/documents/${encodeURIComponent(documentId)}/risk-issues`,
+  )
+}
+
+export async function downloadReport(
+  tenantId: string,
+  documentId: string,
+  signal?: AbortSignal,
+): Promise<{ fileName: string; blob: Blob }> {
+  const headers: Record<string, string> = {}
+  const token = session.readTenantToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const response = await fetch(
+    `${apiBase}/tenants/${encodeURIComponent(tenantId)}/documents/${encodeURIComponent(documentId)}/report.docx`,
+    { headers, signal },
+  )
+  if (!response.ok) {
+    throw new Error(`report download failed with HTTP ${response.status}`)
+  }
+  return { fileName: 'rule-check-report.docx', blob: await response.blob() }
 }

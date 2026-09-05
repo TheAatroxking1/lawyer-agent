@@ -182,6 +182,17 @@ export interface DocumentHeaderSummary {
   current_version_no: number
 }
 
+// Rule check read surface (backend/api/v1/rule_checks.py)
+export interface RiskIssueSummary {
+  id: string
+  provision_no: string
+  matched_text: string
+  risk_level: string
+  status: string
+  evidence_level: string
+  disposition_reason: string | null
+}
+
 // Agent tool gateway (backend/api/v1/agent_gateway.py)
 export interface AgentToolInfo {
   name: string

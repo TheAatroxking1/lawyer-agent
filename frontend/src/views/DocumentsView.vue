@@ -9,7 +9,8 @@ import type {
   MatterKind,
   MatterSummary,
 } from '../api'
-import { createMatter, listDocuments, listMatters, registerDocument } from '../api/tenant'
+import { createMatter, downloadReport, listDocuments, listMatters, listRiskIssues, registerDocument } from '../api/tenant'
+import type { RiskIssueSummary } from '../api'
 import ErrorNote from '../components/ErrorNote.vue'
 import { session } from '../auth/session'
 
@@ -69,6 +70,10 @@ const documentsLoading = ref<Record<string, boolean>>({})
 const uploadingMatterId = ref<string | null>(null)
 const uploadError = ref<ApiError | null>(null)
 const lastUpload = ref<DocumentSummary | null>(null)
+const issuesByDoc = ref<Record<string, RiskIssueSummary[]>>({})
+const issuesLoading = ref<string | null>(null)
+const reportDownloading = ref<string | null>(null)
+const reportError = ref<ApiError | null>(null)
 
 async function load(): Promise<void> {
   error.value = null
@@ -176,6 +181,45 @@ async function loadDocuments(matterId: string): Promise<void> {
     )
   } finally {
     documentsLoading.value[matterId] = false
+  }
+}
+
+async function inspectIssues(docId: string): Promise<void> {
+  if (!activeTenant.value) return
+  reportError.value = null
+  issuesLoading.value = docId
+  try {
+    issuesByDoc.value[docId] = await listRiskIssues(activeTenant.value.tenant_id, docId)
+  } catch (cause) {
+    reportError.value =
+      cause instanceof ApiError
+        ? cause
+        : new ApiError({ status: 0, code: 'network_error', title: '无法获取风险项，请稍后重试' })
+  } finally {
+    issuesLoading.value = null
+  }
+}
+
+async function downloadDocReport(docId: string): Promise<void> {
+  if (!activeTenant.value || reportDownloading.value !== null) return
+  reportError.value = null
+  reportDownloading.value = docId
+  try {
+    const { fileName, blob } = await downloadReport(activeTenant.value.tenant_id, docId)
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = fileName
+    anchor.click()
+    URL.revokeObjectURL(url)
+  } catch (cause) {
+    reportError.value = new ApiError({
+      status: 0,
+      code: 'report_unavailable',
+      title: cause instanceof Error ? cause.message : '报告下载失败',
+    })
+  } finally {
+    reportDownloading.value = null
   }
 }
 
@@ -347,9 +391,30 @@ onMounted(() => {
             </p>
             <ul v-else class="doc-list">
               <li v-for="doc in documents[matter.id] ?? []" :key="doc.id">
-                {{ doc.display_name }}（v{{ doc.current_version_no }}）
+                <div class="doc-line">
+                  <span>{{ doc.display_name }}（v{{ doc.current_version_no }}）</span>
+                  <span class="doc-actions">
+                    <button type="button" :disabled="issuesLoading !== null" @click="inspectIssues(doc.id)">
+                      {{ issuesLoading === doc.id ? '读取中…' : '风险项' }}
+                    </button>
+                    <button
+                      type="button"
+                      :disabled="reportDownloading !== null"
+                      @click="downloadDocReport(doc.id)"
+                    >
+                      {{ reportDownloading === doc.id ? '下载中…' : '报告下载' }}
+                    </button>
+                  </span>
+                </div>
+                <ul v-if="(issuesByDoc[doc.id] ?? []).length > 0" class="issues">
+                  <li v-for="issue in issuesByDoc[doc.id] ?? []" :key="issue.id">
+                    <strong>{{ issue.risk_level }}</strong> {{ issue.matched_text }}（{{ issue.provision_no }} · {{ issue.status }}）
+                  </li>
+                </ul>
+                <p v-else-if="issuesLoading !== doc.id && issuesByDoc[doc.id]" class="state">暂无风险项。</p>
               </li>
             </ul>
+            <ErrorNote :error="reportError" context="风险项/报告操作失败" />
             <p v-if="lastUpload" class="ok">
               已登记：{{ lastUpload.file_name }} · v{{ lastUpload.version_no }} ·
               upload={{ lastUpload.upload_status }}{{ lastUpload.review_status ? ' · review=' + lastUpload.review_status : '' }}
@@ -390,5 +455,9 @@ onMounted(() => {
 .documents { border-top: 1px solid var(--color-border); padding: 0.8rem 1rem; display: grid; gap: 0.5rem; }
 .upload-row .file { display: inline-block; }
 .file input { max-width: 16rem; }
-.doc-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; font-size: 0.9rem; color: var(--color-text-secondary); }
+.doc-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; font-size: 0.9rem; color: var(--color-text-secondary); }
+.doc-line { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; }
+.doc-actions { display: inline-flex; gap: 0.4rem; }
+.doc-actions button { border: 1px solid var(--color-border); background: transparent; color: var(--color-text-secondary); font-size: 0.78rem; padding: 0.15rem 0.55rem; border-radius: 5px; }
+.issues { list-style: none; margin: 0.25rem 0 0; padding-left: 0.6rem; display: grid; gap: 0.2rem; color: var(--color-text-muted); font-size: 0.84rem; }
 </style>
