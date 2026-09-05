@@ -100,6 +100,7 @@ class ApplicationServices:
     legal_corpus_http: Any = None
     legal_version_diff_http: Any = None
     legal_chat_http: Any = None
+    legal_retrieval_qa_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -242,6 +243,7 @@ async def application_services(
         legal_corpus_http=_build_legal_corpus_http_service(session_factory),
         legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
         legal_chat_http=_build_legal_chat_http_service(settings),
+        legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(settings),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -398,6 +400,19 @@ def _build_legal_version_diff_http_service(session_factory: Any) -> Any:
     return LegalVersionDiffReadService(
         lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
     )
+
+
+def _build_legal_retrieval_qa_http_service(settings: Any) -> Any:
+    """Composition root placeholder for retrieval-grounded Q&A.
+
+    The full chain (embedding provider -> hybrid search over the published
+    dataset alias -> evidence assembly -> DeepSeek claims chat) depends on
+    configuration surfaces that do not exist yet in ``Settings``. Until the
+    wiring slice lands, the service stays None and the endpoint answers a
+    stable 503 ``retrieval_qa_unavailable``; nothing is fabricated.
+    """
+    del settings
+    return None
 
 
 def services(request: Request) -> ApplicationServices:

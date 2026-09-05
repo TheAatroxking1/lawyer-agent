@@ -44,6 +44,12 @@ DEFAULT_ALIAS = "dataset_v1"
 DEFAULT_LIMIT = 12
 DEFAULT_BM25_SIZE = 80
 DEFAULT_KNN_SIZE = 80
+# Embedding provider identity used for the query vector. It belongs to the
+# composition/configuration layer; clients never choose it per request.
+DEFAULT_EMBED_MODEL_REF = "BAAI/bge-small-zh-v1.5"
+DEFAULT_EMBED_DIMENSION = 512
+# The claims chat goes to the composed chat provider under its fixed model.
+CHAT_MODEL_REF = "deepseek-chat"
 EVIDENCE_BUDGET_CHARS = 12_000
 PER_ITEM_CAP_CHARS = 3_000
 TRUNCATION_MARK = "…（条文过长已截断，引用核验以依据编号对应的权威条文为准）"
@@ -167,13 +173,13 @@ class LegalRetrievalQaService:
         *,
         alias: str,
         question: str,
-        model_ref: str,
-        dimension: int,
         target_date: date,
         version_id: UUID | None = None,
         limit: int = DEFAULT_LIMIT,
         bm25_size: int = DEFAULT_BM25_SIZE,
         knn_size: int = DEFAULT_KNN_SIZE,
+        model_ref: str = DEFAULT_EMBED_MODEL_REF,
+        dimension: int = DEFAULT_EMBED_DIMENSION,
     ) -> LegalRetrievalAnswer:
         if not isinstance(alias, str) or not alias.strip():
             raise ValueError("dataset alias must be non-empty text")
@@ -207,7 +213,7 @@ class LegalRetrievalQaService:
             ChatMessage(role="user", content=question),
         )
         text, usage = await self._chat.chat(
-            model_ref=model_ref,
+            model_ref=CHAT_MODEL_REF,
             messages=messages,
         )
 
