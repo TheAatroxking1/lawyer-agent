@@ -48,6 +48,20 @@
   `deepseek_api_key_file`（绝对路径、常规文件、有界读取、UTF-8 无 NUL、
   JSON 必须单 `api_key` 字段；文件与值二选一）；16 项单测 green；
   真实 key 文件由用户填写后生效，后续 DeepSeek provider 切片读取该值。
+- 已完成“DeepSeek chat provider 适配器”（2026-09-10 计划）：新
+  `infrastructure/providers/deepseek.py` `DeepSeekChatProvider` 实现项目自有
+  `ModelProviderPort.chat`（OpenAI 兼容 `POST {base}/chat/completions`，
+  httpx 无 SDK、client 可注入 MockTransport；Bearer api_key；body
+  model+messages 逐条 role/content，`stream:false`；解析
+  `choices[0].message.content` 与 usage，缺字段按 0）；构造 api_key 非空否则
+  拒绝；错误稳定映射（空/非 ChatMessage → `ModelInputInvalid` 且不发请求、
+  超时 → `ModelProviderTimeout`、非 2xx → `ModelProviderUnavailable`（只带
+  HTTP 状态，**不回显 key/正文/请求体**）、坏 JSON/空 choices/空 content →
+  `ModelProviderInvalidResponse`）；embed/rerank 明确
+  `ModelProviderUnavailable`；10 项离线单测（请求形态/Bearer/body、成功解析
+  +usage、空消息不发请求、401/500 不泄 key、超时、坏 JSON 族、usage 缺省
+  归零、embed/rerank unavailable、空 key 拒绝、与 `ModelGateway.chat` 组合
+  成功记 usage/失败记 error）green；对话 HTTP/SSE、前端仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
