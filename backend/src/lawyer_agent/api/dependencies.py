@@ -101,6 +101,7 @@ class ApplicationServices:
     legal_version_diff_http: Any = None
     legal_chat_http: Any = None
     legal_retrieval_qa_http: Any = None
+    mcp_gateway_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -246,6 +247,7 @@ async def application_services(
         legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(
             settings, session_factory
         ),
+        mcp_gateway_http=_build_mcp_gateway_http_service(),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -507,6 +509,14 @@ class _LegalEvidenceAssemblyQueryAdapter:
             return await SqlAlchemyLegalCorpusRepository(
                 session
             ).provisions_for_version(version_id)
+
+
+def _build_mcp_gateway_http_service() -> Any:
+    """Composition root for the controlled agent tool gateway (no external
+    MCP server; only tools registered here may ever run)."""
+    from lawyer_agent.application.mcp_gateway import AllowedToolRegistry, MCPClientGateway
+
+    return MCPClientGateway(AllowedToolRegistry())
 
 
 def services(request: Request) -> ApplicationServices:

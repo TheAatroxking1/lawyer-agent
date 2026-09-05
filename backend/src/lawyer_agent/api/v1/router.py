@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from lawyer_agent.api.v1 import (
     accounts,
+    agent_gateway,
     ai_jobs,
     audit,
     auth,
@@ -19,6 +20,7 @@ from lawyer_agent.api.v1 import (
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth.router)
+api_v1_router.include_router(agent_gateway.router)
 api_v1_router.include_router(accounts.router)
 api_v1_router.include_router(tenants.router)
 api_v1_router.include_router(invitations.router)

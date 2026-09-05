@@ -291,6 +291,10 @@ class MCPClientGateway:
             return False
         return True
 
+    def specs(self) -> tuple[ToolSpec, ...]:
+        """Read-only projection of the tools an agent may currently call."""
+        return self._registry.specs()
+
     def call(self, name: str, args: Any) -> ToolResult:
         started = time.perf_counter()
         spec = self._registry.spec(name)
