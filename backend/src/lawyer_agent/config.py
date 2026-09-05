@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     opensearch_url: str = Field(
         default="http://127.0.0.1:9200", pattern=r"^https?://[^\s]+$"
     )
+    embedding_model_ref: str = Field(
+        default="BAAI/bge-small-zh-v1.5",
+        description="语料向量化 embedding 模型（发布与检索必须一致）",
+    )
+    embedding_dimension: int = Field(
+        default=512,
+        description="embedding 输出维度（与模型及已发布索引一致）",
+    )
     database_pool_size: int = Field(default=10, gt=0)
     database_max_overflow: int = Field(default=20, ge=0)
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)
@@ -395,6 +403,20 @@ class Settings(BaseSettings):
             raise ValueError("deepseek_api_key must be text")
         stripped = value.strip()
         return stripped if stripped else None
+
+    @field_validator("embedding_model_ref")
+    @classmethod
+    def normalize_embedding_model_ref(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("embedding_model_ref must be non-empty text")
+        return value.strip()
+
+    @field_validator("embedding_dimension")
+    @classmethod
+    def validate_embedding_dimension(cls, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("embedding_dimension must be a positive integer")
+        return value
 
     @model_validator(mode="after")
     def validate_active_jwt_key(self) -> "Settings":

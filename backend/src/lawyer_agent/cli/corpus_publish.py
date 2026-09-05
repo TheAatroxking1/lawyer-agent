@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parser-version", default=_DEFAULT_PARSER_VERSION, help="解析器版本标识")
     parser.add_argument("--alias", default="dataset_v1", help="数据集索引别名（缺省 dataset_v1）")
     parser.add_argument("--index-name", default=None, help="OpenSearch 物理索引名（缺省自动生成）")
+    parser.add_argument("--model-ref", default=None, help="embedding 模型名（缺省用 Settings）")
+    parser.add_argument("--dimension", type=int, default=None, help="embedding 维度（缺省同上）")
     parser.add_argument("--batch-size", type=int, default=20, help="embedding 批大小")
     return parser
 
@@ -94,10 +96,6 @@ async def _run(args: argparse.Namespace) -> None:
     from lawyer_agent.application.legal_index_publish import (
         LegalDatasetIndexPublishService,
     )
-    from lawyer_agent.application.legal_retrieval_qa import (
-        DEFAULT_EMBED_DIMENSION,
-        DEFAULT_EMBED_MODEL_REF,
-    )
     from lawyer_agent.application.legal_vector_indexing import (
         LegalVectorIndexingService,
     )
@@ -138,6 +136,18 @@ async def _run(args: argparse.Namespace) -> None:
     index_name = args.index_name or f"lawyer_dataset_{uuid4().hex[:12]}"
 
     settings = Settings()
+    embed_model_ref = args.model_ref or settings.embedding_model_ref
+    embed_dimension = (
+        args.dimension if args.dimension is not None else settings.embedding_dimension
+    )
+    if not isinstance(embed_model_ref, str) or not embed_model_ref.strip():
+        raise _InputError("embedding model ref must be non-empty text")
+    if (
+        isinstance(embed_dimension, bool)
+        or not isinstance(embed_dimension, int)
+        or embed_dimension <= 0
+    ):
+        raise _InputError("embedding dimension must be a positive integer")
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     try:
@@ -190,7 +200,7 @@ async def _run(args: argparse.Namespace) -> None:
         # 2) Embed, index into OpenSearch and atomically publish the alias.
         embed_gateway = ModelGateway(
             provider=LocalSentenceTransformerEmbeddingProvider(
-                model_name_or_path=DEFAULT_EMBED_MODEL_REF
+                model_name_or_path=embed_model_ref
             ),
             recorder=LoggingModelCallRecorder(),
             limits=CallLimits(timeout_seconds=180.0, max_attempts=1),
@@ -216,8 +226,8 @@ async def _run(args: argparse.Namespace) -> None:
                 version_id=imported.version_id,
                 index_name=index_name,
                 alias=args.alias,
-                model_ref=DEFAULT_EMBED_MODEL_REF,
-                dimension=DEFAULT_EMBED_DIMENSION,
+                model_ref=embed_model_ref,
+                dimension=embed_dimension,
                 batch_size=args.batch_size,
             )
         print(

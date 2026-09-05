@@ -160,13 +160,26 @@ class LegalRetrievalQaService:
         self,
         dataset_evidence: _DatasetEvidencePort,
         chat: _ChatPort,
+        *,
+        embed_model_ref: str = DEFAULT_EMBED_MODEL_REF,
+        embed_dimension: int = DEFAULT_EMBED_DIMENSION,
     ) -> None:
         if not hasattr(dataset_evidence, "search_evidence"):
             raise ValueError("retrieval qa requires a dataset evidence service")
         if not hasattr(chat, "chat"):
             raise ValueError("retrieval qa requires a chat gateway")
+        if not isinstance(embed_model_ref, str) or not embed_model_ref.strip():
+            raise ValueError("embed model_ref must be non-empty text")
+        if (
+            isinstance(embed_dimension, bool)
+            or not isinstance(embed_dimension, int)
+            or embed_dimension <= 0
+        ):
+            raise ValueError("embed dimension must be a positive integer")
         self._dataset_evidence = dataset_evidence
         self._chat = chat
+        self._embed_model_ref = embed_model_ref.strip()
+        self._embed_dimension = embed_dimension
 
     async def answer(
         self,
@@ -178,27 +191,37 @@ class LegalRetrievalQaService:
         limit: int = DEFAULT_LIMIT,
         bm25_size: int = DEFAULT_BM25_SIZE,
         knn_size: int = DEFAULT_KNN_SIZE,
-        model_ref: str = DEFAULT_EMBED_MODEL_REF,
-        dimension: int = DEFAULT_EMBED_DIMENSION,
+        model_ref: str | None = None,
+        dimension: int | None = None,
     ) -> LegalRetrievalAnswer:
         if not isinstance(alias, str) or not alias.strip():
             raise ValueError("dataset alias must be non-empty text")
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be non-empty text")
-        if not isinstance(model_ref, str) or not model_ref.strip():
-            raise ValueError("model_ref must be non-empty text")
-        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
-            raise ValueError("dimension must be a positive integer")
         if not isinstance(target_date, date):
             raise ValueError("target_date must be a date")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
+        effective_model_ref = (
+            self._embed_model_ref if model_ref is None else model_ref
+        )
+        effective_dimension = (
+            self._embed_dimension if dimension is None else dimension
+        )
+        if not isinstance(effective_model_ref, str) or not effective_model_ref.strip():
+            raise ValueError("model_ref must be non-empty text")
+        if (
+            isinstance(effective_dimension, bool)
+            or not isinstance(effective_dimension, int)
+            or effective_dimension <= 0
+        ):
+            raise ValueError("dimension must be a positive integer")
 
         bundle = await self._dataset_evidence.search_evidence(
             alias=alias,
             query=question,
-            model_ref=model_ref,
-            dimension=dimension,
+            model_ref=effective_model_ref,
+            dimension=effective_dimension,
             version_id=version_id,
             limit=limit,
             bm25_size=bm25_size,

@@ -438,6 +438,7 @@ def _build_legal_retrieval_qa_http_service(
         LegalDatasetAliasService,
     )
     from lawyer_agent.application.legal_retrieval_qa import (
+        DEFAULT_EMBED_DIMENSION,
         DEFAULT_EMBED_MODEL_REF,
         LegalRetrievalQaService,
     )
@@ -452,9 +453,15 @@ def _build_legal_retrieval_qa_http_service(
     )
     from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
 
+    embed_model_ref = getattr(
+        settings, "embedding_model_ref", DEFAULT_EMBED_MODEL_REF
+    )
+    embed_dimension = getattr(
+        settings, "embedding_dimension", DEFAULT_EMBED_DIMENSION
+    )
     embed_gateway = ModelGateway(
         provider=LocalSentenceTransformerEmbeddingProvider(
-            model_name_or_path=DEFAULT_EMBED_MODEL_REF
+            model_name_or_path=embed_model_ref
         ),
         recorder=LoggingModelCallRecorder(),
         limits=CallLimits(timeout_seconds=60.0, max_attempts=1),
@@ -481,6 +488,8 @@ def _build_legal_retrieval_qa_http_service(
     return LegalRetrievalQaService(
         dataset_evidence=dataset_evidence,
         chat=chat_gateway,
+        embed_model_ref=embed_model_ref,
+        embed_dimension=embed_dimension,
     )
 
 
