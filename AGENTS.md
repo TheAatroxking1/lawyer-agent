@@ -160,8 +160,23 @@
   （法规·版本·条号·全文·来源·数据集）+usage；错误族引导
   （retrieval_qa_unavailable/dataset_not_published/provider 系列）；
   「重新提问」；vitest 31/31（新增 askQuestion 断言）+ typecheck 0 + build
-  分包（AskView gzip 2.4 kB）。AskView 接 SSE 流、上传下载、MCP 工具、Nginx
-  入 compose 仍为后续。
+  分包（AskView gzip 2.4 kB）。AskView 接 SSE 流、上传下载、Nginx 入 compose
+  仍为后续。
+- 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
+  （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
+  MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
+  `^[a-z][a-z0-9_.]{0,63}$`/description ≤512/input_schema 子集校验，坏键、
+  坏类型/数组 items/enum/required 未声明稳定拒绝）；`validate_args`（非对象/
+  缺必填/未知参数/类型不符/enum 越界/数组逐项类型不符 → invalid_arguments）；
+  `AllowedToolRegistry`（closed set，重复登记 duplicate_tool）；
+  `MCPClientGateway(registry, allowlist?)`：allowed/call → ToolResult，错误
+  码 unknown_tool/tool_not_allowed/invalid_arguments/handler_failure（不回
+  显参数与异常细节），成功失败均结构化脱敏日志（name/ok/code/latency），空
+  登记自动注册内置 `meta.list_tools`；验证 ruff+mypy strict（163 文件）零错
+  + 21 项单测（调用/未知/白名单空集禁全部/重复/坏名坏 Schema 族/参数非法
+  族/handler 失败不回显/meta 自注册/specs 稳定排序）green + 全 unit **1129
+  passed + 1 skipped**。Agent 侧接入网关工具、ApplicationServices/HTTP 暴露
+  仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
