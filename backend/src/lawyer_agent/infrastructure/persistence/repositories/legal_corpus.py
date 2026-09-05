@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -12,6 +12,8 @@ from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.legal_corpus import (
     ChunkQuality,
     ChunkType,
+    DatasetSnapshot,
+    DatasetState,
     LegalChunk,
     LegalInstrument,
     LegalVersion,
@@ -21,10 +23,18 @@ from lawyer_agent.domain.legal_corpus import (
 )
 from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalChunkModel,
+    LegalDatasetSnapshotModel,
     LegalInstrumentModel,
     LegalProvisionModel,
     LegalVersionModel,
 )
+
+_DATASET_STATE_MAP = {
+    "pending": DatasetState.PENDING,
+    "published": DatasetState.PUBLISHED,
+    "superseded": DatasetState.SUPERSEDED,
+    "rejected": DatasetState.REJECTED,
+}
 
 _VERSION_STATUS_MAP = {
     "current": LegalVersionStatus.CURRENT,
@@ -111,6 +121,24 @@ class LegalCorpusChunkPort(Protocol):
     async def chunks_for_version(
         self, version_id: UUID
     ) -> tuple[LegalChunk, ...]: ...
+
+
+def _to_dataset_snapshot(model: LegalDatasetSnapshotModel) -> DatasetSnapshot:
+    return DatasetSnapshot(
+        id=model.id,
+        dataset_name=model.dataset_name,
+        parser_version=model.parser_version,
+        state=_DATASET_STATE_MAP[model.state],
+        manifest=model.manifest_json,
+        quality_metrics=model.quality_metrics_json,
+        released_at=_aware_utc(model.released_at),
+    )
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=UTC)
 
 
 def _to_instrument(model: LegalInstrumentModel) -> LegalInstrument:
@@ -315,6 +343,26 @@ class SqlAlchemyLegalCorpusRepository:
             )
         )
         return tuple(_to_version(model) for model in rows)
+
+    async def dataset_snapshots(self) -> tuple[DatasetSnapshot, ...]:
+        rows = await self._session.scalars(
+            select(LegalDatasetSnapshotModel).order_by(
+                LegalDatasetSnapshotModel.released_at.is_not(None).desc(),
+                LegalDatasetSnapshotModel.released_at.desc(),
+                LegalDatasetSnapshotModel.id.desc(),
+            )
+        )
+        return tuple(_to_dataset_snapshot(model) for model in rows)
+
+    async def dataset_snapshot_by_name(
+        self, dataset_name: str
+    ) -> DatasetSnapshot | None:
+        model = await self._session.scalar(
+            select(LegalDatasetSnapshotModel).where(
+                LegalDatasetSnapshotModel.dataset_name == dataset_name
+            )
+        )
+        return None if model is None else _to_dataset_snapshot(model)
 
 
 class SqlAlchemyLegalCorpusChunkRepository:

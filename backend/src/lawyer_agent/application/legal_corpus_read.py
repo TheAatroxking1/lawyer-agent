@@ -7,6 +7,7 @@ tenant membership.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import date
 from typing import Protocol, cast
@@ -14,10 +15,13 @@ from uuid import UUID
 
 from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.legal_corpus import (
+    DatasetSnapshot,
     LegalInstrument,
     LegalVersion,
     Provision,
 )
+
+_DATASET_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
 
 def _nonempty_filter(value: str | None, *, max_chars: int) -> str | None:
@@ -61,6 +65,12 @@ class LegalCorpusInstrumentCursorInvalid(LegalCorpusQueryError):
     title = "Legal instrument list cursor is invalid"
 
 
+class LegalCorpusDatasetSnapshotNotFound(LegalCorpusQueryError):
+    status = 404
+    code = "legal_dataset_snapshot_not_found"
+    title = "Legal dataset snapshot not found"
+
+
 class LegalCorpusQueryPort(Protocol):
     async def version_at(
         self, instrument_id: UUID, as_of: date
@@ -94,6 +104,12 @@ class LegalCorpusQueryPort(Protocol):
         jurisdiction: str | None = None,
         region_code: str | None = None,
     ) -> tuple[LegalInstrument, ...]: ...
+
+    async def dataset_snapshots(self) -> tuple[DatasetSnapshot, ...]: ...
+
+    async def dataset_snapshot_by_name(
+        self, dataset_name: str
+    ) -> DatasetSnapshot | None: ...
 
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
@@ -189,3 +205,23 @@ class LegalCorpusQueryService:
                 )
             except LegalCorpusInstrumentListCursorInvalid as exc:
                 raise LegalCorpusInstrumentCursorInvalid() from exc
+
+    async def datasets(self) -> tuple[DatasetSnapshot, ...]:
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            snapshots = await uow.corpus.dataset_snapshots()
+        return tuple(snapshots)
+
+    async def dataset(self, *, dataset_name: str) -> DatasetSnapshot:
+        if (
+            not isinstance(dataset_name, str)
+            or not dataset_name.strip()
+            or _DATASET_NAME.fullmatch(dataset_name.strip()) is None
+        ):
+            raise LegalCorpusInvalidRequest()
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            snapshot = await uow.corpus.dataset_snapshot_by_name(
+                dataset_name.strip()
+            )
+        if snapshot is None:
+            raise LegalCorpusDatasetSnapshotNotFound()
+        return snapshot

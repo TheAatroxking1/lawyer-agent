@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Any, cast
 from uuid import UUID
 
@@ -20,7 +20,7 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusQueryError,
     LegalCorpusQueryService,
 )
-from lawyer_agent.domain.legal_corpus import LegalVersion
+from lawyer_agent.domain.legal_corpus import DatasetSnapshot, LegalVersion
 
 
 class StrictModel(BaseModel):
@@ -52,6 +52,21 @@ class LegalInstrumentSummary(StrictModel):
 class LegalInstrumentPage(StrictModel):
     items: list[LegalInstrumentSummary]
     next_before_id: UUID | None = None
+
+
+_METRIC_ALLOWLIST: dict[str, Any] = {
+    "article_count": int,
+    "coverage": float,
+    "parse_failures": int,
+}
+
+
+class DatasetSnapshotSummary(StrictModel):
+    dataset_name: str
+    parser_version: str
+    state: str
+    released_at: datetime | None = None
+    quality_metrics: dict[str, int | float]
 
 
 class ProvisionSummary(StrictModel):
@@ -119,6 +134,56 @@ def _version_summary(version: LegalVersion) -> LegalVersionSummary:
         dataset_version=version.dataset_version,
         parser_version=version.parser_version,
     )
+
+
+def _dataset_summary(snapshot: DatasetSnapshot) -> DatasetSnapshotSummary:
+    metrics: dict[str, int | float] = {}
+    for key, expected in _METRIC_ALLOWLIST.items():
+        value = snapshot.quality_metrics.get(key)
+        if isinstance(value, expected):
+            metrics[key] = value
+    return DatasetSnapshotSummary(
+        dataset_name=snapshot.dataset_name,
+        parser_version=snapshot.parser_version,
+        state=snapshot.state.value,
+        released_at=snapshot.released_at,
+        quality_metrics=metrics,
+    )
+
+
+@router.get(
+    "/datasets",
+    response_model=list[DatasetSnapshotSummary],
+)
+async def list_dataset_snapshots(
+    current: AccountSession,
+    services: Services,
+) -> list[DatasetSnapshotSummary]:
+    del current
+    service = _require_service(services)
+    try:
+        snapshots = await service.datasets()
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return [_dataset_summary(snapshot) for snapshot in snapshots]
+
+
+@router.get(
+    "/datasets/{dataset_name}",
+    response_model=DatasetSnapshotSummary,
+)
+async def get_dataset_snapshot(
+    dataset_name: str,
+    current: AccountSession,
+    services: Services,
+) -> DatasetSnapshotSummary:
+    del current
+    service = _require_service(services)
+    try:
+        snapshot = await service.dataset(dataset_name=dataset_name)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return _dataset_summary(snapshot)
 
 
 @router.get(
