@@ -1,6 +1,9 @@
 // Pure navigation-guard decision logic, kept framework-free for unit tests.
 
-export const PUBLIC_ROUTE_NAMES = new Set(['login', 'register'])
+// Anyone (logged-in or not) may visit these routes.
+export const AUTH_FREE_ROUTE_NAMES = new Set(['home', 'chat', 'not-found'])
+// Only meaningful for anonymous visitors: these pages host the login flow.
+export const AUTH_FORMS_ROUTE_NAMES = new Set(['login', 'register'])
 
 export interface AuthRedirect {
   name: string
@@ -16,12 +19,14 @@ export interface AuthRedirectDecision {
 export function authRedirectDecision(
   decision: AuthRedirectDecision,
 ): AuthRedirect | null {
-  const { hasToken, routeName, fullPath = '/' } = decision
-  if (!hasToken && !PUBLIC_ROUTE_NAMES.has(routeName)) {
+  const { hasToken, routeName, fullPath = '/chat' } = decision
+  const openToAll = AUTH_FREE_ROUTE_NAMES.has(routeName)
+  const authForm = AUTH_FORMS_ROUTE_NAMES.has(routeName)
+  if (!hasToken && !openToAll && !authForm) {
     return { name: 'login', query: { next: fullPath } }
   }
-  if (hasToken && PUBLIC_ROUTE_NAMES.has(routeName)) {
-    return { name: 'home' }
+  if (hasToken && authForm) {
+    return { name: 'chat' }
   }
   return null
 }

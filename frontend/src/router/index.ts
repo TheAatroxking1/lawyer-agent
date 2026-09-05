@@ -22,11 +22,20 @@ const router = createRouter({
       path: '/',
       component: () => import('../layouts/AppShell.vue'),
       children: [
+        // Landing: the conversation page is the product surface; logging in
+        // happens only when the visitor actually talks to the AI.
+        { path: '', redirect: { name: 'chat' } },
         {
-          path: '',
+          path: 'home',
           name: 'home',
           component: () => import('../views/HomeView.vue'),
           meta: { title: '首页' },
+        },
+        {
+          path: 'chat',
+          name: 'chat',
+          component: () => import('../views/ChatView.vue'),
+          meta: { title: '法规对话' },
         },
         {
           path: 'corpus',
@@ -39,12 +48,6 @@ const router = createRouter({
           name: 'corpus-instrument',
           component: () => import('../views/CorpusInstrumentView.vue'),
           meta: { title: '法规详情' },
-        },
-        {
-          path: 'chat',
-          name: 'chat',
-          component: () => import('../views/ChatView.vue'),
-          meta: { title: '法规对话' },
         },
       ],
     },

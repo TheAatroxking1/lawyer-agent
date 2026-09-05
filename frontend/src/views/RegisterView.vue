@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { ApiError, apiClient, registerAccount } from '../api'
+import { refreshAuth } from '../auth/state'
 import { session } from '../auth/session'
 import ErrorNote from '../components/ErrorNote.vue'
 
@@ -37,7 +38,8 @@ async function submit(): Promise<void> {
       password: password.value,
     })
     session.saveToken(result.access_token)
-    await router.replace('/')
+    refreshAuth()
+    await router.replace('/chat')
   } catch (cause) {
     error.value =
       cause instanceof ApiError

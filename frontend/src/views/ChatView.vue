@@ -3,12 +3,11 @@ import { nextTick, ref, watch } from 'vue'
 
 import { ApiError, apiClient, chat } from '../api'
 import type { ChatUsage } from '../api'
+import AuthModal from '../components/AuthModal.vue'
+import { authState, refreshAuth } from '../auth/state'
 import { session } from '../auth/session'
 import { MAX_CONTENT_CHARS, composeChatMessages } from '../chat/messages'
 import type { ChatTurn } from '../chat/messages'
-import { useRouter } from 'vue-router'
-
-const router = useRouter()
 
 const turns = ref<ChatTurn[]>([])
 const draft = ref('')
@@ -16,29 +15,32 @@ const sending = ref(false)
 const error = ref<ApiError | null>(null)
 const usage = ref<ChatUsage | null>(null)
 const transcript = ref<HTMLElement | null>(null)
+const showLogin = ref(false)
+const pendingSend = ref(false)
 
 function guidanceFor(code: string): string | null {
   switch (code) {
     case 'model_provider_unavailable':
       return '模型服务未配置：请复制 deploy/deepseek.config.example.json 为 deploy/deepseek.config.json，填入你的 DeepSeek API Key 后重启后端。'
     case 'authentication_failed':
-      return '登录已失效，请重新登录。'
+      return '登录已失效，请重新登录后再发送。'
     default:
       return null
   }
 }
 
-function requireLogin(): void {
-  session.clearToken()
-  void router.replace('/login')
+function openLogin(): void {
+  error.value = null
+  showLogin.value = true
 }
 
-async function send(): Promise<void> {
-  if (sending.value) return
-  error.value = null
-  const content = draft.value.trim()
-  if (content.length === 0) return
-  draft.value = ''
+function onLoggedOut401(): void {
+  session.clearToken()
+  refreshAuth()
+  openLogin()
+}
+
+async function doSend(content: string): Promise<void> {
   usage.value = null
   const history: ChatTurn[] = [...turns.value, { role: 'user', content }]
   turns.value = history
@@ -54,6 +56,35 @@ async function send(): Promise<void> {
         : new ApiError({ status: 0, code: 'network_error', title: '无法连接服务，请稍后重试' })
   } finally {
     sending.value = false
+  }
+}
+
+function requestSend(): void {
+  if (sending.value) return
+  error.value = null
+  const content = draft.value.trim()
+  if (content.length === 0) return
+  if (!authState.authenticated) {
+    // Keep the draft in the box; only authenticate when the user actually
+    // talks to the AI, then resend the same message.
+    pendingSend.value = true
+    showLogin.value = true
+    return
+  }
+  draft.value = ''
+  void doSend(content)
+}
+
+function onModalSuccess(): void {
+  showLogin.value = false
+  const resend = pendingSend.value
+  pendingSend.value = false
+  if (resend && authState.authenticated) {
+    const content = draft.value.trim()
+    if (content.length > 0) {
+      draft.value = ''
+      void doSend(content)
+    }
   }
 }
 
@@ -88,7 +119,7 @@ watch(
 
     <div ref="transcript" class="transcript" aria-live="polite">
       <p v-if="turns.length === 0" class="empty">
-        开始提问吧，例如：<button class="link" type="button" @click="draft = '承租人逾期支付租金，出租人可以要求支付违约金吗？'; void send()">承租人逾期支付租金，出租人可以要求支付违约金吗？</button>
+        开始提问吧，例如：<button class="link" type="button" @click="draft = '承租人逾期支付租金，出租人可以要求支付违约金吗？'; requestSend()">承租人逾期支付租金，出租人可以要求支付违约金吗？</button>
       </p>
       <article v-for="(turn, index) in turns" :key="index" class="bubble" :class="turn.role">
         <div class="who">{{ turn.role === 'user' ? '我' : '律师 Agent' }}</div>
@@ -98,29 +129,44 @@ watch(
     </div>
 
     <div class="compose">
+      <p v-if="!authState.authenticated" class="guest-note">
+        未登录可浏览与输入；点击发送即弹出登录（支持微信 / 手机号 / 账号密码）。
+      </p>
       <p v-if="error" class="error" role="alert">
         <span class="code">{{ error.code }}</span>
         <span>{{ error.title }}</span>
-        <button v-if="error.code === 'authentication_failed'" type="button" @click="requireLogin">重新登录</button>
+        <button
+          v-if="error.code === 'authentication_failed'"
+          type="button"
+          @click="onLoggedOut401"
+        >
+          重新登录
+        </button>
       </p>
       <p v-if="error && guidanceFor(error.code)" class="guidance">{{ guidanceFor(error.code) }}</p>
       <p v-if="usage" class="usage">
         本次回答 tokens：{{ usage.completion_tokens }}（累计 {{ usage.total_tokens }}）
       </p>
-      <form class="compose-row" @submit.prevent="send">
+      <form class="compose-row" @submit.prevent="requestSend">
         <textarea
           v-model="draft"
           :maxlength="MAX_CONTENT_CHARS"
           rows="3"
           placeholder="输入问题（Enter 发送，Shift+Enter 换行）"
           :disabled="sending"
-          @keydown.enter.exact.prevent="send"
+          @keydown.enter.exact.prevent="requestSend"
         ></textarea>
-        <button type="submit" :disabled="sending || draft.trim().length === 0">
-          {{ sending ? '发送中…' : '发送' }}
+        <button
+          type="submit"
+          :disabled="sending || draft.trim().length === 0"
+          :title="authState.authenticated ? undefined : '登录后可发送给 AI'"
+        >
+          {{ sending ? '发送中…' : authState.authenticated ? '发送' : '登录并发送' }}
         </button>
       </form>
     </div>
+
+    <AuthModal v-if="showLogin" @close="showLogin = false" @success="onModalSuccess" />
   </section>
 </template>
 
@@ -251,6 +297,15 @@ watch(
   margin: 0;
   color: var(--color-text-muted);
   font-size: 0.78rem;
+}
+.guest-note {
+  margin: 0;
+  padding: 0.4rem 0.7rem;
+  border: 1px dashed var(--color-accent-soft-border);
+  border-radius: 6px;
+  background: var(--color-accent-soft);
+  color: var(--color-text-secondary);
+  font-size: 0.85rem;
 }
 .compose-row {
   display: flex;
