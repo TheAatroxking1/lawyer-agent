@@ -338,3 +338,114 @@ def test_retrieval_qa_rejects_invalid_question_bodies(migrated_mysql_url: URL) -
             json={"question": "q", "surprise": 1},
         )
         assert unknown.status_code == 422
+
+
+def _sse_events(text: str) -> list[tuple[str, dict[str, object]]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    for block in text.split("\n\n"):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        name = ""
+        data_lines: list[str] = []
+        for line in lines:
+            if line.startswith("event:"):
+                name = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].strip())
+        payload: dict[str, object] = {}
+        if data_lines:
+            payload = __import__("json").loads("\n".join(data_lines))
+        events.append((name, payload))
+    return events
+
+
+def test_retrieval_qa_stream_requires_authentication(migrated_mysql_url: URL) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    client = _client(migrated_mysql_url, prefix_label="lawyer-test-rqa-stream-unauth")
+    with client:
+        reply = client.post("/api/v1/legal/questions/stream", json=_question())
+        assert reply.status_code == 401
+
+
+def test_retrieval_qa_stream_delivers_events_over_real_mysql(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    client = _client(migrated_mysql_url, prefix_label="lawyer-test-rqa-stream-ok")
+    with client:
+        client.app.state.services.legal_retrieval_qa_http = FakeRetrievalQa(
+            _allowed_answer()
+        )
+        token = _register(client, "rqa-stream-ok-owner")
+        headers = {"Authorization": f"Bearer {token}"}
+        reply = client.post(
+            "/api/v1/legal/questions/stream", headers=headers, json=_question()
+        )
+        assert reply.status_code == 200
+        assert reply.headers["content-type"].startswith("text/event-stream")
+        events = _sse_events(reply.text)
+        assert [name for name, _ in events] == ["started", "answer", "done"]
+        assert events[0][1]["question"].startswith("不履行合同")
+        answer = events[1][1]
+        assert answer["refused"] is False
+        assert answer["reason"] == "allowed"
+        assert "违约责任" in str(answer["text"])
+        assert answer["usage"]["total_tokens"] == 28
+        assert len(answer["citations"]) == 1
+        assert answer["citations"][0]["provision_no"] == "第五百七十七条"
+        assert events[2][1] == {}
+
+
+def test_retrieval_qa_stream_carries_stable_refusal(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    client = _client(migrated_mysql_url, prefix_label="lawyer-test-rqa-stream-refused")
+    with client:
+        client.app.state.services.legal_retrieval_qa_http = FakeRetrievalQa(
+            _refused_answer("no_evidence")
+        )
+        token = _register(client, "rqa-stream-refused-owner")
+        headers = {"Authorization": f"Bearer {token}"}
+        reply = client.post(
+            "/api/v1/legal/questions/stream", headers=headers, json=_question()
+        )
+        assert reply.status_code == 200
+        events = _sse_events(reply.text)
+        assert [name for name, _ in events] == ["started", "answer", "done"]
+        answer = events[1][1]
+        assert answer["refused"] is True
+        assert answer["reason"] == "no_evidence"
+        assert answer["citations"] == []
+
+
+def test_retrieval_qa_stream_delivers_error_event(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    client = _client(migrated_mysql_url, prefix_label="lawyer-test-rqa-stream-fail")
+    with client:
+        client.app.state.services.legal_retrieval_qa_http = FakeRetrievalQa(
+            ModelProviderTimeout("slow")
+        )
+        token = _register(client, "rqa-stream-fail-owner")
+        headers = {"Authorization": f"Bearer {token}"}
+        reply = client.post(
+            "/api/v1/legal/questions/stream", headers=headers, json=_question()
+        )
+        assert reply.status_code == 200
+        events = _sse_events(reply.text)
+        assert [name for name, _ in events] == ["started", "error", "done"]
+        failure = events[1][1]
+        assert failure["status"] == 504
+        assert failure["code"] == "model_provider_timeout"
+        assert events[2][1] == {}
