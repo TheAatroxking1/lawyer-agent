@@ -207,7 +207,20 @@
   验证 ruff+mypy（162 文件）零错 + 3 项装配单测（无 key/无 url → None、
   齐全可构造且 session_factory 零调用）+ 全 unit + 检索问答全栈合计
   **1114 passed + 1 skipped**；真实运行前提：本地 embedding 权重 + OS 在线
-  + dataset_v1 已发布 + DeepSeek key。SSE 流式问答、前端问答页仍为后续。
+  + dataset_v1 已发布 + DeepSeek key。SSE 端点已完成（见下条）、前端问答页
+  仍为后续。
+- 已完成“检索问答 SSE 流式端点”非模型切片（2026-09-10 计划，spec 9.3）：
+  `POST /api/v1/legal/questions/stream` 以 `StreamingResponse
+  (text/event-stream, Cache-Control: no-cache, X-Accel-Buffering: no)` 推送
+  稳定事件序 `started → answer|error → done`（started 带问题原文；answer 与
+  `LegalRetrievalReply` 同构含 usage 与七字段 citations；运行期网关/检索失败
+  转 `error` 事件携带与 HTTP 层一致 status/code/title，绝不伪造流内容；鉴权
+  与输入校验仍在开流前普通 Problem Details，服务缺失开流前 503）；复用既有
+  body 校验/默认今日 target_date/错误映射；验证 ruff+mypy strict 零错 + 10
+  项真实 MySQL+Redis 全栈（原 6 + 新增 4：stream 未认证 401、allowed 事件序
+  started/answer/done 且 answer 字段、refusal no_evidence 稳定、timeout →
+  error 事件 504）；前端消费 SSE（fetch 流解析）与真实逐 token 流（provider
+  chat_stream）仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
