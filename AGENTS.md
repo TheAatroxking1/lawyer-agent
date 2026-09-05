@@ -185,7 +185,22 @@
   /var/cache/nginx + no-new-privileges、wget healthcheck）并把
   `http://localhost:8080` 加入 api 默认可信源；验证 `docker compose config
   --quiet` 通过；镜像 build 因本机 Docker Hub 拉取不可达未能在本会话完成
-  （仓库内 npm 构建已绿，网络恢复后复跑 build）。上传下载页面仍为后续。
+  （仓库内 npm 构建已绿，网络恢复后复跑 build）。
+- 已完成“案件文档工作台基础（租户列表/切换/会话租户 token）”非模型切片
+  （2026-09-10 计划）：案件/文档属租户内部数据，前端此前无租户上下文——
+  `session.ts` 增独立 `TENANT_TOKEN_KEY` 与
+  saveTenantToken/readTenantToken/clearTenantToken（与账号 token 互不覆盖、
+  可注入 Storage 可测）；`api/types` 镜像 `AccountTenant/AccountTenantList/
+  SwitchTenantInput`，`endpoints.myTenants`（GET /accounts/me/tenants）与
+  `switchTenant`（POST /auth/switch-tenant → token）；`DocumentsView`（路由
+  /documents 受保护，顶栏「案件文档」）：加载租户成员列表——空 → 指引卡
+  （邀请 / 申请创建租户经平台审核 / 部署 CLI 提权首个管理员，明确公开注册
+  不自动归属租户）；有 → 仅 active 成员+active 租户可「进入工作台」（换取
+  租户 token 存会话），否则提示未生效；进入后展示当前租户与能力说明（上传
+  登记/Rule Check 报告下载已备；原始文件下载与 MinIO 预签名后置）；「退出
+  当前租户」清租户 token；验证 typecheck 0 + vitest 40/40（session 租户/账号
+  token 独立 + endpoints 两调用断言）+ build；后端零改动。租户内案件/文档
+  上传下载列表、规则报告下载 UI 仍为后续。
 - 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
   （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
   MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
