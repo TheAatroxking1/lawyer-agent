@@ -356,6 +356,16 @@
   snapshot 为 published 且 manifest/质量指标落库（versions=1/provisions=10/
   chunks=10）；ruff+mypy strict（165 文件）零错；用法与证据见
   `docs/superpowers/plans/2026-09-10-corpus-publish-cli.md`。
+- 已完成“embedding 模型参数化（Settings + 检索服务 + corpus_publish CLI）”非模型
+  切片（2026-09-10）：模型此前写死默认 `BAAI/bge-small-zh-v1.5`/512——`Settings`
+  增 `embedding_model_ref`（默认同前）与 `embedding_dimension`（默认 512）及校验；
+  检索问答装配读取配置（对鸭子类型 settings 以常量回退，保持单测兼容），
+  `LegalRetrievalQaService` 构造注入实例级 embed 默认、`answer` 支持调用级覆盖；
+  `corpus_publish` CLI 增 `--model-ref/--dimension`（缺省取 Settings），可逐模型
+  重建发布；模型卡经 hf-mirror 确认 `IEITYuan/Yuan-embedding-2.0-zh`=1024 维、
+  `BAAI/bge-m3`=1024 维长文本、`richinfoai/ritrieve_zh_v1` 为对照候选（输出形态
+  待确认）；验证 ruff+mypy strict（165 文件）零错 + 全 unit **1150 passed + 1
+  skipped**；注意发布与运行期模型/维度须一致，切换后需重新发布 dataset_v1。
 - 已完成“全栈最终实现交付核验审计”非模型轮（2026-09-10 主线收尾）：逐项对照
   主目标列清单并复核证据（key 配置底座 / DeepSeek chat provider+chat_stream 经
   ModelGateway / /legal/chat 与 /legal/chat/stream SSE / Vue3 全前端面（登录·语料

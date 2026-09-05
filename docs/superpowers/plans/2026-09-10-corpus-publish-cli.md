@@ -23,9 +23,31 @@ uv run --no-sync python -m lawyer_agent.cli.corpus_publish `
 
 流水线：DOCX → `LegalStructureParser`（只认「第X条…」等编号条文）→ 显式元数据映射
 → 受控导入（version+provisions，同文件重跑幂等 replay）→ 派生 PROVISION chunk →
-本地 `BAAI/bge-small-zh-v1.5` 分批 embed（ModelGateway 记录调用）→ OpenSearch
-k-NN 索引（索引名缺省 `lawyer_dataset_<hex12>`）→ `LegalDatasetIndexPublishService`
-原子切 `dataset_v1` 别名并登记 snapshot。零条文/空文件/坏参数返回非零码并不写库。
+本地 embedding 模型分批 embed（ModelGateway 记录调用）→ OpenSearch k-NN 索引
+（索引名缺省 `lawyer_dataset_<hex12>`）→ `LegalDatasetIndexPublishService` 原子切
+`dataset_v1` 别名并登记 snapshot。零条文/空文件/坏参数返回非零码并不写库。
+
+## Embedding 模型参数化（2026-09-10 增补）
+
+模型不再写死：`Settings` 增 `embedding_model_ref`（默认
+`BAAI/bge-small-zh-v1.5`）与 `embedding_dimension`（默认 512）；后端检索问答装配
+与检索服务以该配置为 embed 默认（服务仍支持调用级覆盖）。`corpus_publish` CLI 增
+`--model-ref` / `--dimension`（缺省取 Settings），可用于按模型重建发布：
+
+```powershell
+# 例：用 Yuan-embedding-2.0-zh（1024 维，经 hf-mirror 下载后）重建数据集
+uv run --no-sync python -m lawyer_agent.cli.corpus_publish --docx <文件> ... `
+  --model-ref IEITYuan/Yuan-embedding-2.0-zh --dimension 1024 --alias dataset_v1
+```
+
+注意：**发布所用模型/维度必须与运行期 `LAWYER_EMBEDDING_MODEL_REF` /
+`LAWYER_EMBEDDING_DIMENSION`（或 Settings 默认）一致**，否则检索 query 向量与索引
+向量维度/分布不匹配。切换模型后需重新发布 dataset（新索引 + 原子切别名，旧索引
+保留可回滚）。
+
+候选模型信息（模型卡确认）：`IEITYuan/Yuan-embedding-2.0-zh` 1024 维（sentence-
+transformers，max 512）；`BAAI/bge-m3` 1024 维、支持长文本；`richinfoai/ritrieve_zh_v1`
+为对照候选（其输出形态——向量或重排分数——待模型卡进一步确认后再接线）。
 
 ## 生成样例语料（可选）
 
