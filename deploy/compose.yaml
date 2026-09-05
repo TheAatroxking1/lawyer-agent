@@ -16,7 +16,7 @@ services:
       LAWYER_DATA_ENCRYPTION_ACTIVE_KEY_VERSION: ${LAWYER_DATA_ENCRYPTION_ACTIVE_KEY_VERSION:-1}
       LAWYER_BLIND_INDEX_ACTIVE_KEY_VERSION: ${LAWYER_BLIND_INDEX_ACTIVE_KEY_VERSION:-1}
       LAWYER_JWT_ACTIVE_KID: ${LAWYER_JWT_ACTIVE_KID:-development}
-      LAWYER_TRUSTED_ORIGINS: '${LAWYER_TRUSTED_ORIGINS:-["http://localhost:5173"]}'
+      LAWYER_TRUSTED_ORIGINS: '${LAWYER_TRUSTED_ORIGINS:-["http://localhost:5173","http://localhost:8080"]}'
       LAWYER_COOKIE_SECURE: ${LAWYER_COOKIE_SECURE:-false}
       LAWYER_JWT_ISSUER: ${LAWYER_JWT_ISSUER:-https://identity.lawyer-agent.local}
       LAWYER_SECRET_KEY_FILE: /run/secrets/lawyer_app_secret_key
@@ -57,6 +57,22 @@ services:
         - python
         - -c
         - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      api: {condition: service_healthy}
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/ || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
