@@ -23,6 +23,7 @@ function goLogin(): void {
       <RouterLink class="brand" :to="{ name: 'chat' }">律师 Agent</RouterLink>
       <nav class="nav">
         <RouterLink :to="{ name: 'home' }" :class="{ active: $route.name === 'home' }">首页</RouterLink>
+        <RouterLink :to="{ name: 'ask' }" :class="{ active: $route.name === 'ask' }">法规问答</RouterLink>
         <RouterLink :to="{ name: 'corpus' }" :class="{ active: $route.name === 'corpus' || $route.name === 'corpus-instrument' }">法规语料</RouterLink>
         <RouterLink :to="{ name: 'chat' }" :class="{ active: $route.name === 'chat' }">法规对话</RouterLink>
       </nav>

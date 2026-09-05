@@ -14,6 +14,8 @@ import type {
   LoginInput,
   ProvisionSummary,
   RegisterInput,
+  RetrievalQuestionInput,
+  RetrievalQuestionReply,
 } from './types'
 
 export async function login(
@@ -87,5 +89,15 @@ export async function chat(
   return client.request<ChatReply>('/legal/chat', {
     method: 'POST',
     body: { messages },
+  })
+}
+
+export async function askQuestion(
+  client: ApiClient,
+  input: RetrievalQuestionInput,
+): Promise<RetrievalQuestionReply> {
+  return client.request<RetrievalQuestionReply>('/legal/questions', {
+    method: 'POST',
+    body: input,
   })
 }

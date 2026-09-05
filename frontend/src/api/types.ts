@@ -92,6 +92,31 @@ export interface ChatReply {
   usage: ChatUsage
 }
 
+// POST /api/v1/legal/questions (+ /questions/stream answer payload)
+export interface RetrievalCitation {
+  evidence_id: string
+  instrument_title: string
+  version_label: string
+  provision_no: string
+  provision_text: string
+  source_ref: string
+  dataset_version: string
+}
+
+export interface RetrievalQuestionReply {
+  refused: boolean
+  reason: string
+  text: string
+  usage: ChatUsage | null
+  citations: RetrievalCitation[]
+}
+
+export interface RetrievalQuestionInput {
+  question: string
+  alias?: string
+  target_date?: string
+}
+
 // Problem Details body produced by backend/api/errors.py
 export interface ProblemErrors {
   field?: string

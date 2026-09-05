@@ -1,7 +1,7 @@
 // Pure navigation-guard decision logic, kept framework-free for unit tests.
 
 // Anyone (logged-in or not) may visit these routes.
-export const AUTH_FREE_ROUTE_NAMES = new Set(['home', 'chat', 'not-found'])
+export const AUTH_FREE_ROUTE_NAMES = new Set(['home', 'chat', 'ask', 'not-found'])
 // Only meaningful for anonymous visitors: these pages host the login flow.
 export const AUTH_FORMS_ROUTE_NAMES = new Set(['login', 'register'])
 

@@ -38,6 +38,12 @@ const router = createRouter({
           meta: { title: '法规对话' },
         },
         {
+          path: 'ask',
+          name: 'ask',
+          component: () => import('../views/AskView.vue'),
+          meta: { title: '法规问答' },
+        },
+        {
           path: 'corpus',
           name: 'corpus',
           component: () => import('../views/CorpusView.vue'),
