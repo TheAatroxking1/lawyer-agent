@@ -62,6 +62,28 @@
   +usage、空消息不发请求、401/500 不泄 key、超时、坏 JSON 族、usage 缺省
   归零、embed/rerank unavailable、空 key 拒绝、与 `ModelGateway.chat` 组合
   成功记 usage/失败记 error）green；对话 HTTP/SSE、前端仍为后续。
+- 已完成“法规对话 HTTP（chat 端点，经 ModelGateway）”非模型切片
+  （2026-09-10 计划）：对话无 HTTP 入口——新增 `POST /api/v1/legal/chat`
+  （登录账号、公共问答）：Pydantic 严格 body `{messages:[{role,content}]}`、
+  白名单 role/≤32 条/≤4000 字（422 `legal_chat_invalid_request`）；应用
+  `application/legal_chat.py` `LegalChatHttpService(gateway|None)` 委托
+  `ModelGateway.chat`（model_ref=deepseek-chat 由装配固定，不接受任意
+  model_ref），错误稳定映射（无 key → 503 `model_provider_unavailable`、
+  网关 timeout → 504 `model_provider_timeout`、unavailable/invalid_response
+  → 502 `model_provider_failure`，绝不伪造回复）；`infrastructure/providers/
+  recorder.py` `LoggingModelCallRecorder`（结构化脱敏日志，无
+  prompt/key/正文）；装配 `ApplicationServices.legal_chat_http`：
+  `settings.deepseek_api_key` 空 → gateway=None（启动可用、调用 503）；
+  非空 → DeepSeek provider+recorder+ModelGateway；7 项离线单测（无 key
+  503、委托透传、messages 校验族、网关错误映射）+ recorder 2 项 + 契约 +
+  真实 MySQL+Redis 全栈（无 key 登录 POST → 503 stable、坏 role/空 messages
+  422、未认证 401）green；全量门禁复跑发现 `alembic/env.py` 的
+  `fileConfig` 默认 `disable_existing_loggers=True` 会在进程内跑迁移时
+  禁用 collection 期已创建的全部应用 logger（含 recorder 的
+  `lawyer_agent.model_gateway`，使其 INFO 静默丢失、caplog 为空）——
+  修复为 `disable_existing_loggers=False`（只配置 alembic 自己的
+  logger，不误伤无关 logger），publisher/consumer+recorder 最小复现与
+  rabbitmq 目录全绿；SSE/证据检索问答编排、前端仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
