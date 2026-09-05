@@ -651,3 +651,182 @@ async def _cleanup_dataset_snapshots(mysql_url: URL, names: list[str]) -> None:
                 )
     finally:
         await engine.dispose()
+
+
+async def _seed_load_batches(mysql_url: URL) -> list[UUID]:
+    """Three load batches with distinct created_at timestamps."""
+    import json as _json
+
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = [new_uuid7() for _ in range(3)]
+    hashes = [bytes([index + 1]) * 32 for index in range(3)]
+    rows = [
+        (
+            ids[0],
+            hashes[0],
+            "B20260101000001AA",
+            "object://corpus/c1.docx",
+            "docx-v1",
+            "completed",
+            {"files": 2, "unique": 2, "duplicates": 0},
+            "2026-01-01 00:00:00.000001",
+            "2026-01-01 00:05:00.000000",
+            None,
+        ),
+        (
+            ids[1],
+            hashes[1],
+            "B20260101000002BB",
+            "object://corpus/c2.docx",
+            "docx-v1",
+            "inventoried",
+            {"files": 1, "unique": 1, "duplicates": 0},
+            "2026-01-01 00:00:00.000002",
+            None,
+            None,
+        ),
+        (
+            ids[2],
+            hashes[2],
+            "B20260101000003CC",
+            "object://corpus/c3.docx",
+            "docx-v2",
+            "failed",
+            {"files": 1, "unique": 1, "duplicates": 0},
+            "2026-01-01 00:00:00.000003",
+            "2026-01-01 00:09:00.000000",
+            "parse failure",
+        ),
+    ]
+    try:
+        async with factory() as session:
+            for row in rows:
+                batch_id, file_sha, batch_no, source_ref = row[:4]
+                parser, status, counts, started, completed, error = row[4:]
+                await session.execute(
+                    text(
+                        "INSERT INTO legal_load_batches "
+                        "(id,batch_no,source_ref,file_sha256,parser_version,status,"
+                        "item_counts_json,started_at,completed_at,error_message,created_at) "
+                        "VALUES (:id,:no,:source,:sha,:parser,:status,:counts,"
+                        ":started,:completed,:error,:created)"
+                    ),
+                    {
+                        "id": batch_id.bytes,
+                        "no": batch_no,
+                        "source": source_ref,
+                        "sha": file_sha,
+                        "parser": parser,
+                        "status": status,
+                        "counts": _json.dumps(counts, ensure_ascii=False),
+                        "started": started,
+                        "completed": completed,
+                        "error": error,
+                        "created": started,
+                    },
+                )
+            await session.commit()
+    finally:
+        await engine.dispose()
+    return ids
+
+
+def test_legal_load_batch_read_http_over_real_mysql(migrated_mysql_url: URL) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    prefix = f"lawyer-test-corpus-batch:{uuid4().hex}:"
+    settings = Settings(
+        environment="test",
+        secret_key="h" * 32,
+        database_url=migrated_mysql_url.render_as_string(hide_password=False),
+        redis_url=redis_url,
+        redis_key_prefix=prefix,
+        trusted_origins=(_ORIGIN,),
+        cookie_secure=True,
+        data_encryption_key_ring={7: _encoded(_CIPHER_KEY)},
+        data_encryption_active_key_version=7,
+        blind_index_key_ring={7: _encoded(_BLIND_KEY)},
+        blind_index_active_key_version=7,
+        blind_index_rollout_phase="legacy-compatible",
+        blind_index_legacy_key_version=7,
+        blind_index_legacy_writers_drained=False,
+    )
+    batch_ids = asyncio.run(_seed_load_batches(migrated_mysql_url))
+    client = TestClient(create_app(settings), base_url="https://testserver")
+    try:
+        with client:
+            registered = client.post(
+                "/api/v1/auth/register",
+                headers={"Origin": _ORIGIN},
+                json={
+                    "username": "corpus-batch-owner",
+                    "password": _PASSWORD,
+                    "display_name": "语料批次用户",
+                },
+            )
+            assert registered.status_code == 201, registered.text
+            account_token = registered.json()["access_token"]
+            base = "/api/v1/legal"
+            headers = {"Authorization": f"Bearer {account_token}"}
+
+            # 1. Keyset pagination limit=2 walks all three newest first.
+            seen: list[UUID] = []
+            cursor: str | None = None
+            for _ in range(2):
+                url = f"{base}/load-batches?limit=2"
+                if cursor is not None:
+                    url += f"&before_id={cursor}"
+                walked = client.get(url, headers=headers)
+                assert walked.status_code == 200, walked.text
+                body = walked.json()
+                seen.extend(UUID(item["id"]) for item in body["items"])
+                cursor = body["next_before_id"]
+            assert len(seen) == 3
+            assert set(seen) == set(batch_ids)
+            assert cursor is None
+            assert seen[0] == batch_ids[2]  # newest first
+
+            # 2. Single batch by id returns whitelisted fields.
+            single = client.get(f"{base}/load-batches/{batch_ids[0]}", headers=headers)
+            assert single.status_code == 200, single.text
+            detail = single.json()
+            assert detail["batch_no"] == "B20260101000001AA"
+            assert detail["status"] == "completed"
+            assert detail["source_ref"] == "object://corpus/c1.docx"
+            assert detail["item_counts"]["files"] == 2
+
+            # 3. Unknown batch -> 404 stable code.
+            unknown = client.get(f"{base}/load-batches/{new_uuid7()}", headers=headers)
+            assert unknown.status_code == 404
+            assert unknown.json()["code"] == "legal_corpus_load_batch_not_found"
+
+            # 4. Unknown cursor -> 404 stable code.
+            bad_cursor = client.get(
+                f"{base}/load-batches?before_id={new_uuid7()}", headers=headers
+            )
+            assert bad_cursor.status_code == 404
+            assert (
+                bad_cursor.json()["code"]
+                == "legal_corpus_load_batch_cursor_invalid"
+            )
+
+            # 5. Unauthenticated -> 401.
+            unauth = client.get(f"{base}/load-batches")
+            assert unauth.status_code == 401
+    finally:
+        asyncio.run(_cleanup_load_batches(migrated_mysql_url, batch_ids))
+
+
+async def _cleanup_load_batches(mysql_url: URL, ids: list[UUID]) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            for batch_id in ids:
+                await connection.execute(
+                    text("DELETE FROM legal_load_batches WHERE id=:id"),
+                    {"id": batch_id.bytes},
+                )
+    finally:
+        await engine.dispose()

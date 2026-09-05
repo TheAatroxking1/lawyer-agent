@@ -9,6 +9,8 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusDatasetSnapshotNotFound,
     LegalCorpusInstrumentCursorInvalid,
     LegalCorpusInvalidRequest,
+    LegalCorpusLoadBatchCursorInvalid,
+    LegalCorpusLoadBatchNotFound,
     LegalCorpusQueryService,
 )
 from lawyer_agent.domain.common import new_uuid7
@@ -16,6 +18,8 @@ from lawyer_agent.domain.legal_corpus import (
     DatasetSnapshot,
     DatasetState,
     LegalInstrument,
+    LoadBatch,
+    LoadStatus,
 )
 
 _TITLE = "中华人民共和国民法典"
@@ -76,13 +80,35 @@ class _FakeCorpus:
                 return snapshot
         return None
 
+    async def load_batches(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+    ) -> tuple[LoadBatch, ...]:
+        if self._owner.fail_batch_cursor:
+            from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
+                LegalCorpusLoadBatchCursorInvalid,
+            )
+
+            raise LegalCorpusLoadBatchCursorInvalid("batch cursor missing")
+        return self._owner.batches
+
+    async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None:
+        for batch in self._owner.batches:
+            if batch.id == batch_id:
+                return batch
+        return None
+
 
 class _FakeUow:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.fail_cursor = False
+        self.fail_batch_cursor = False
         self.empty = False
         self.snapshots: tuple[DatasetSnapshot, ...] = ()
+        self.batches: tuple[LoadBatch, ...] = ()
         self.corpus = _FakeCorpus(self)
 
     async def __aenter__(self) -> _FakeUow:
@@ -140,6 +166,66 @@ async def test_dataset_rejects_blank_or_overlong_name() -> None:
         await service.dataset(dataset_name="x" * 65)
     with pytest.raises(LegalCorpusInvalidRequest):
         await service.dataset(dataset_name="bad name!")
+
+
+def _batch(overrides: dict[str, object] | None = None) -> LoadBatch:
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    values: dict[str, object] = {
+        "id": new_uuid7(),
+        "batch_no": "B20260101000000AB",
+        "source_ref": "object://corpus/a.docx",
+        "file_sha256": bytes(32),
+        "parser_version": "docx-v1",
+        "status": LoadStatus.COMPLETED,
+        "item_counts": {"files": 1, "unique": 1, "duplicates": 0},
+        "started_at": started,
+        "completed_at": started,
+        "error_message": None,
+    }
+    if overrides:
+        values.update(overrides)
+    return LoadBatch(**values)
+
+
+async def test_load_batches_returns_all_from_uow() -> None:
+    uow = _FakeUow()
+    first = _batch()
+    second = _batch()
+    uow.batches = (first, second)
+    rows = await _service(uow).load_batches(limit=10)
+    assert rows == (first, second)
+
+
+async def test_load_batch_returns_by_id() -> None:
+    uow = _FakeUow()
+    target = _batch()
+    uow.batches = (_batch(), target)
+    loaded = await _service(uow).load_batch(batch_id=target.id)
+    assert loaded == target
+
+
+async def test_load_batch_missing_maps_to_not_found() -> None:
+    uow = _FakeUow()
+    uow.batches = (_batch(),)
+    with pytest.raises(LegalCorpusLoadBatchNotFound):
+        await _service(uow).load_batch(batch_id=new_uuid7())
+
+
+async def test_load_batches_rejects_invalid_limit_and_cursor() -> None:
+    service = _service(_FakeUow())
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.load_batches(limit=0)
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.load_batches(limit=101)
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.load_batches(limit=5, before_id=UUID(int=0))  # not uuid7
+
+
+async def test_load_batches_maps_cursor_missing_to_stable_error() -> None:
+    uow = _FakeUow()
+    uow.fail_batch_cursor = True
+    with pytest.raises(LegalCorpusLoadBatchCursorInvalid):
+        await _service(uow).load_batches(limit=5, before_id=new_uuid7())
 
 
 async def test_instruments_passes_validated_filters_to_uow() -> None:

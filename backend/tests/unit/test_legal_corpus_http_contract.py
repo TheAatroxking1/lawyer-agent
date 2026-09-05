@@ -9,6 +9,8 @@ from lawyer_agent.api.v1.legal_corpus import (
     LegalInstrumentPage,
     LegalInstrumentSummary,
     LegalVersionSummary,
+    LoadBatchPage,
+    LoadBatchSummary,
     ProvisionSummary,
 )
 from lawyer_agent.application.legal_corpus_diff import (
@@ -20,6 +22,7 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusInstrumentCursorInvalid,
     LegalCorpusInstrumentNotFound,
     LegalCorpusInvalidRequest,
+    LegalCorpusLoadBatchNotFound,
     LegalCorpusVersionNotFound,
 )
 from lawyer_agent.domain.common import new_uuid7
@@ -145,3 +148,32 @@ def test_dataset_snapshot_not_found_code() -> None:
     error = LegalCorpusDatasetSnapshotNotFound()
     assert error.status == 404
     assert error.code == "legal_dataset_snapshot_not_found"
+
+
+def test_load_batch_summary_round_trip() -> None:
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    summary = LoadBatchSummary(
+        id=new_uuid7(),
+        batch_no="B20260101000000AB",
+        source_ref="object://corpus/a.docx",
+        parser_version="docx-v1",
+        status="completed",
+        item_counts={"files": 1, "unique": 1, "duplicates": 0},
+        started_at=started,
+        completed_at=started,
+        error_message=None,
+    )
+    assert summary.batch_no.startswith("B2")
+    assert summary.item_counts["unique"] == 1
+
+
+def test_load_batch_page_round_trip() -> None:
+    batch_id = new_uuid7()
+    page = LoadBatchPage(items=[], next_before_id=batch_id)
+    assert page.next_before_id == batch_id
+
+
+def test_load_batch_not_found_code() -> None:
+    error = LegalCorpusLoadBatchNotFound()
+    assert error.status == 404
+    assert error.code == "legal_corpus_load_batch_not_found"
