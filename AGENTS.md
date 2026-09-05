@@ -151,6 +151,17 @@
   注册/登录（带 next）。验证 typecheck 0 错 + vitest 30/30 + build 分包
   （ChatView gzip 2.6 kB）；后端零改动。真实微信 OAuth/短信/绑定（需外部
   凭据与后端流程）仍为后续。
+- 已完成“前端检索问答页（有据问答）”非模型切片（2026-09-10 计划）：后端
+  /legal/questions 已真实装配但无前端面——`types.ts` 镜像
+  `RetrievalCitation`（七字段白名单）/`RetrievalQuestionReply`/输入契约；
+  `endpoints.askQuestion` → POST `/legal/questions`；`AskView`（路由 `/ask`
+  公开，AppShell 导航增「法规问答」）：游客可输入、提交弹 AuthModal 三页签
+  登录并成功自动补发；结果区 拒答卡片（reason+文案）/支持回答文本+引用卡片
+  （法规·版本·条号·全文·来源·数据集）+usage；错误族引导
+  （retrieval_qa_unavailable/dataset_not_published/provider 系列）；
+  「重新提问」；vitest 31/31（新增 askQuestion 断言）+ typecheck 0 + build
+  分包（AskView gzip 2.4 kB）。AskView 接 SSE 流、上传下载、MCP 工具、Nginx
+  入 compose 仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
