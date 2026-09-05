@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { ApiClient } from './client'
 import {
+  chat,
   getInstrument,
   getVersion,
   listInstruments,
@@ -48,5 +49,12 @@ describe('endpoint path composition', () => {
       '/legal/versions/33333333-3333-7333-8333-333333333333',
       '/legal/versions/44444444-4444-7444-8444-444444444444/provisions',
     ])
+  })
+
+  it('posts chat with the composed message body', async () => {
+    const { client, calls } = recordingClient()
+    await chat(client, [{ role: 'user', content: '你好' }])
+    expect(calls[0].url).toBe('/legal/chat')
+    expect(calls[0].init).toEqual({ method: 'POST', body: { messages: [{ role: 'user', content: '你好' }] } })
   })
 })
