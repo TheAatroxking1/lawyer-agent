@@ -88,6 +88,11 @@ class LoadBatchPage(StrictModel):
     next_before_id: UUID | None = None
 
 
+class QualityIssueSummary(StrictModel):
+    issue_type: str
+    message: str
+
+
 class ProvisionSummary(StrictModel):
     id: UUID
     version_id: UUID
@@ -221,6 +226,27 @@ async def get_load_batch(
     except LegalCorpusQueryError as exc:
         raise _map_error(exc) from None
     return _load_batch_summary(batch)
+
+
+@router.get(
+    "/load-batches/{batch_id}/quality-issues",
+    response_model=list[QualityIssueSummary],
+)
+async def get_load_batch_quality_issues(
+    batch_id: UUID,
+    current: AccountSession,
+    services: Services,
+) -> list[QualityIssueSummary]:
+    del current
+    service = _require_service(services)
+    try:
+        issues = await service.quality_issues(batch_id=batch_id)
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    return [
+        QualityIssueSummary(issue_type=issue.issue_type, message=issue.message)
+        for issue in issues
+    ]
 
 
 @router.get(

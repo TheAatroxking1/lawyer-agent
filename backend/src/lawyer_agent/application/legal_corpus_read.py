@@ -20,6 +20,7 @@ from lawyer_agent.domain.legal_corpus import (
     LegalVersion,
     LoadBatch,
     Provision,
+    QualityIssue,
 )
 
 _DATASET_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
@@ -132,6 +133,10 @@ class LegalCorpusQueryPort(Protocol):
     ) -> tuple[LoadBatch, ...]: ...
 
     async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None: ...
+
+    async def quality_issues_for_batch(
+        self, batch_id: UUID
+    ) -> tuple[QualityIssue, ...]: ...
 
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
@@ -263,6 +268,13 @@ class LegalCorpusQueryService:
         if batch is None:
             raise LegalCorpusLoadBatchNotFound()
         return batch
+
+    async def quality_issues(self, *, batch_id: UUID) -> tuple[QualityIssue, ...]:
+        # Reuses load_batch existence semantics (missing batch -> 404).
+        await self.load_batch(batch_id=batch_id)
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            issues = await uow.corpus.quality_issues_for_batch(batch_id)
+        return tuple(issues)
 
     async def datasets(self) -> tuple[DatasetSnapshot, ...]:
         async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:

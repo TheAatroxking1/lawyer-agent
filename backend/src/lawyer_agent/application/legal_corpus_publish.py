@@ -10,7 +10,11 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.legal_corpus import DatasetSnapshot, DatasetState, LoadBatch
+from lawyer_agent.domain.legal_corpus import (
+    DatasetSnapshot,
+    DatasetState,
+    LoadBatch,
+)
 
 _ARTICLE_NO = re.compile(r"第([一二三四五六七八九十百千零〇0-9０-９]+)条")
 
@@ -29,6 +33,13 @@ class LegalCorpusPublishPort(Protocol):
         item_counts: dict[str, int],
         now: datetime,
     ) -> bool: ...
+
+    async def replace_quality_issues(
+        self,
+        batch_id: UUID,
+        file_sha256: bytes,
+        issues: tuple[str, ...],
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +172,7 @@ class LegalCorpusPublishService:
                 quality_metrics=report.metrics,
             )
             await self._port.upsert_dataset(snapshot)
+            await self._record_failure_issues(batch_id, report.issues)
             return snapshot, report
 
         now = self._now()
@@ -187,3 +199,17 @@ class LegalCorpusPublishService:
                 now=now,
             )
         return published, report
+
+    async def _record_failure_issues(
+        self, batch_id: UUID | None, issues: tuple[str, ...]
+    ) -> None:
+        if batch_id is None:
+            return
+        batch = await self._port.find_batch(batch_id)
+        if batch is None:
+            return
+        await self._port.replace_quality_issues(
+            batch_id,
+            batch.file_sha256,
+            tuple(issue for issue in issues if issue),
+        )

@@ -22,6 +22,7 @@ from lawyer_agent.domain.legal_corpus import (
     LoadStatus,
     Provision,
     ProvisionLevel,
+    QualityIssue,
 )
 from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalChunkModel,
@@ -29,6 +30,7 @@ from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalInstrumentModel,
     LegalLoadBatchModel,
     LegalProvisionModel,
+    LegalQualityIssueModel,
     LegalVersionModel,
 )
 
@@ -133,6 +135,10 @@ class LegalCorpusQueryPort(Protocol):
 
     async def load_batch_by_id(self, batch_id: UUID) -> LoadBatch | None: ...
 
+    async def quality_issues_for_batch(
+        self, batch_id: UUID
+    ) -> tuple[QualityIssue, ...]: ...
+
 
 class LegalCorpusChunkPort(Protocol):
     """Read/write boundary for derived legal corpus chunks (re-indexable)."""
@@ -176,6 +182,16 @@ def _to_load_batch(model: LegalLoadBatchModel) -> LoadBatch:
         started_at=_aware_utc(model.started_at),
         completed_at=_aware_utc(model.completed_at),
         error_message=model.error_message,
+    )
+
+
+def _to_quality_issue(model: LegalQualityIssueModel) -> QualityIssue:
+    return QualityIssue(
+        id=model.id,
+        batch_id=model.batch_id,
+        file_sha256=bytes(model.file_sha256),
+        issue_type=model.issue_type,
+        message=model.message,
     )
 
 
@@ -447,6 +463,16 @@ class SqlAlchemyLegalCorpusRepository:
             )
         )
         return None if model is None else _to_load_batch(model)
+
+    async def quality_issues_for_batch(
+        self, batch_id: UUID
+    ) -> tuple[QualityIssue, ...]:
+        models = await self._session.scalars(
+            select(LegalQualityIssueModel)
+            .where(LegalQualityIssueModel.batch_id == batch_id)
+            .order_by(LegalQualityIssueModel.created_at, LegalQualityIssueModel.id)
+        )
+        return tuple(_to_quality_issue(model) for model in models)
 
 
 class SqlAlchemyLegalCorpusChunkRepository:

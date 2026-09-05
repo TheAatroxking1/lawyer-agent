@@ -4,10 +4,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import (
     DatasetSnapshot,
     DatasetState,
@@ -17,6 +18,7 @@ from lawyer_agent.domain.legal_corpus import (
 from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalDatasetSnapshotModel,
     LegalLoadBatchModel,
+    LegalQualityIssueModel,
 )
 
 _LOAD_STATUS_MAP = {
@@ -131,6 +133,37 @@ class SqlAlchemyLegalCorpusInventoryRepository:
             ),
         )
         return result.rowcount == 1
+
+    async def replace_quality_issues(
+        self,
+        batch_id: UUID,
+        file_sha256: bytes,
+        issues: tuple[str, ...],
+    ) -> None:
+        """Atomically replace a batch's quality issue rows (idempotent)."""
+        if not isinstance(issues, tuple):
+            raise ValueError("quality issues must be a tuple of text")
+        if file_sha256 is None or len(file_sha256) != 32:
+            raise ValueError("quality issue file sha256 must be 32 bytes")
+        await self._session.execute(
+            delete(LegalQualityIssueModel).where(
+                LegalQualityIssueModel.batch_id == batch_id
+            )
+        )
+        for issue in issues:
+            if not isinstance(issue, str) or not issue:
+                continue
+            issue_type = issue.split(":", 1)[0].strip() or "quality_issue"
+            self._session.add(
+                LegalQualityIssueModel(
+                    id=new_uuid7(),
+                    batch_id=batch_id,
+                    file_sha256=file_sha256,
+                    issue_type=issue_type[:64],
+                    message=issue[:2048],
+                )
+            )
+        await self._session.flush()
 
 
 def _batch_model(batch: LoadBatch) -> LegalLoadBatchModel:
