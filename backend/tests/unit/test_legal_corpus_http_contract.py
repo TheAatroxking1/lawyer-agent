@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import UUID
 
 from lawyer_agent.api.v1.legal_corpus import (
+    LegalInstrumentPage,
     LegalInstrumentSummary,
     LegalVersionSummary,
     ProvisionSummary,
@@ -12,7 +14,9 @@ from lawyer_agent.application.legal_corpus_diff import (
     LegalVersionDiffVersionNotFound,
 )
 from lawyer_agent.application.legal_corpus_read import (
+    LegalCorpusInstrumentCursorInvalid,
     LegalCorpusInstrumentNotFound,
+    LegalCorpusInvalidRequest,
     LegalCorpusVersionNotFound,
 )
 from lawyer_agent.domain.common import new_uuid7
@@ -85,3 +89,31 @@ def test_service_present_in_composition() -> None:
     )
     assert services.legal_corpus_http is placeholder
     assert services.legal_version_diff_http is placeholder
+
+
+def test_instrument_page_round_trip() -> None:
+    instrument_id = new_uuid7()
+    summary = LegalInstrumentSummary(
+        id=instrument_id,
+        title="中华人民共和国民法典",
+        issuing_authority="全国人民代表大会",
+        jurisdiction="national",
+        region_code=None,
+    )
+    page = LegalInstrumentPage(items=[summary], next_before_id=None)
+    assert page.items[0].id == instrument_id
+    assert page.next_before_id is None
+    follow = LegalInstrumentPage(items=[], next_before_id=instrument_id)
+    assert follow.next_before_id == UUID(str(instrument_id))
+
+
+def test_instrument_invalid_request_code() -> None:
+    error = LegalCorpusInvalidRequest()
+    assert error.status == 422
+    assert error.code == "legal_corpus_invalid_request"
+
+
+def test_instrument_cursor_invalid_code() -> None:
+    error = LegalCorpusInstrumentCursorInvalid()
+    assert error.status == 404
+    assert error.code == "legal_corpus_instrument_cursor_invalid"

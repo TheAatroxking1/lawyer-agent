@@ -328,3 +328,186 @@ def test_legal_corpus_read_http_over_real_mysql(migrated_mysql_url: URL) -> None
             f"{base}/instruments/{instrument_id}/versions",
         )
         assert unauth_history.status_code == 401
+
+
+async def _seed_list_instruments(
+    mysql_url: URL,
+) -> list[UUID]:
+    """Three national instruments with distinct titles/authorities/regions."""
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = [new_uuid7() for _ in range(3)]
+    rows = [
+        (
+            ids[0],
+            "中华人民共和国耕地占用税法",
+            "全国人民代表大会常务委员会",
+            "national",
+            None,
+            "2026-01-01 00:00:00.000001",
+        ),
+        (
+            ids[1],
+            "中华人民共和国契税法",
+            "全国人民代表大会常务委员会",
+            "national",
+            "110000",
+            "2026-01-01 00:00:00.000002",
+        ),
+        (
+            ids[2],
+            "北京市大气污染防治条例",
+            "北京市人民代表大会常务委员会",
+            "national",
+            "310000",
+            "2026-01-01 00:00:00.000003",
+        ),
+    ]
+    try:
+        async with factory() as session:
+            for instrument_id, title, authority, jurisdiction, region, created in rows:
+                await session.execute(
+                    text(
+                        "INSERT INTO legal_instruments "
+                        "(id,title,issuing_authority,jurisdiction,region_code,"
+                        "version,created_at) "
+                        "VALUES (:id,:title,:authority,:jurisdiction,:region,1,:created)"
+                    ),
+                    {
+                        "id": instrument_id.bytes,
+                        "title": title,
+                        "authority": authority,
+                        "jurisdiction": jurisdiction,
+                        "region": region,
+                        "created": created,
+                    },
+                )
+            await session.commit()
+    finally:
+        await engine.dispose()
+    return ids
+
+
+def test_legal_instrument_list_search_over_real_mysql(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    prefix = f"lawyer-test-corpus-list:{uuid4().hex}:"
+    settings = Settings(
+        environment="test",
+        secret_key="h" * 32,
+        database_url=migrated_mysql_url.render_as_string(hide_password=False),
+        redis_url=redis_url,
+        redis_key_prefix=prefix,
+        trusted_origins=(_ORIGIN,),
+        cookie_secure=True,
+        data_encryption_key_ring={7: _encoded(_CIPHER_KEY)},
+        data_encryption_active_key_version=7,
+        blind_index_key_ring={7: _encoded(_BLIND_KEY)},
+        blind_index_active_key_version=7,
+        blind_index_rollout_phase="legacy-compatible",
+        blind_index_legacy_key_version=7,
+        blind_index_legacy_writers_drained=False,
+    )
+    ids = asyncio.run(_seed_list_instruments(migrated_mysql_url))
+    client = TestClient(create_app(settings), base_url="https://testserver")
+    try:
+        with client:
+            registered = client.post(
+                "/api/v1/auth/register",
+                headers={"Origin": _ORIGIN},
+                json={
+                    "username": "corpus-list-owner",
+                    "password": _PASSWORD,
+                    "display_name": "语料列表用户",
+                },
+            )
+            assert registered.status_code == 201, registered.text
+            account_token = registered.json()["access_token"]
+            base = "/api/v1/legal"
+            headers = {"Authorization": f"Bearer {account_token}"}
+
+            # 1. National-listed instruments include all three new rows.
+            page = client.get(
+                f"{base}/instruments?jurisdiction=national", headers=headers
+            )
+            assert page.status_code == 200, page.text
+            body = page.json()
+            listed = {row["id"] for row in body["items"]}
+            assert {str(instrument_id) for instrument_id in ids} <= listed
+            assert body["next_before_id"] is None or len(body["items"]) < 20
+
+            # 2. Filtered by title substring narrows to the one matching row.
+            by_title = client.get(
+                f"{base}/instruments?jurisdiction=national&title=契税法",
+                headers=headers,
+            )
+            assert by_title.status_code == 200, by_title.text
+            title_items = by_title.json()["items"]
+            assert [row["id"] for row in title_items] == [str(ids[1])]
+
+            # 3. Authority + jurisdiction + region filters combine.
+            filtered = client.get(
+                f"{base}/instruments?issuing_authority=北京&jurisdiction=national"
+                "&region_code=310000",
+                headers=headers,
+            )
+            assert filtered.status_code == 200, filtered.text
+            filtered_items = filtered.json()["items"]
+            assert [row["id"] for row in filtered_items] == [str(ids[2])]
+
+            # 4. Keyset pagination: limit=1 walks all three without loss/dup.
+            seen: list[UUID] = []
+            cursor: str | None = None
+            for _ in range(3):
+                url = f"{base}/instruments?limit=1&jurisdiction=national"
+                if cursor is not None:
+                    url += f"&before_id={cursor}"
+                walked = client.get(url, headers=headers)
+                assert walked.status_code == 200, walked.text
+                walked_body = walked.json()
+                assert len(walked_body["items"]) == 1
+                seen.append(UUID(walked_body["items"][0]["id"]))
+                cursor = walked_body["next_before_id"]
+            assert len(set(seen)) == 3
+            assert set(seen) == set(ids)
+            # Newest-first: ids[2] was created latest.
+            assert seen[0] == ids[2]
+
+            # 5. Unknown cursor -> 404 stable cursor-invalid error.
+            unknown_cursor = client.get(
+                f"{base}/instruments?before_id={new_uuid7()}", headers=headers
+            )
+            assert unknown_cursor.status_code == 404
+            assert (
+                unknown_cursor.json()["code"]
+                == "legal_corpus_instrument_cursor_invalid"
+            )
+
+            # 6. Blank search text -> 422 stable invalid-request error.
+            blank = client.get(
+                f"{base}/instruments?title=%20%20", headers=headers
+            )
+            assert blank.status_code == 422
+            assert blank.json()["code"] == "legal_corpus_invalid_request"
+
+            # 7. Unauthenticated -> 401.
+            unauth = client.get(f"{base}/instruments")
+            assert unauth.status_code == 401
+    finally:
+        asyncio.run(_cleanup_list_instruments(migrated_mysql_url, ids))
+
+
+async def _cleanup_list_instruments(mysql_url: URL, ids: list[UUID]) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            for instrument_id in ids:
+                await connection.execute(
+                    text("DELETE FROM legal_instruments WHERE id=:id"),
+                    {"id": instrument_id.bytes},
+                )
+    finally:
+        await engine.dispose()
