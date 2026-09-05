@@ -9,6 +9,7 @@ alias -> hybrid search -> restore provisions -> assemble bundle".
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
 
@@ -33,7 +34,7 @@ class _DatasetSearchPort(Protocol):
 
 class _EvidenceAssemblyPort(Protocol):
     async def assemble(
-        self, *, hits: object
+        self, *, hits: Sequence[LegalSearchHit]
     ) -> EvidenceBundle | None: ...
 
 

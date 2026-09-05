@@ -104,6 +104,9 @@ class Settings(BaseSettings):
     redis_url: str = Field(default=DEVELOPMENT_REDIS_URL, repr=False, exclude=True)
     redis_key_prefix: str = Field(default="lawyer:", pattern=r"^[a-z0-9][a-z0-9:-]{0,62}:$")
     redis_security_topology: SecurityRedisTopology = SecurityRedisTopology.STANDALONE
+    opensearch_url: str = Field(
+        default="http://127.0.0.1:9200", pattern=r"^https?://[^\s]+$"
+    )
     database_pool_size: int = Field(default=10, gt=0)
     database_max_overflow: int = Field(default=20, ge=0)
     database_pool_timeout_seconds: float = Field(default=30.0, gt=0)

@@ -243,7 +243,9 @@ async def application_services(
         legal_corpus_http=_build_legal_corpus_http_service(session_factory),
         legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
         legal_chat_http=_build_legal_chat_http_service(settings),
-        legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(settings),
+        legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(
+            settings, session_factory
+        ),
         invitation_delivery=delivery_capability,
         readiness=ConcurrentReadinessProbe(
             checks=(mysql_readiness, redis_readiness),
@@ -402,17 +404,109 @@ def _build_legal_version_diff_http_service(session_factory: Any) -> Any:
     )
 
 
-def _build_legal_retrieval_qa_http_service(settings: Any) -> Any:
-    """Composition root placeholder for retrieval-grounded Q&A.
+def _build_legal_retrieval_qa_http_service(
+    settings: Any,
+    session_factory: Any,
+) -> Any:
+    """Composition root for retrieval-grounded Q&A over the legal dataset.
 
-    The full chain (embedding provider -> hybrid search over the published
-    dataset alias -> evidence assembly -> DeepSeek claims chat) depends on
-    configuration surfaces that do not exist yet in ``Settings``. Until the
-    wiring slice lands, the service stays None and the endpoint answers a
-    stable 503 ``retrieval_qa_unavailable``; nothing is fabricated.
+    Requires a configured DeepSeek API key (the claims chat) and an OpenSearch
+    endpoint (hybrid search target). The embedding provider loads its model
+    lazily on the first query, so startup performs no model or network work.
+    Without the prerequisites the service stays None and the endpoint answers
+    a stable 503 ``retrieval_qa_unavailable`` — nothing is fabricated.
     """
-    del settings
-    return None
+    api_key = getattr(settings, "deepseek_api_key", None)
+    opensearch_url = getattr(settings, "opensearch_url", None)
+    if not api_key or not opensearch_url:
+        return None
+    from lawyer_agent.application.legal_dataset_evidence import (
+        LegalDatasetEvidenceService,
+    )
+    from lawyer_agent.application.legal_dataset_search import (
+        LegalDatasetSearchService,
+    )
+    from lawyer_agent.application.legal_evidence_assembly import (
+        LegalEvidenceAssemblyService,
+    )
+    from lawyer_agent.application.legal_hybrid_search import (
+        LegalHybridSearchService,
+    )
+    from lawyer_agent.application.legal_index_alias import (
+        LegalDatasetAliasService,
+    )
+    from lawyer_agent.application.legal_retrieval_qa import (
+        DEFAULT_EMBED_MODEL_REF,
+        LegalRetrievalQaService,
+    )
+    from lawyer_agent.application.model_gateway import ModelGateway
+    from lawyer_agent.domain.model_gateway import CallLimits
+    from lawyer_agent.infrastructure.providers.deepseek import DeepSeekChatProvider
+    from lawyer_agent.infrastructure.providers.embedding import (
+        LocalSentenceTransformerEmbeddingProvider,
+    )
+    from lawyer_agent.infrastructure.providers.recorder import (
+        LoggingModelCallRecorder,
+    )
+    from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
+
+    embed_gateway = ModelGateway(
+        provider=LocalSentenceTransformerEmbeddingProvider(
+            model_name_or_path=DEFAULT_EMBED_MODEL_REF
+        ),
+        recorder=LoggingModelCallRecorder(),
+        limits=CallLimits(timeout_seconds=60.0, max_attempts=1),
+    )
+    os_client = OpenSearchRestClient(base_url=opensearch_url)
+    alias_service = LegalDatasetAliasService(os_client)
+    hybrid = LegalHybridSearchService(gateway=embed_gateway, search=os_client)
+    dataset_search = LegalDatasetSearchService(
+        hybrid=hybrid,
+        alias=alias_service,
+    )
+    assembly = LegalEvidenceAssemblyService(
+        query=_LegalEvidenceAssemblyQueryAdapter(session_factory)
+    )
+    dataset_evidence = LegalDatasetEvidenceService(
+        dataset_search=dataset_search,
+        evidence_assembly=assembly,
+    )
+    chat_gateway = ModelGateway(
+        provider=DeepSeekChatProvider(api_key=api_key),
+        recorder=LoggingModelCallRecorder(),
+        limits=CallLimits(timeout_seconds=30.0, max_attempts=1),
+    )
+    return LegalRetrievalQaService(
+        dataset_evidence=dataset_evidence,
+        chat=chat_gateway,
+    )
+
+
+class _LegalEvidenceAssemblyQueryAdapter:
+    """Fresh-session corpus reads for evidence assembly (public corpus)."""
+
+    def __init__(self, session_factory: Any) -> None:
+        self._session_factory = session_factory
+
+    async def version_with_instrument(self, version_id: Any) -> Any:
+        from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
+            SqlAlchemyLegalCorpusRepository,
+        )
+
+        async with self._session_factory() as session:
+            return await SqlAlchemyLegalCorpusRepository(session).version_with_instrument(
+                version_id
+            )
+
+    async def provisions_for_version(self, version_id: Any) -> Any:
+        from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
+            SqlAlchemyLegalCorpusRepository,
+        )
+
+        async with self._session_factory() as session:
+            return await SqlAlchemyLegalCorpusRepository(
+                session
+            ).provisions_for_version(version_id)
 
 
 def services(request: Request) -> ApplicationServices:
