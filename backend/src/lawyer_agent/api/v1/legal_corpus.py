@@ -58,6 +58,8 @@ _METRIC_ALLOWLIST: dict[str, Any] = {
     "article_count": int,
     "coverage": float,
     "parse_failures": int,
+    "indexed_documents": int,
+    "dimension": int,
 }
 
 
