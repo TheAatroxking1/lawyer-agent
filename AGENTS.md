@@ -343,6 +343,19 @@
   passed + 1 skipped** + 真实 MySQL+Redis 网关全栈 **3 passed 保持**。另尝试
   `docker compose build web`（Vue+Nginx 镜像）仍被 Docker Hub 网络不可达阻塞
   （环境性，仓库内 npm 构建已绿）。
+- 已完成“语料导入发布 CLI（corpus_publish）+ 真实 dataset_v1 跑通”非模型切片
+  （2026-09-10）：导入/发布此前只在服务层与测试、无用户运行入口——新增
+  `backend/src/lawyer_agent/cli/corpus_publish.py`（DOCX→LegalStructureParser→显式
+  元数据映射→受控导入→PROVISION 分块→本地 BGE 分批 embed→OpenSearch k-NN→
+  LegalDatasetIndexPublishService 原子切 alias 并登记 snapshot；重跑幂等 replay、
+  换 alias 生成新快照不动旧索引；坏参数/空文件返回码不写库）与
+  `scripts/make_sample_law_docx.py` 样例生成器；在主库 `lawyer_agent` 上
+  `alembic upgrade head` 成功后真实跑通：imported articles=10 chunks=10 →
+  published index=lawyer_dataset_7791fc0a0c4d alias=dataset_v1
+  indexed_documents=10，OS `/_alias/dataset_v1` 可解析且 _count=10，MySQL
+  snapshot 为 published 且 manifest/质量指标落库（versions=1/provisions=10/
+  chunks=10）；ruff+mypy strict（165 文件）零错；用法与证据见
+  `docs/superpowers/plans/2026-09-10-corpus-publish-cli.md`。
 - 已完成“全栈最终实现交付核验审计”非模型轮（2026-09-10 主线收尾）：逐项对照
   主目标列清单并复核证据（key 配置底座 / DeepSeek chat provider+chat_stream 经
   ModelGateway / /legal/chat 与 /legal/chat/stream SSE / Vue3 全前端面（登录·语料
