@@ -75,6 +75,23 @@ export interface ProvisionSummary {
   full_text: string
 }
 
+// POST /api/v1/legal/chat (backend/api/v1/legal_chat.py)
+export interface ChatMessageInput {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatUsage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+}
+
+export interface ChatReply {
+  text: string
+  usage: ChatUsage
+}
+
 // Problem Details body produced by backend/api/errors.py
 export interface ProblemErrors {
   field?: string

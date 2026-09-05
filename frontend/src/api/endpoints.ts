@@ -5,6 +5,8 @@ import type { ApiClient } from './client'
 import { queryString } from './client'
 import type {
   AccessTokenResponse,
+  ChatMessageInput,
+  ChatReply,
   InstrumentListQuery,
   InstrumentPage,
   InstrumentSummary,
@@ -76,4 +78,14 @@ export async function listProvisionsForVersion(
   return client.request<ProvisionSummary[]>(
     `/legal/versions/${encodeURIComponent(versionId)}/provisions`,
   )
+}
+
+export async function chat(
+  client: ApiClient,
+  messages: ChatMessageInput[],
+): Promise<ChatReply> {
+  return client.request<ChatReply>('/legal/chat', {
+    method: 'POST',
+    body: { messages },
+  })
 }

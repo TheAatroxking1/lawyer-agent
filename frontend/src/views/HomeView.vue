@@ -13,7 +13,7 @@
       </RouterLink>
       <RouterLink class="card" to="/chat">
         <h2>法规对话</h2>
-        <p>基于 DeepSeek 的公共问答（配置 API Key 后可用），流式问答界面随后续切片接入。</p>
+        <p>基于 DeepSeek 的公共问答，多轮会话（配置 API Key 后可用）。</p>
       </RouterLink>
       <div class="card muted">
         <h2>更多能力</h2>
