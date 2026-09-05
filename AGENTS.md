@@ -160,8 +160,19 @@
   （法规·版本·条号·全文·来源·数据集）+usage；错误族引导
   （retrieval_qa_unavailable/dataset_not_published/provider 系列）；
   「重新提问」；vitest 31/31（新增 askQuestion 断言）+ typecheck 0 + build
-  分包（AskView gzip 2.4 kB）。AskView 接 SSE 流、上传下载、Nginx 入 compose
-  仍为后续。
+  分包（AskView gzip 2.4 kB）。AskView 已接 SSE（见下条）、上传下载、Nginx
+  入 compose 仍为后续。
+- 已完成“前端消费检索问答 SSE”非模型切片（2026-09-10 计划）：后端 SSE
+  端点就绪但前端仍走一次性 POST——`lib/sse.ts` 框架无关解析
+  `parseSseBlock/parseSseStream`（event/多条 data 行 \n 拼接/忽略注释/空行分
+  帧/\r\n 兼容）；`api/sse.ts` `askQuestionStream(input, signal?)` →
+  AsyncIterable{event,data}（POST /legal/questions/stream，Bearer 注入、
+  reader+TextDecoder 增量按 `\n\n` 分帧解析 JSON、非 2xx 解析 Problem → 抛
+  ApiError、finally releaseLock）；`AskView` 改为流式消费：answer 事件渲染
+  （与卡片/拒答共用 UI）、error 事件构造 ApiError 走既有引导、done 结束、
+  searching 阶段提示；验证 typecheck 0 + vitest 38/38（新增 sse 解析 7 项）
+  + build（AskView gzip 3.1 kB）；真实逐 token 流待 provider chat_stream
+  后置。上传下载、Nginx 入 compose 仍为后续。
 - 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
   （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
   MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
