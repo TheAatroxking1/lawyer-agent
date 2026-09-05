@@ -152,7 +152,26 @@
   拒答文案确定性中文；15 项离线单测（allowed 全链/解析/五类引用拒答/解析
   失败/no_evidence 零调用/网关上抛/非法输入族/prompt 顺序·截断·预算）green
   + ruff/mypy 零错 + 全 unit **1105 passed + 1 skipped**；无 Schema/DB 改动。
-  检索问答 HTTP/SSE、装配、前端流式界面仍为后续。
+  检索问答 HTTP 端点已完成（见下条）、SSE/装配/前端流式界面仍为后续。
+- 已完成“检索问答 HTTP API”非模型切片（2026-09-10 计划）：编排服务就绪
+  但无 HTTP 面——新增 `POST /api/v1/legal/questions`（登录账号）：body 严格
+  `{question 非空≤4000, alias 默认 dataset_v1 白名单 [a-zA-Z0-9_.-]{1,64},
+  target_date? 默认今日 UTC, version_id?}`；响应
+  `LegalRetrievalReply{refused, reason, text, usage?, citations[]}`，
+  citation 白名单投影仅 evidence_id/instrument_title/version_label/
+  provision_no/provision_text/source_ref/dataset_version 七字段；错误映射
+  （服务缺失 503 `retrieval_qa_unavailable`、`LegalDatasetNotPublished` 503
+  `legal_dataset_not_published`、网关 timeout 504/unavailable 503/其余 502、
+  ValueError 422）；`ApplicationServices.legal_retrieval_qa_http` 默认 None +
+  `_build_legal_retrieval_qa_http_service` 占位（注明配置面未就绪不伪造）；
+  编排微调：embed model_ref/dimension 收敛为组合层默认
+  （DEFAULT_EMBED_MODEL_REF/DIMENSION，客户端不可指定）、claims chat 固定
+  `CHAT_MODEL_REF=deepseek-chat`（不再误传 embed model_ref 给 chat 网关）；
+  验证 ruff+mypy strict（162 文件）零错、15 项编排单测仍绿 + **6 项真实
+  MySQL+Redis 全栈 HTTP**（未认证 401、默认装配 503、fake allowed 200 含
+  白名单键集、refusal no_evidence 稳定、504/503/503 三错误码、空白/坏
+  alias/未知键 422）；生产装配（Settings 补 opensearch/embedding 配置面全
+  链）、SSE 流式问答、前端问答页仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
