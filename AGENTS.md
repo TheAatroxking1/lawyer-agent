@@ -172,7 +172,20 @@
   （与卡片/拒答共用 UI）、error 事件构造 ApiError 走既有引导、done 结束、
   searching 阶段提示；验证 typecheck 0 + vitest 38/38（新增 sse 解析 7 项）
   + build（AskView gzip 3.1 kB）；真实逐 token 流待 provider chat_stream
-  后置。上传下载、Nginx 入 compose 仍为后续。
+  后置。上传下载仍为后续。
+- 已完成“Web 服务并入 Compose（Vue 静态托管 + Nginx 反代 API）”部署切片
+  （2026-09-10 计划）：spec 默认栈含 Vue/Nginx——新增 `frontend/nginx/
+  nginx.conf`（listen 8080、SPA fallback、/assets 长缓存、`/api/` 反代
+  api:8000（HTTP/1.1 + X-Forwarded-*、proxy_buffering off 透传 SSE、
+  read_timeout 120s、client_max_body_size 25m）、/health/ready 反代、gzip）、
+  `frontend/Dockerfile`（node:22-alpine `npm ci && npm run build` →
+  `nginxinc/nginx-unprivileged:1.27-alpine` 非 root 运行）与 .dockerignore；
+  `deploy/compose.yaml` 增 `web` 服务（context ../frontend、ports
+  127.0.0.1:8080:8080、depends_on api healthy、read_only + tmpfs /tmp 与
+  /var/cache/nginx + no-new-privileges、wget healthcheck）并把
+  `http://localhost:8080` 加入 api 默认可信源；验证 `docker compose config
+  --quiet` 通过；镜像 build 因本机 Docker Hub 拉取不可达未能在本会话完成
+  （仓库内 npm 构建已绿，网络恢复后复跑 build）。上传下载页面仍为后续。
 - 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
   （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
   MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
