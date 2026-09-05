@@ -170,8 +170,27 @@
   验证 ruff+mypy strict（162 文件）零错、15 项编排单测仍绿 + **6 项真实
   MySQL+Redis 全栈 HTTP**（未认证 401、默认装配 503、fake allowed 200 含
   白名单键集、refusal no_evidence 稳定、504/503/503 三错误码、空白/坏
-  alias/未知键 422）；生产装配（Settings 补 opensearch/embedding 配置面全
-  链）、SSE 流式问答、前端问答页仍为后续。
+  alias/未知键 422）；SSE 流式问答、前端问答页仍为后续。
+- 已完成“检索问答生产装配（全链组合 + opensearch_url 配置面）”非模型
+  切片（2026-09-10 计划）：端点/编排就绪但装配返回 None 永久 503——
+  `config.py` 增 `opensearch_url`（默认 http://127.0.0.1:9200，pattern
+  `^https?://[^\s]+$`；embed model_ref/dimension 沿用编排组合层默认常量不
+  重复配置面）；`api/dependencies.py` `_build_legal_retrieval_qa_http_service
+  (settings, session_factory)`：deepseek key 或 opensearch_url 缺失 → None
+  （503 兜底不变），齐全 → 装配 `LocalSentenceTransformerEmbeddingProvider
+  (DEFAULT_EMBED_MODEL_REF)→ModelGateway(embed)` + `OpenSearchRestClient` +
+  `LegalDatasetAliasService` + `LegalHybridSearchService` +
+  `LegalDatasetSearchService` + `LegalEvidenceAssemblyService` +
+  `LegalDatasetEvidenceService` + DeepSeek chat ModelGateway → 返回
+  `LegalRetrievalQaService`（构造全惰性：零网络/零模型加载）；新增
+  `_LegalEvidenceAssemblyQueryAdapter(session_factory)`（每次独立会话委托
+  `SqlAlchemyLegalCorpusRepository.version_with_instrument/
+  provisions_for_version`）；协议修正 `_EvidenceAssemblyPort.assemble`
+  参数 object → `Sequence[LegalSearchHit]`（mypy strict 兼容真实实现）；
+  验证 ruff+mypy（162 文件）零错 + 3 项装配单测（无 key/无 url → None、
+  齐全可构造且 session_factory 零调用）+ 全 unit + 检索问答全栈合计
+  **1114 passed + 1 skipped**；真实运行前提：本地 embedding 权重 + OS 在线
+  + dataset_v1 已发布 + DeepSeek key。SSE 流式问答、前端问答页仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
