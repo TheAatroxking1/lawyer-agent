@@ -8,6 +8,7 @@ injectable so the adapter can be unit-tested offline without loading a model.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -31,7 +32,9 @@ class LocalSentenceTransformerEmbeddingProvider(ModelProviderPort):
     The model is loaded lazily on the first embed call. Only the ``encode``
     behaviour is required, so tests can inject a fake encoder; a missing
     dependency or weight failure surfaces as ``ModelProviderUnavailable`` and is
-    never fabricated into a result.
+    never fabricated into a result. Vectors are L2-normalised by default so the
+    OpenSearch ``l2`` k-NN space ranks by cosine — the retrieval convention for
+    BGE and Yuan embeddings.
     """
 
     def __init__(
@@ -39,11 +42,15 @@ class LocalSentenceTransformerEmbeddingProvider(ModelProviderPort):
         *,
         model_name_or_path: str,
         encode: _EncodeCallable | None = None,
+        normalize_embeddings: bool = True,
     ) -> None:
         if not isinstance(model_name_or_path, str) or not model_name_or_path.strip():
             raise ValueError("embedding model name or path must be non-empty")
+        if not isinstance(normalize_embeddings, bool):
+            raise ValueError("normalize_embeddings must be boolean")
         self._model_name_or_path = model_name_or_path
         self._encode = encode
+        self._normalize = normalize_embeddings
         self._loaded: Any | None = None
 
     def _encoder(self) -> _EncodeCallable:
@@ -88,6 +95,10 @@ class LocalSentenceTransformerEmbeddingProvider(ModelProviderPort):
         vectors: list[EmbeddingVector] = []
         for row in encoded:
             values = tuple(float(value) for value in row)
+            if self._normalize:
+                norm = math.sqrt(sum(value * value for value in values))
+                if norm > 0.0:
+                    values = tuple(value / norm for value in values)
             vectors.append(
                 EmbeddingVector(values=values, dimension=len(values))
             )

@@ -108,11 +108,11 @@ class Settings(BaseSettings):
         default="http://127.0.0.1:9200", pattern=r"^https?://[^\s]+$"
     )
     embedding_model_ref: str = Field(
-        default="BAAI/bge-small-zh-v1.5",
+        default="IEITYuan/Yuan-embedding-2.0-zh",
         description="语料向量化 embedding 模型（发布与检索必须一致）",
     )
     embedding_dimension: int = Field(
-        default=512,
+        default=1792,
         description="embedding 输出维度（与模型及已发布索引一致）",
     )
     database_pool_size: int = Field(default=10, gt=0)
