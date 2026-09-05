@@ -104,8 +104,21 @@
   vitest 18 项（Bearer 注入/Problem 映射/401/500 派生/超时 AbortError/
   坏 body 抛 ApiError、session 持久化/空 token/无存储降级、guard 决策矩阵）
   全绿 + `npm run build`（vue-tsc && vite build）产物正常分包；后端零改动。
-  语料详情（版本/条文全文）、法规对话界面与 SSE、上传下载页面、Nginx 托管
-  入 compose 仍为后续。
+  法规对话界面与 SSE、上传下载页面、Nginx 托管入 compose 仍为后续。
+- 已完成“法规语料详情页（版本清单 + 条文全文）”非模型切片
+  （2026-09-10 计划）：骨架只交付语料目录、行不可点——`frontend/`
+  补详情读链路：`types.ts` 镜像 `LegalVersionSummary`/`ProvisionSummary`
+  契约并修正 `InstrumentSummary.region_code` 可空；`endpoints.ts` 增
+  getInstrument/listVersionsForInstrument/getVersion/
+  listProvisionsForVersion（id encodeURIComponent）；`lib/format.ts` 纯展示
+  `versionStatusLabel`（current→现行/repealed→已废止/historical→历史版本/
+  status_unknown→状态未知/未知原样）与 `isoDate`（截取/空值安全）；
+  `CorpusInstrumentView` 详情页（/corpus/:instrumentId）：身份头、版本胶囊
+  （服务端 newest-first 默认首个）、选中版本元数据白名单 dl、条文全文有序
+  列表；目录行改 RouterLink；错误统一 ErrorNote；vitest +7 项合计
+  **25/25 绿**（endpoints 路径组/format）+ typecheck 0 错误 + build 分包
+  （详情页 gzip 1.8 kB）；后端零改动。法规对话界面与 SSE、上传下载页面、
+  Nginx 托管入 compose 仍为后续。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
