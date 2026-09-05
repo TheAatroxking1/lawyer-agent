@@ -297,8 +297,18 @@ class MCPClientGateway:
         return True
 
     def specs(self) -> tuple[ToolSpec, ...]:
-        """Read-only projection of the tools an agent may currently call."""
-        return self._registry.specs()
+        """Read-only projection of the tools callers may currently invoke.
+
+        When an allowlist is configured only the allowed subset is shown, so
+        callers never learn about registry tools that are not enabled for them.
+        """
+        if self._allowlist is None:
+            return self._registry.specs()
+        return tuple(
+            spec
+            for spec in self._registry.specs()
+            if spec.name in self._allowlist
+        )
 
     def call(self, name: str, args: Any) -> ToolResult:
         started = time.perf_counter()

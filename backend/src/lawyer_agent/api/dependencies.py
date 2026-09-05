@@ -718,7 +718,18 @@ def _build_mcp_gateway_http_service(session_factory: Any) -> Any:
         },
         handler=_list_provisions,
     )
-    return MCPClientGateway(registry)
+    # Explicit allowlist: exactly these five tools may ever run. The registry
+    # stays the closed set of known tools; widening what an agent may call is a
+    # deliberate act of extending this tuple, never an automatic consequence of
+    # registering another tool.
+    allowlist = (
+        "meta.list_tools",
+        "corpus.instruments_search",
+        "corpus.instrument_get",
+        "corpus.versions_list",
+        "corpus.provisions_list",
+    )
+    return MCPClientGateway(registry, allowlist=allowlist)
 
 
 def services(request: Request) -> ApplicationServices:
