@@ -169,6 +169,21 @@ def test_meta_list_tools_is_registered_when_empty_and_works() -> None:
     assert names == ["meta.list_tools"]
 
 
+def test_gateway_specs_project_only_allowed_tools_when_allowlist_is_set() -> None:
+    registry = AllowedToolRegistry()
+    registry.register(
+        name="corpus.read",
+        description="read",
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda args: None,
+    )
+    gateway = MCPClientGateway(registry, allowlist=["meta.list_tools"])
+    names = [spec.name for spec in gateway.specs()]
+    assert names == ["meta.list_tools"]
+    assert gateway.allowed("meta.list_tools") is True
+    assert gateway.allowed("corpus.read") is False
+
+
 def test_specs_are_sorted_by_name() -> None:
     registry = AllowedToolRegistry()
     registry.register(
