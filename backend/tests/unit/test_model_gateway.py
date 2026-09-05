@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
@@ -31,6 +31,10 @@ class MemoryRecorder:
         self.records.append(record)
 
 
+def _chat() -> tuple[ChatMessage, ...]:
+    return (ChatMessage(role="user", content="q"),)
+
+
 class DeterministicProvider:
     """Synthetic provider for gateway tests (project-interface compliant)."""
 
@@ -40,17 +44,24 @@ class DeterministicProvider:
         fail_embed: Exception | None = None,
         fail_rerank: Exception | None = None,
         fail_chat: Exception | None = None,
+        fail_chat_stream: Exception | None = None,
         bad_dimension: bool = False,
         empty_chat: bool = False,
+        empty_chat_stream: bool = False,
+        mid_chat_stream_error: bool = False,
     ) -> None:
         self.fail_embed = fail_embed
         self.fail_rerank = fail_rerank
         self.fail_chat = fail_chat
+        self.fail_chat_stream = fail_chat_stream
         self.bad_dimension = bad_dimension
         self.empty_chat = empty_chat
+        self.empty_chat_stream = empty_chat_stream
+        self.mid_chat_stream_error = mid_chat_stream_error
         self.embed_timeout = 0.0
         self.rerank_timeout = 0.0
         self.chat_timeout = 0.0
+        self.chat_stream_timeout = 0.0
 
     async def embed(
         self,
@@ -101,6 +112,22 @@ class DeterministicProvider:
         if self.empty_chat:
             return "", TokenUsage()
         return "法律问答占位回复", TokenUsage(prompt_tokens=10, completion_tokens=5)
+
+    async def chat_stream(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        timeout_seconds: float,
+    ) -> AsyncIterator[str]:
+        self.chat_stream_timeout = timeout_seconds
+        if self.fail_chat_stream is not None:
+            raise self.fail_chat_stream
+        if self.empty_chat_stream:
+            return
+        yield "你"
+        if self.mid_chat_stream_error:
+            raise RuntimeError("stream broke mid-way")
+        yield "好"
 
 
 def _gateway(
@@ -215,6 +242,130 @@ async def test_gateway_failure_record_and_success_record_both_counted() -> None:
         await gateway.rerank(model_ref="reranker", query="q", documents=["d"])
     await gateway.embed(model_ref="m", texts=["ok"], dimension=4)
     assert [record.status for record in recorder.records] == ["error", "success"]
+
+
+async def _collect_stream(stream: AsyncIterator[str]) -> list[str]:
+    return [text async for text in stream]
+
+
+class EmbedOnlyProvider:
+    """Runtime-valid provider without chat_stream capability."""
+
+    async def embed(
+        self,
+        *,
+        texts: Sequence[str],
+        dimension: int,
+        timeout_seconds: float,
+    ) -> tuple[EmbeddingVector, ...]:
+        del texts, dimension, timeout_seconds
+        return ()
+
+
+async def test_gateway_chat_stream_success_records_call_and_forwards_deltas() -> None:
+    provider = DeterministicProvider()
+    recorder = MemoryRecorder()
+    gateway = _gateway(provider, recorder)
+    deltas = await _collect_stream(
+        gateway.chat_stream(
+            model_ref="deepseek",
+            messages=[ChatMessage(role="user", content="继续")],
+        )
+    )
+    assert deltas == ["你", "好"]
+    assert provider.chat_stream_timeout == 12.5
+    assert len(recorder.records) == 1
+    record = recorder.records[0]
+    assert record.operation is ModelOperation.CHAT_STREAM
+    assert record.model_ref == "deepseek"
+    assert record.status == "success"
+    assert record.usage is None
+
+
+async def test_gateway_chat_stream_requires_stream_capable_provider() -> None:
+    recorder = MemoryRecorder()
+    gateway = ModelGateway(EmbedOnlyProvider(), recorder)
+    with pytest.raises(ModelProviderUnavailable, match="streaming"):
+        await _collect_stream(
+            gateway.chat_stream(
+                model_ref="deepseek",
+                messages=[ChatMessage(role="user", content="q")],
+            )
+        )
+    assert recorder.records == []
+
+
+async def test_gateway_chat_stream_validates_inputs_before_any_call() -> None:
+    provider = DeterministicProvider()
+    recorder = MemoryRecorder()
+    gateway = _gateway(provider, recorder)
+    with pytest.raises(ModelInputInvalid):
+        await _collect_stream(gateway.chat_stream(model_ref="  ", messages=_chat()))
+    with pytest.raises(ModelInputInvalid):
+        await _collect_stream(gateway.chat_stream(model_ref="m", messages=()))
+    with pytest.raises(ModelInputInvalid):
+        await _collect_stream(
+            gateway.chat_stream(model_ref="m", messages=("raw",))  # type: ignore[arg-type]
+        )
+    assert recorder.records == []
+
+
+async def test_gateway_chat_stream_empty_stream_is_invalid_response() -> None:
+    provider = DeterministicProvider(empty_chat_stream=True)
+    recorder = MemoryRecorder()
+    gateway = _gateway(provider, recorder)
+    with pytest.raises(ModelProviderInvalidResponse, match="no text"):
+        await _collect_stream(
+            gateway.chat_stream(
+                model_ref="deepseek",
+                messages=[ChatMessage(role="user", content="q")],
+            )
+        )
+    assert recorder.records[0].operation is ModelOperation.CHAT_STREAM
+    assert recorder.records[0].status == "error"
+
+
+async def test_gateway_chat_stream_mid_stream_failure_maps_and_records_error() -> None:
+    provider = DeterministicProvider(mid_chat_stream_error=True)
+    recorder = MemoryRecorder()
+    gateway = _gateway(provider, recorder)
+    collected: list[str] = []
+    with pytest.raises(ModelProviderUnavailable, match="failed"):
+        async for text in gateway.chat_stream(
+            model_ref="deepseek",
+            messages=[ChatMessage(role="user", content="q")],
+        ):
+            collected.append(text)
+    assert collected == ["你"]
+    assert len(recorder.records) == 1
+    assert recorder.records[0].operation is ModelOperation.CHAT_STREAM
+    assert recorder.records[0].status == "error"
+
+
+async def test_gateway_chat_stream_maps_provider_errors_and_timeouts() -> None:
+    provider = DeterministicProvider(fail_chat_stream=RuntimeError("down"))
+    recorder = MemoryRecorder()
+    gateway = _gateway(provider, recorder)
+    with pytest.raises(ModelProviderUnavailable):
+        await _collect_stream(
+            gateway.chat_stream(
+                model_ref="deepseek",
+                messages=[ChatMessage(role="user", content="q")],
+            )
+        )
+    assert recorder.records[0].status == "error"
+
+    timed = DeterministicProvider(fail_chat_stream=TimeoutError())
+    timed_recorder = MemoryRecorder()
+    timed_gateway = _gateway(timed, timed_recorder)
+    with pytest.raises(ModelProviderTimeout):
+        await _collect_stream(
+            timed_gateway.chat_stream(
+                model_ref="deepseek",
+                messages=[ChatMessage(role="user", content="q")],
+            )
+        )
+    assert timed_recorder.records[0].status == "error"
 
 
 def test_call_limits_validate_fields() -> None:

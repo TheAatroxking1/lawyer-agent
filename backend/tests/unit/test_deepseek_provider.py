@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -64,6 +65,20 @@ def _messages() -> tuple[ChatMessage, ...]:
         ChatMessage(role="system", content="你是法律助手。"),
         ChatMessage(role="user", content="违约金怎么计算？"),
     )
+
+
+def _stream_body(*chunks: object) -> str:
+    lines = ["data: " + json.dumps(chunk) for chunk in chunks]
+    lines.append("data: [DONE]")
+    return "\n\n".join(lines) + "\n\n"
+
+
+def _delta_chunk(content: str) -> dict[str, object]:
+    return {"choices": [{"delta": {"content": content}}]}
+
+
+async def _collect(stream: AsyncIterator[str]) -> list[str]:
+    return [text async for text in stream]
 
 
 def test_chat_posts_openai_compatible_request_and_parses_reply() -> None:
@@ -232,5 +247,141 @@ def test_gateway_chat_failure_records_error_without_code_leak() -> None:
         asyncio.run(gateway.chat(model_ref=_MODEL, messages=_messages()))
     assert len(recorder.records) == 1
     assert recorder.records[0].operation is ModelOperation.CHAT
+    assert recorder.records[0].status == "error"
+
+
+def test_chat_stream_posts_stream_request_and_yields_text_deltas() -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers.get("authorization")
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            text=_stream_body(
+                {"choices": [{"delta": {"role": "assistant", "content": ""}}]},
+                _delta_chunk("你"),
+                _delta_chunk("好"),
+                {"choices": [{"delta": {"content": ""}, "finish_reason": "stop"}]},
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    provider = _provider(handler)
+    deltas = asyncio.run(_collect(provider.chat_stream(messages=_messages(), timeout_seconds=9.5)))
+    assert deltas == ["你", "好"]
+    assert captured["url"] == f"{_BASE}/chat/completions"
+    assert captured["auth"] == f"Bearer {_API_KEY}"
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["model"] == _MODEL
+    assert body["stream"] is True
+    assert body["messages"] == [
+        {"role": "system", "content": "你是法律助手。"},
+        {"role": "user", "content": "违约金怎么计算？"},
+    ]
+
+
+def test_chat_stream_skips_empty_role_only_frames() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = _stream_body(_delta_chunk("有"), {"choices": []}, _delta_chunk("据"))
+        return httpx.Response(200, text=body)
+
+    provider = _provider(handler)
+    deltas = asyncio.run(_collect(provider.chat_stream(messages=_messages(), timeout_seconds=5.0)))
+    assert deltas == ["有", "据"]
+
+
+def test_chat_stream_rejects_empty_or_untyped_messages_without_request() -> None:
+    sent: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, text=_stream_body(_delta_chunk("x")))
+
+    provider = _provider(handler)
+    with pytest.raises(ModelInputInvalid, match="non-empty"):
+        asyncio.run(_collect(provider.chat_stream(messages=(), timeout_seconds=5.0)))
+    with pytest.raises(ModelInputInvalid, match="strongly typed"):
+        asyncio.run(
+            _collect(provider.chat_stream(messages=("raw",), timeout_seconds=5.0))  # type: ignore[arg-type]
+        )
+    assert sent == []
+
+
+def test_chat_stream_maps_http_error_and_timeout_without_leaking_key() -> None:
+    async def unauthorized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="invalid api key secret")
+
+    provider = _provider(unauthorized)
+    with pytest.raises(ModelProviderUnavailable) as raised:
+        asyncio.run(_collect(provider.chat_stream(messages=_messages(), timeout_seconds=5.0)))
+    assert "401" in str(raised.value)
+    assert _API_KEY not in str(raised.value)
+    assert "invalid api key" not in str(raised.value)
+
+    async def timed_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    with pytest.raises(ModelProviderTimeout):
+        asyncio.run(
+            _collect(_provider(timed_out).chat_stream(messages=_messages(), timeout_seconds=1.0))
+        )
+
+
+def test_chat_stream_rejects_malformed_or_invalid_frames() -> None:
+    cases = (
+        "not-json",
+        json.dumps({"usage": {}}),  # missing choices key entirely -> invalid
+        json.dumps({"choices": [{"delta": "oops"}]}),
+        json.dumps({"choices": ["not-an-object"]}),
+    )
+
+    for raw in cases:
+        body = "data: " + raw + "\n\ndata: [DONE]\n\n"
+
+        async def handler(
+            request: httpx.Request, body: str = body
+        ) -> httpx.Response:
+            return httpx.Response(200, text=body)
+
+        provider = _provider(handler)
+        with pytest.raises(ModelProviderInvalidResponse):
+            asyncio.run(_collect(provider.chat_stream(messages=_messages(), timeout_seconds=5.0)))
+
+
+def test_gateway_chat_stream_records_success_without_usage() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=_stream_body(_delta_chunk("你"), _delta_chunk("好")),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    recorder = _MemoryRecorder()
+    gateway = ModelGateway(_provider(handler), recorder)
+    deltas = asyncio.run(
+        _collect(gateway.chat_stream(model_ref=_MODEL, messages=_messages()))
+    )
+    assert deltas == ["你", "好"]
+    assert len(recorder.records) == 1
+    assert recorder.records[0].operation is ModelOperation.CHAT_STREAM
+    assert recorder.records[0].status == "success"
+    assert recorder.records[0].usage is None
+
+
+def test_gateway_chat_stream_failure_records_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    recorder = _MemoryRecorder()
+    gateway = ModelGateway(_provider(handler), recorder)
+    with pytest.raises(ModelProviderUnavailable):
+        asyncio.run(
+            _collect(gateway.chat_stream(model_ref=_MODEL, messages=_messages()))
+        )
+    assert len(recorder.records) == 1
+    assert recorder.records[0].operation is ModelOperation.CHAT_STREAM
     assert recorder.records[0].status == "error"
 
