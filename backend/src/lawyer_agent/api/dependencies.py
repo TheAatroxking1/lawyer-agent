@@ -511,26 +511,92 @@ class _LegalEvidenceAssemblyQueryAdapter:
             ).provisions_for_version(version_id)
 
 
+def _corpus_instrument_payload(instrument: Any) -> dict[str, Any]:
+    """Whitelisted public instrument identity (never tenant-private data)."""
+    return {
+        "id": str(instrument.id),
+        "title": instrument.title,
+        "issuing_authority": instrument.issuing_authority,
+        "jurisdiction": instrument.jurisdiction,
+        "region_code": instrument.region_code,
+    }
+
+
+def _corpus_version_payload(version: Any) -> dict[str, Any]:
+    """Whitelisted version metadata (mirrors LegalVersionSummary fields)."""
+    return {
+        "id": str(version.id),
+        "version_label": version.version_label,
+        "status": version.status.value,
+        "published_on": (
+            version.published_on.isoformat() if version.published_on is not None else None
+        ),
+        "effective_on": (
+            version.effective_on.isoformat() if version.effective_on is not None else None
+        ),
+        "repealed_on": (
+            version.repealed_on.isoformat() if version.repealed_on is not None else None
+        ),
+        "law_number": version.law_number,
+        "dataset_version": version.dataset_version,
+        "parser_version": version.parser_version,
+    }
+
+
+def _corpus_provision_payload(provision: Any) -> dict[str, Any]:
+    """Whitelisted provision text (mirrors ProvisionSummary fields)."""
+    return {
+        "id": str(provision.id),
+        "provision_no": provision.provision_no,
+        "level": provision.level.value,
+        "structure_path": list(provision.structure_path),
+        "title": provision.title,
+        "full_text": provision.full_text,
+    }
+
+
 def _build_mcp_gateway_http_service(session_factory: Any) -> Any:
     """Composition root for the controlled agent tool gateway (no external
     MCP server; only tools registered here may ever run). Registers the public
-    corpus search as a real agent tool backed by the same read service the
-    corpus HTTP endpoints use."""
+    corpus read/search tools backed by the same read service the corpus HTTP
+    endpoints use, so an agent can search the catalogue and then read an
+    instrument, its versions and their provisions end to end."""
 
-    async def _corpus_instruments_search(args: dict[str, Any]) -> object:
-        from lawyer_agent.application.legal_corpus_read import (
-            LegalCorpusQueryService,
-        )
-        from lawyer_agent.infrastructure.persistence.legal_corpus_read_uow import (
-            SqlAlchemyLegalCorpusReadUnitOfWork,
-        )
+    from uuid import UUID as UuidType
 
-        limit = int(args.get("limit", 20))
-        title = args.get("title")
-        service = LegalCorpusQueryService(
+    from lawyer_agent.application.legal_corpus_read import (
+        LegalCorpusInstrumentNotFound,
+        LegalCorpusQueryService,
+        LegalCorpusVersionNotFound,
+    )
+    from lawyer_agent.application.mcp_gateway import (
+        AllowedToolRegistry,
+        MCPClientGateway,
+        MCPGatewayError,
+    )
+    from lawyer_agent.domain.common import require_uuid7
+    from lawyer_agent.infrastructure.persistence.legal_corpus_read_uow import (
+        SqlAlchemyLegalCorpusReadUnitOfWork,
+    )
+
+    def _service() -> LegalCorpusQueryService:
+        return LegalCorpusQueryService(
             lambda: SqlAlchemyLegalCorpusReadUnitOfWork(session_factory)
         )
-        instruments = await service.instruments(
+
+    def _uuid_arg(args: dict[str, Any], key: str) -> UUID:
+        raw = args[key]
+        try:
+            return require_uuid7(UuidType(str(raw).strip()), field=key)
+        except (ValueError, TypeError) as exc:
+            raise MCPGatewayError(
+                "invalid_arguments", f"{key} 必须是 UUID7 字符串"
+            ) from exc
+
+    async def _search_instruments(args: dict[str, Any]) -> object:
+        limit = int(args.get("limit", 20))
+        title = args.get("title")
+        instruments = await _service().instruments(
             limit=limit,
             before_id=None,
             title=title if isinstance(title, str) and title.strip() else None,
@@ -538,18 +604,57 @@ def _build_mcp_gateway_http_service(session_factory: Any) -> Any:
             jurisdiction=None,
             region_code=None,
         )
-        return [
-            {
-                "id": str(item.id),
-                "title": item.title,
-                "issuing_authority": item.issuing_authority,
-                "jurisdiction": item.jurisdiction,
-                "region_code": item.region_code,
-            }
-            for item in instruments
-        ]
+        return [_corpus_instrument_payload(item) for item in instruments]
 
-    from lawyer_agent.application.mcp_gateway import AllowedToolRegistry, MCPClientGateway
+    async def _get_instrument(args: dict[str, Any]) -> object:
+        instrument_id = _uuid_arg(args, "instrument_id")
+        try:
+            instrument = await _service().instrument(instrument_id=instrument_id)
+        except LegalCorpusInstrumentNotFound:
+            return {"found": False, "instrument": None}
+        return {"found": True, "instrument": _corpus_instrument_payload(instrument)}
+
+    async def _list_versions(args: dict[str, Any]) -> object:
+        instrument_id = _uuid_arg(args, "instrument_id")
+        service = _service()
+        try:
+            instrument = await service.instrument(instrument_id=instrument_id)
+            versions = await service.versions_for_instrument(
+                instrument_id=instrument_id
+            )
+        except LegalCorpusInstrumentNotFound:
+            return {
+                "found": False,
+                "instrument": None,
+                "version_count": 0,
+                "versions": [],
+            }
+        return {
+            "found": True,
+            "instrument": _corpus_instrument_payload(instrument),
+            "version_count": len(versions),
+            "versions": [_corpus_version_payload(version) for version in versions],
+        }
+
+    async def _list_provisions(args: dict[str, Any]) -> object:
+        version_id = _uuid_arg(args, "version_id")
+        service = _service()
+        try:
+            version = await service.version(version_id=version_id)
+        except LegalCorpusVersionNotFound:
+            return {
+                "found": False,
+                "version": None,
+                "provision_count": 0,
+                "provisions": [],
+            }
+        provisions = await service.provisions_for_version(version_id=version_id)
+        return {
+            "found": True,
+            "version": _corpus_version_payload(version),
+            "provision_count": len(provisions),
+            "provisions": [_corpus_provision_payload(item) for item in provisions],
+        }
 
     registry = AllowedToolRegistry()
     registry.register(
@@ -563,7 +668,55 @@ def _build_mcp_gateway_http_service(session_factory: Any) -> Any:
             },
             "additionalProperties": False,
         },
-        handler=_corpus_instruments_search,
+        handler=_search_instruments,
+    )
+    registry.register(
+        name="corpus.instrument_get",
+        description="按 instrument_id 读取单部公共法规的身份元数据",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "instrument_id": {
+                    "type": "string",
+                    "description": "法规 UUID7（来自 instruments_search 输出的 id）",
+                },
+            },
+            "required": ["instrument_id"],
+            "additionalProperties": False,
+        },
+        handler=_get_instrument,
+    )
+    registry.register(
+        name="corpus.versions_list",
+        description="按 instrument_id 读取一部公共法规的全部版本清单",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "instrument_id": {
+                    "type": "string",
+                    "description": "法规 UUID7（来自 instruments_search 输出的 id）",
+                },
+            },
+            "required": ["instrument_id"],
+            "additionalProperties": False,
+        },
+        handler=_list_versions,
+    )
+    registry.register(
+        name="corpus.provisions_list",
+        description="按 version_id 读取单个公共法规版本的全部条文全文（含条号与结构路径）",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "version_id": {
+                    "type": "string",
+                    "description": "版本 UUID7（来自 versions_list 输出的 id）",
+                },
+            },
+            "required": ["version_id"],
+            "additionalProperties": False,
+        },
+        handler=_list_provisions,
     )
     return MCPClientGateway(registry)
 
