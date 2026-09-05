@@ -136,6 +136,52 @@ export interface SwitchTenantInput {
   membership_id: string
 }
 
+// Tenant matter/document contracts (backend/api/v1/matter_documents.py)
+export type MatterKind = 'contract_review' | 'litigation' | 'legal_advice' | 'compliance' | 'other'
+
+export interface MatterSummary {
+  id: string
+  title: string
+  kind: string
+  status: string
+  description: string | null
+  owner_membership_id: string | null
+  version: number
+}
+
+export interface MatterPage {
+  items: MatterSummary[]
+  next_before_id: string | null
+}
+
+export interface CreateMatterInput {
+  title: string
+  kind: MatterKind
+  description?: string
+}
+
+export interface RegisterDocumentInput {
+  file_name: string
+  mime_type: string
+  payload_b64: string
+}
+
+export interface DocumentSummary {
+  id: string
+  document_id: string
+  version_no: number
+  kind: string
+  file_name: string | null
+  upload_status: string
+  review_status: string | null
+}
+
+export interface DocumentHeaderSummary {
+  id: string
+  display_name: string
+  current_version_no: number
+}
+
 // Problem Details body produced by backend/api/errors.py
 export interface ProblemErrors {
   field?: string
