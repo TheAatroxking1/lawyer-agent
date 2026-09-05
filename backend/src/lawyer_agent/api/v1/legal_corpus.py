@@ -49,6 +49,11 @@ class LegalInstrumentSummary(StrictModel):
     region_code: str | None = None
 
 
+class LegalInstrumentPage(StrictModel):
+    items: list[LegalInstrumentSummary]
+    next_before_id: UUID | None = None
+
+
 class ProvisionSummary(StrictModel):
     id: UUID
     version_id: UUID
@@ -114,6 +119,47 @@ def _version_summary(version: LegalVersion) -> LegalVersionSummary:
         dataset_version=version.dataset_version,
         parser_version=version.parser_version,
     )
+
+
+@router.get(
+    "/instruments",
+    response_model=LegalInstrumentPage,
+)
+async def list_instruments(
+    current: AccountSession,
+    services: Services,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    before_id: Annotated[UUID | None, Query(alias="before_id")] = None,
+    title: Annotated[str | None, Query(max_length=512)] = None,
+    issuing_authority: Annotated[str | None, Query(max_length=256)] = None,
+    jurisdiction: Annotated[str | None, Query(max_length=64)] = None,
+    region_code: Annotated[str | None, Query(max_length=16)] = None,
+) -> LegalInstrumentPage:
+    del current
+    service = _require_service(services)
+    try:
+        instruments = await service.instruments(
+            limit=limit,
+            before_id=before_id,
+            title=title,
+            issuing_authority=issuing_authority,
+            jurisdiction=jurisdiction,
+            region_code=region_code,
+        )
+    except LegalCorpusQueryError as exc:
+        raise _map_error(exc) from None
+    items = [
+        LegalInstrumentSummary(
+            id=instrument.id,
+            title=instrument.title,
+            issuing_authority=instrument.issuing_authority,
+            jurisdiction=instrument.jurisdiction,
+            region_code=instrument.region_code,
+        )
+        for instrument in instruments
+    ]
+    next_cursor = items[-1].id if len(items) == limit else None
+    return LegalInstrumentPage(items=items, next_before_id=next_cursor)
 
 
 @router.get(

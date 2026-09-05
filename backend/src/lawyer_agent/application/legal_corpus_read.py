@@ -12,11 +12,23 @@ from datetime import date
 from typing import Protocol, cast
 from uuid import UUID
 
+from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.legal_corpus import (
     LegalInstrument,
     LegalVersion,
     Provision,
 )
+
+
+def _nonempty_filter(value: str | None, *, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise LegalCorpusInvalidRequest()
+    stripped = value.strip()
+    if len(stripped) > max_chars:
+        raise LegalCorpusInvalidRequest()
+    return stripped
 
 
 class LegalCorpusQueryError(Exception):
@@ -35,6 +47,18 @@ class LegalCorpusInstrumentNotFound(LegalCorpusQueryError):
     status = 404
     code = "legal_corpus_instrument_not_found"
     title = "Legal instrument not found"
+
+
+class LegalCorpusInvalidRequest(LegalCorpusQueryError):
+    status = 422
+    code = "legal_corpus_invalid_request"
+    title = "Legal corpus request is invalid"
+
+
+class LegalCorpusInstrumentCursorInvalid(LegalCorpusQueryError):
+    status = 404
+    code = "legal_corpus_instrument_cursor_invalid"
+    title = "Legal instrument list cursor is invalid"
 
 
 class LegalCorpusQueryPort(Protocol):
@@ -59,6 +83,17 @@ class LegalCorpusQueryPort(Protocol):
     async def version_with_instrument(
         self, version_id: UUID
     ) -> tuple[LegalVersion, LegalInstrument] | None: ...
+
+    async def list_instruments(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+        title: str | None = None,
+        issuing_authority: str | None = None,
+        jurisdiction: str | None = None,
+        region_code: str | None = None,
+    ) -> tuple[LegalInstrument, ...]: ...
 
 
 class LegalCorpusReadUnitOfWorkPort(Protocol):
@@ -116,3 +151,41 @@ class LegalCorpusQueryService:
         if loaded is None:
             raise LegalCorpusVersionNotFound()
         return loaded[0]
+
+    async def instruments(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+        title: str | None = None,
+        issuing_authority: str | None = None,
+        jurisdiction: str | None = None,
+        region_code: str | None = None,
+    ) -> tuple[LegalInstrument, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise LegalCorpusInvalidRequest()
+        if before_id is not None:
+            try:
+                require_uuid7(before_id, field="before_id")
+            except ValueError as exc:
+                raise LegalCorpusInvalidRequest() from exc
+        title_filter = _nonempty_filter(title, max_chars=512)
+        authority_filter = _nonempty_filter(issuing_authority, max_chars=256)
+        jurisdiction_filter = _nonempty_filter(jurisdiction, max_chars=64)
+        region_filter = _nonempty_filter(region_code, max_chars=16)
+        async with cast(LegalCorpusReadUnitOfWorkPort, self._uow_factory()) as uow:
+            from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
+                LegalCorpusInstrumentListCursorInvalid,
+            )
+
+            try:
+                return await uow.corpus.list_instruments(
+                    limit=limit,
+                    before_id=before_id,
+                    title=title_filter,
+                    issuing_authority=authority_filter,
+                    jurisdiction=jurisdiction_filter,
+                    region_code=region_filter,
+                )
+            except LegalCorpusInstrumentListCursorInvalid as exc:
+                raise LegalCorpusInstrumentCursorInvalid() from exc

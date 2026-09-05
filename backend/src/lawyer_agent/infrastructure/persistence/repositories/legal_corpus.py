@@ -5,9 +5,10 @@ from datetime import date
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lawyer_agent.domain.common import require_uuid7
 from lawyer_agent.domain.legal_corpus import (
     ChunkQuality,
     ChunkType,
@@ -63,6 +64,10 @@ class VersionProvisions:
     provisions: tuple[Provision, ...]
 
 
+class LegalCorpusInstrumentListCursorInvalid(ValueError):
+    """A legal instrument list cursor references a row that does not exist."""
+
+
 class LegalCorpusQueryPort(Protocol):
     """Explicit public-read boundary for national legal corpus data."""
 
@@ -83,6 +88,17 @@ class LegalCorpusQueryPort(Protocol):
     async def versions_for_instrument(
         self, instrument_id: UUID
     ) -> tuple[LegalVersion, ...]: ...
+
+    async def list_instruments(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+        title: str | None = None,
+        issuing_authority: str | None = None,
+        jurisdiction: str | None = None,
+        region_code: str | None = None,
+    ) -> tuple[LegalInstrument, ...]: ...
 
 
 class LegalCorpusChunkPort(Protocol):
@@ -220,6 +236,69 @@ class SqlAlchemyLegalCorpusRepository:
             )
         )
         return None if model is None else _to_instrument(model)
+
+    async def list_instruments(
+        self,
+        *,
+        limit: int,
+        before_id: UUID | None = None,
+        title: str | None = None,
+        issuing_authority: str | None = None,
+        jurisdiction: str | None = None,
+        region_code: str | None = None,
+    ) -> tuple[LegalInstrument, ...]:
+        """Keyset list of public legal instruments newest first (created_at, id).
+
+        Optional substring filters (title/issuing_authority) and exact filters
+        (jurisdiction/region_code) narrow the result before ordering. A cursor
+        that does not exist raises ``LegalCorpusInstrumentListCursorInvalid``.
+        """
+        statement = select(LegalInstrumentModel)
+        if title is not None:
+            statement = statement.where(
+                LegalInstrumentModel.title.contains(title)
+            )
+        if issuing_authority is not None:
+            statement = statement.where(
+                LegalInstrumentModel.issuing_authority.contains(issuing_authority)
+            )
+        if jurisdiction is not None:
+            statement = statement.where(
+                LegalInstrumentModel.jurisdiction == jurisdiction
+            )
+        if region_code is not None:
+            statement = statement.where(
+                LegalInstrumentModel.region_code == region_code
+            )
+        if before_id is not None:
+            require_uuid7(before_id, field="before_id")
+            anchor = await self._session.scalar(
+                select(LegalInstrumentModel.created_at).where(
+                    LegalInstrumentModel.id == before_id
+                )
+            )
+            if anchor is None:
+                raise LegalCorpusInstrumentListCursorInvalid(
+                    "instrument list cursor does not exist"
+                )
+            statement = statement.where(
+                or_(
+                    LegalInstrumentModel.created_at < anchor,
+                    and_(
+                        LegalInstrumentModel.created_at == anchor,
+                        LegalInstrumentModel.id < before_id,
+                    ),
+                )
+            )
+        models = (
+            await self._session.scalars(
+                statement.order_by(
+                    LegalInstrumentModel.created_at.desc(),
+                    LegalInstrumentModel.id.desc(),
+                ).limit(limit)
+            )
+        ).all()
+        return tuple(_to_instrument(model) for model in models)
 
     async def versions_for_instrument(
         self, instrument_id: UUID
