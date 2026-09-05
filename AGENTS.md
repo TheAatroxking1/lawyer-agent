@@ -36,6 +36,18 @@
 
 ## 当前阶段
 
+- 用户 2026-09-10 明确转向「全栈最终实现」：DeepSeek API key 由用户自己在
+  JSON 配置文件填写（模板 `deploy/deepseek.config.example.json` 已提交，
+  真实 key 文件 `deploy/deepseek.config.json` 被 .gitignore 忽略、绝不入库）；
+  其余全栈任务由开发者完成：Vue 3 前端骨架（frontend/：路由/登录/语料浏览/
+  对话/上传下载）+ 后端补齐（检索 HTTP、DeepSeek chat provider 经
+  ModelGateway、SSE 问答、MCP 客户端网关白名单化工具、文件上传下载端点）＋
+  真实语料入库/发布编排；embedding/OpenSearch 检索已授权可执行。
+- 已完成“DeepSeek API key JSON 配置底座”（2026-09-10 计划）：`Settings` 增
+  `deepseek_api_key`（可经环境变量或 JSON 文件，repr/exclude 永不泄露）与
+  `deepseek_api_key_file`（绝对路径、常规文件、有界读取、UTF-8 无 NUL、
+  JSON 必须单 `api_key` 字段；文件与值二选一）；16 项单测 green；
+  真实 key 文件由用户填写后生效，后续 DeepSeek provider 切片读取该值。
 - 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
 - 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
 - “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
