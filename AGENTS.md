@@ -213,8 +213,18 @@
   ≤25MB 前置拦截）→ arrayBuffer→base64→registerDocument（后端白名单校验
   201）→ 展示最近登记版本 upload/review 状态与版本列表、分块错误横幅；验证
   typecheck 0 + vitest 40/40 保持 + build（DocumentsView gzip 3.8 kB）。
-  Rule Check 运行/报告下载按钮、案件详情、原始文件下载与 MinIO 预签名仍为
-  后续。
+  Rule Check 报告下载已补（见下条）、运行按钮与案件详情仍为后续；原始文件
+  下载与 MinIO 预签名属既有延后项。
+- 已完成“文档风险项查看与 DOCX 报告下载（工作台内）”非模型切片
+  （2026-09-10 计划）：上传登记后缺风险结果查看与下载——`api/types` 镜像
+  `RiskIssueSummary`；`api/tenant` 增 `listRiskIssues(tenantId, docId)`（GET
+  …/risk-issues）与 `downloadReport`（GET …/report.docx，租户 Bearer、blob
+  返回，非 2xx 抛错）；`DocumentsView` 文档行内 风险项/报告下载 按钮 → 风险
+  内联列表（级别·命中文本·条号·状态）或「暂无风险项」、报告以 objectURL 触发
+  保存、错误横幅与下载中禁用；验证 typecheck 0 + vitest 41/41 + build；后端
+  run→list→report 读回语义已由 Rule Check 全栈覆盖（报告下载仅在运行过检查
+  的文档可用）。「运行检查」需激活规则包+条文输入（租户运营流程）、案件详情
+  仍为后续。
 - 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
   （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
   MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
