@@ -10,12 +10,15 @@ when the model/search prerequisites are not configured the endpoint answers
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
 from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Body
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lawyer_agent.api.dependencies import AccountSession, Services
@@ -154,3 +157,74 @@ async def retrieval_question(
     except Exception as exc:
         raise _map_error(exc) from None
     return _reply(answer)
+
+
+def _event(event: str, payload: dict[str, Any]) -> str:
+    """Serialises one SSE event: ``event: <name>`` + ``data: <json>``."""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _target_date(body: RetrievalQuestionBody) -> date:
+    return body.target_date or datetime.now(UTC).date()
+
+
+async def _answer_event_stream(
+    service: LegalRetrievalQaService,
+    body: RetrievalQuestionBody,
+) -> AsyncIterator[str]:
+    """Stages started -> answer/error -> done over an SSE response.
+
+    Validation and authentication still fail before the stream (normal Problem
+    Details). Runtime provider/search failures are delivered as an ``error``
+    SSE event carrying the same stable status/code/title so the client can map
+    them consistently; the transport itself stays open until ``done``.
+    """
+    yield _event("started", {"question": body.question})
+    try:
+        answer = await service.answer(
+            alias=body.alias,
+            question=body.question,
+            target_date=_target_date(body),
+            version_id=body.version_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - streamed problem mapping
+        mapped = _map_error(exc)
+        yield _event(
+            "error",
+            {
+                "status": mapped.status,
+                "code": mapped.code,
+                "title": mapped.title,
+            },
+        )
+    else:
+        reply = _reply(answer)
+        yield _event("answer", reply.model_dump(mode="json"))
+    finally:
+        yield _event("done", {})
+
+
+@router.post("/questions/stream")
+async def retrieval_question_stream(
+    body: Annotated[RetrievalQuestionBody, Body()],
+    current: AccountSession,
+    services: Services,
+) -> StreamingResponse:
+    del current
+    value = getattr(services, "legal_retrieval_qa_http", None)
+    if value is None:
+        raise ApiProblem(
+            503,
+            "retrieval_qa_unavailable",
+            "Retrieval Q&A is unavailable",
+        )
+    service = cast(LegalRetrievalQaService, value)
+    return StreamingResponse(
+        _answer_event_stream(service, body),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
