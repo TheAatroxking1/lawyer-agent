@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 from base64 import b64encode
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,6 +17,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from alembic import command
+from lawyer_agent.application.legal_chat import LegalChatTimeout
 from lawyer_agent.config import Settings
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import content_sha256
@@ -1056,3 +1058,111 @@ def test_legal_chat_http_without_deepseek_key_over_real_mysql(
             },
         )
         assert unauth.status_code == 401
+
+        # 4. Stream endpoint: unauthenticated -> 401, no key -> 503 before stream.
+        stream_unauth = client.post(
+            f"{base}/chat/stream",
+            json={
+                "messages": [{"role": "user", "content": "x"}]
+            },
+        )
+        assert stream_unauth.status_code == 401
+        stream_no_key = client.post(
+            f"{base}/chat/stream",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "违约金怎么算？"}]
+            },
+        )
+        assert stream_no_key.status_code == 503
+        assert stream_no_key.json()["code"] == "model_provider_unavailable"
+        bad_stream = client.post(
+            f"{base}/chat/stream",
+            headers=headers,
+            json={"messages": [{"role": "admin", "content": "x"}]},
+        )
+        assert bad_stream.status_code == 422
+        empty_stream = client.post(
+            f"{base}/chat/stream",
+            headers=headers,
+            json={"messages": []},
+        )
+        assert empty_stream.status_code == 422
+
+        # 5. Stream endpoint with a stream-capable service -> token deltas over SSE.
+        client.app.state.services.legal_chat_http = _FakeChatStreamService(
+            deltas=("你", "好")
+        )
+        allowed = client.post(
+            f"{base}/chat/stream",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "继续"}]
+            },
+        )
+        assert allowed.status_code == 200, allowed.text
+        events = _sse_events(allowed.text)
+        assert [name for name, _ in events] == ["started", "delta", "delta", "done"]
+        assert json.loads(events[1][1])["text"] == "你"
+        assert json.loads(events[2][1])["text"] == "好"
+
+        # 6. Mid-stream gateway failure -> partial delta then a stable error event.
+        client.app.state.services.legal_chat_http = _FakeChatStreamService(
+            deltas=("部分",), fail_after=LegalChatTimeout("provider timed out")
+        )
+        failed = client.post(
+            f"{base}/chat/stream",
+            headers=headers,
+            json={
+                "messages": [{"role": "user", "content": "继续"}]
+            },
+        )
+        assert failed.status_code == 200, failed.text
+        failed_events = _sse_events(failed.text)
+        assert [name for name, _ in failed_events] == [
+            "started",
+            "delta",
+            "error",
+            "done",
+        ]
+        assert json.loads(failed_events[1][1])["text"] == "部分"
+        error_payload = json.loads(failed_events[2][1])
+        assert error_payload["status"] == 504
+        assert error_payload["code"] == "model_provider_timeout"
+
+
+class _FakeChatStreamService:
+    """App-state stand-in for the legal chat service over SSE (deltas or error)."""
+
+    def __init__(
+        self,
+        *,
+        deltas: tuple[str, ...] = ("你", "好"),
+        fail_after: Exception | None = None,
+    ) -> None:
+        self._deltas = tuple(deltas)
+        self._fail_after = fail_after
+        self.gateway_available = True
+
+    async def chat_stream(self, messages: object) -> AsyncIterator[str]:
+        del messages
+        for index, delta in enumerate(self._deltas):
+            yield delta
+            if self._fail_after is not None and index == len(self._deltas) - 1:
+                raise self._fail_after
+
+
+def _sse_events(raw: str) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    current: str | None = None
+    data_lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("event: "):
+            current = line[7:]
+        elif line.startswith("data: "):
+            data_lines.append(line[6:])
+        elif not line and current is not None:
+            events.append((current, "\n".join(data_lines)))
+            current = None
+            data_lines = []
+    return events
