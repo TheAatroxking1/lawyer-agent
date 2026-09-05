@@ -1,28 +1,49 @@
 import { describe, expect, it } from 'vitest'
 
-import { authRedirectDecision } from './guard'
+import {
+  AUTH_FORMS_ROUTE_NAMES,
+  AUTH_FREE_ROUTE_NAMES,
+  authRedirectDecision,
+} from './guard'
 
 describe('authRedirectDecision', () => {
-  it('redirects anonymous users to login with a next target', () => {
-    expect(authRedirectDecision({ routeName: 'corpus', hasToken: false, fullPath: '/corpus' })).toEqual(
-      { name: 'login', query: { next: '/corpus' } },
-    )
+  it('sends anonymous users to login for protected routes with a next target', () => {
+    expect(
+      authRedirectDecision({ routeName: 'corpus', hasToken: false, fullPath: '/corpus' }),
+    ).toEqual({ name: 'login', query: { next: '/corpus' } })
+    expect(
+      authRedirectDecision({
+        routeName: 'corpus-instrument',
+        hasToken: false,
+        fullPath: '/corpus/abc',
+      }),
+    ).toEqual({ name: 'login', query: { next: '/corpus/abc' } })
   })
 
-  it('sends authenticated users away from login to home', () => {
-    expect(authRedirectDecision({ routeName: 'login', hasToken: true })).toEqual({ name: 'home' })
+  it('lets anonymous users browse auth-free product surfaces', () => {
+    for (const routeName of [...AUTH_FREE_ROUTE_NAMES]) {
+      expect(authRedirectDecision({ routeName, hasToken: false })).toBeNull()
+    }
   })
 
-  it('sends authenticated users away from register to home', () => {
-    expect(authRedirectDecision({ routeName: 'register', hasToken: true })).toEqual({ name: 'home' })
+  it('lets anonymous users reach the auth form pages', () => {
+    for (const routeName of [...AUTH_FORMS_ROUTE_NAMES]) {
+      expect(authRedirectDecision({ routeName, hasToken: false })).toBeNull()
+    }
   })
 
-  it('lets authenticated users reach protected routes', () => {
-    expect(authRedirectDecision({ routeName: 'corpus', hasToken: true })).toBeNull()
+  it('sends authenticated users away from auth forms to the conversation', () => {
+    expect(authRedirectDecision({ routeName: 'login', hasToken: true })).toEqual({
+      name: 'chat',
+    })
+    expect(authRedirectDecision({ routeName: 'register', hasToken: true })).toEqual({
+      name: 'chat',
+    })
   })
 
-  it('lets anonymous users reach public routes', () => {
-    expect(authRedirectDecision({ routeName: 'login', hasToken: false })).toBeNull()
-    expect(authRedirectDecision({ routeName: 'register', hasToken: false })).toBeNull()
+  it('keeps authenticated users on product surfaces instead of bouncing them', () => {
+    for (const routeName of ['home', 'chat', 'corpus', 'not-found']) {
+      expect(authRedirectDecision({ routeName, hasToken: true })).toBeNull()
+    }
   })
 })
