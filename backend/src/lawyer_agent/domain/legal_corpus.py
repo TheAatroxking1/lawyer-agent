@@ -39,7 +39,9 @@ class ProvisionLevel(StrEnum):
 
 class ChunkType(StrEnum):
     PROVISION = "provision"
-    SUB_ITEM = "sub_item"
+    PARAGRAPH = "paragraph"  # 款（条文内自然段/子块）
+    ITEM = "item"  # 项
+    SUB_ITEM = "sub_item"  # 目
     TABLE = "table"
     ATTACHMENT = "attachment"
 
