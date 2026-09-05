@@ -291,8 +291,20 @@
    skipped 保持** + 真实 MySQL+Redis 全栈 **3 passed**（新增 seed 一法规两
    版本：工具清单 5 个、instrument_get 命中白名单键集/未命中/坏 uuid、
    versions_list 两版本含 2024 current、provisions_list 命中条文全文/空版本
-   0 条/未命中）。真实逐 token 流式对话与原始文件下载（MinIO 真实存储）仍为
+   0 条/未命中）。真实逐 token 流式对话分三步推进（见下条）；原始文件下载（MinIO 真实存储）仍为
    后续。
+- 已完成“真实逐 token 流式对话 · provider chat_stream + ModelGateway 流式委托”
+   非模型切片（2026-09-10 计划，对话流式化第 1/3 步）：对话/问答此前只能一次
+   拿全量文本——`domain.model_gateway.ModelOperation` 增 `CHAT_STREAM`；
+   `DeepSeekChatProvider.chat_stream(messages, timeout) -> AsyncIterator[str]`
+   （OpenAI 兼容 `stream:true`，httpx `.stream` 逐行只认 `data: `、`[DONE]` 正常
+   收尾、空 choices 帧跳过、坏 JSON/缺 choices/delta 非对象 → invalid、401/超时
+   稳定映射且不回显 key）；`ModelGateway.chat_stream(model_ref, messages)` 与
+   chat 同输入校验，能力探测 `provider.chat_stream`（无则 unavailable 不假装），
+   流结束零增量 → invalid response、中途故障记 error 并稳定映射、正常结束记
+   success（流式 usage 未知如实 None）；验证 ruff/mypy strict（164 文件）零错 +
+   全 unit **1144 passed + 1 skipped**（provider 流 8 项 + gateway 流 6 项）。
+   `/legal/chat/stream` SSE 端点与 ChatView 消费仍为后续两步。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
