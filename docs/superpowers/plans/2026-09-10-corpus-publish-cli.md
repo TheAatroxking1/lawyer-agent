@@ -29,25 +29,38 @@ uv run --no-sync python -m lawyer_agent.cli.corpus_publish `
 
 ## Embedding 模型参数化（2026-09-10 增补）
 
-模型不再写死：`Settings` 增 `embedding_model_ref`（默认
-`BAAI/bge-small-zh-v1.5`）与 `embedding_dimension`（默认 512）；后端检索问答装配
-与检索服务以该配置为 embed 默认（服务仍支持调用级覆盖）。`corpus_publish` CLI 增
-`--model-ref` / `--dimension`（缺省取 Settings），可用于按模型重建发布：
+模型不再写死：`Settings` 增 `embedding_model_ref`（**默认已切为
+`IEITYuan/Yuan-embedding-2.0-zh`**）与 `embedding_dimension`（**默认 1792**，模型
+卡实测输出维度）；后端检索问答装配与检索服务以该配置为 embed 默认（服务仍支持
+调用级覆盖）。`corpus_publish` CLI 增 `--model-ref` / `--dimension`（缺省取
+Settings），可用于按模型重建发布：
 
 ```powershell
-# 例：用 Yuan-embedding-2.0-zh（1024 维，经 hf-mirror 下载后）重建数据集
+# 例：用 Yuan-embedding-2.0-zh（1792 维，已缓存）重建数据集
 uv run --no-sync python -m lawyer_agent.cli.corpus_publish --docx <文件> ... `
-  --model-ref IEITYuan/Yuan-embedding-2.0-zh --dimension 1024 --alias dataset_v1
+  --model-ref IEITYuan/Yuan-embedding-2.0-zh --dimension 1792 --alias dataset_v1
 ```
 
 注意：**发布所用模型/维度必须与运行期 `LAWYER_EMBEDDING_MODEL_REF` /
 `LAWYER_EMBEDDING_DIMENSION`（或 Settings 默认）一致**，否则检索 query 向量与索引
 向量维度/分布不匹配。切换模型后需重新发布 dataset（新索引 + 原子切别名，旧索引
-保留可回滚）。
+保留可回滚）。embedding provider 现默认做 L2 归一化（可关闭），OS l2 空间按余弦
+排序，符合 BGE/Yuan 检索规范。
 
-候选模型信息（模型卡确认）：`IEITYuan/Yuan-embedding-2.0-zh` 1024 维（sentence-
-transformers，max 512）；`BAAI/bge-m3` 1024 维、支持长文本；`richinfoai/ritrieve_zh_v1`
-为对照候选（其输出形态——向量或重排分数——待模型卡进一步确认后再接线）。
+候选模型信息（模型卡确认）：`IEITYuan/Yuan-embedding-2.0-zh` 实际输出 1792 维
+（config hidden 1024，pooler 投影后 1792；sentence-transformers，max 512）；
+`BAAI/bge-m3` 1024 维、支持长文本；`richinfoai/ritrieve_zh_v1` 为对照候选（其
+输出形态——向量或重排分数——待模型卡进一步确认后再接线）。
+
+### 2026-09-10 真实切换记录（A 项）
+
+- 经 hf-mirror 下载 `IEITYuan/Yuan-embedding-2.0-zh` 并缓存（391 权重文件）。
+- 用 Yuan/1792（L2 归一化）重建发布 `dataset_v1`：
+  `index=lawyer_dataset_1dd4236b12ae indexed_documents=10 previous_target=
+  lawyer_dataset_7791fc0a0c4d`（旧 bge 索引保留可回滚）；snapshot manifest 记录
+  model_ref=IEITYuan/Yuan-embedding-2.0-zh、dimension=1792。
+- 语义 spot-check：查询「承租人逾期支付租金…违约金」query 向量 1792 维、L2=1.0，
+  k-NN top1=第五条（迟延支付租金可主张违约金，score 0.7472）。
 
 ## 生成样例语料（可选）
 

@@ -356,6 +356,18 @@
   snapshot 为 published 且 manifest/质量指标落库（versions=1/provisions=10/
   chunks=10）；ruff+mypy strict（165 文件）零错；用法与证据见
   `docs/superpowers/plans/2026-09-10-corpus-publish-cli.md`。
+- 已完成“embedding 主模型切换 Yuan-embedding-2.0-zh + L2 归一化 + 真实重建
+  dataset_v1”非模型切片（2026-09-10，用户 A 项）：经 hf-mirror 下载缓存
+  `IEITYuan/Yuan-embedding-2.0-zh`（实测输出 **1792 维**，非 config hidden 1024）；
+  `LocalSentenceTransformerEmbeddingProvider` 默认 **L2 归一化**（可关闭，OS l2
+  按余弦排序，BGE/Yuan 检索规范一致）；`Settings` 默认
+  embedding_model_ref/dimension 切为 Yuan/1792；用 Yuan 重建发布 dataset_v1：
+  `index=lawyer_dataset_1dd4236b12ae indexed=10 previous=lawyer_dataset_7791fc0a0c4d`
+  （旧 bge 索引保留回滚），snapshot manifest 记录 model_ref/dimension=1792；语义
+  spot-check：query 1792 维 L2=1.0，k-NN top1 命中第五条（迟延租金违约金，
+  score 0.7472）；验证 ruff+mypy strict（165 文件）零错 + 全 unit **1151 passed
+  + 1 skipped**。运行后端前需重启加载新默认（或显式设置两项环境变量一致）；
+  `ritrieve_zh_v1` 输出形态与 BGE-M3 长文本接线仍待后续确认。
 - 已完成“embedding 模型参数化（Settings + 检索服务 + corpus_publish CLI）”非模型
   切片（2026-09-10）：模型此前写死默认 `BAAI/bge-small-zh-v1.5`/512——`Settings`
   增 `embedding_model_ref`（默认同前）与 `embedding_dimension`（默认 512）及校验；
