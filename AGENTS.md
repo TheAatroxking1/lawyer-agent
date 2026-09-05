@@ -260,8 +260,23 @@
   `AgentToolsView`（路由 /agent-tools 受保护、顶栏「智能工具」）：加载白名单
   工具（code+描述）→ 行内调用 → JSON 输出展示/错误横幅走 ApiError；验证
   typecheck 0 + vitest 41/41（endpoints +1 断言含默认 args）+ build；后端
-  2 项全栈已覆盖真实调用语义。语料/检索注册为网关工具并授予 Agent 白名单
-  仍为后续。
+  2 项全栈已覆盖真实调用语义。
+- 已完成“语料检索注册为 Agent 网关工具（async handler + 真实工具）”非模型
+  切片（2026-09-10 计划）：网关此前仅内置 meta 自省——`AllowedToolRegistry.
+  ensure_meta()`（meta 无条件存在，不再只对空登记注册）、`MCPClientGateway`
+  __init__ 调 ensure_meta 并新增 `call_async(name,args)`（与 call 同白名单/
+  Schema/错误映射，handler 返回可等待对象即 await、异常亦映射
+  handler_failure）；`/platform/agent/tools/call` 改 await call_async；
+  `_build_mcp_gateway_http_service(session_factory)` 登记真实只读工具
+  `corpus.instruments_search`（title 子串可选 / limit∈{10,20,50,100} 默认
+  20、additionalProperties False，handler 用与语料 HTTP 同源
+  LegalCorpusQueryService 异步读库并只回七字段白名单 id/title/
+  issuing_authority/jurisdiction/region_code）；GET /tools 同时含 meta 与
+  corpus；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1131 passed + 1
+  skipped**（新增 async handler 成功/校验/未知映射 2 项）+ 真实 MySQL+Redis
+  全栈（工具清单双工具、corpus 空库调用 ok true 输出 []、limit 字符串
+  invalid_arguments、meta/unknown/422 保持）。更多只读语料能力注册与 Agent
+  白名单调用仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
