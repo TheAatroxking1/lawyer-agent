@@ -243,6 +243,15 @@
   认证 401；登录后 GET 含 meta 描述、调用成功、unknown_tool、多余参数
   invalid_arguments、未知键 422）。把语料/检索注册为网关工具并授予 Agent
   白名单仍为后续。
+- 已完成“Agent 工具面板（对接 MCP 网关 HTTP）”非模型切片（2026-09-10 计划）：
+  网关 HTTP 面就绪但无前端——`api/types` 增 AgentToolInfo/AgentToolCallResult/
+  AgentToolCallInput；`endpoints.listAgentTools`（GET /platform/agent/tools）与
+  `callAgentTool`（POST /platform/agent/tools/call，args 缺省 {}）；
+  `AgentToolsView`（路由 /agent-tools 受保护、顶栏「智能工具」）：加载白名单
+  工具（code+描述）→ 行内调用 → JSON 输出展示/错误横幅走 ApiError；验证
+  typecheck 0 + vitest 41/41（endpoints +1 断言含默认 args）+ build；后端
+  2 项全栈已覆盖真实调用语义。语料/检索注册为网关工具并授予 Agent 白名单
+  仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
