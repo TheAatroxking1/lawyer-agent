@@ -126,6 +126,9 @@ async def _cleanup(mysql_url: URL) -> None:
             await connection.execute(text("DELETE FROM legal_provisions"))
             await connection.execute(text("DELETE FROM legal_versions"))
             await connection.execute(text("DELETE FROM legal_instruments"))
+            await connection.execute(text("DELETE FROM legal_quality_issues"))
+            await connection.execute(text("DELETE FROM legal_load_batches"))
+            await connection.execute(text("DELETE FROM legal_dataset_snapshots"))
     finally:
         await engine.dispose()
 
@@ -248,5 +251,74 @@ def test_legal_corpus_publish_publishes_dataset_v1(mysql_url: URL) -> None:
     command.upgrade(config, "head")
     try:
         asyncio.run(_run_publish_check(mysql_url))
+    finally:
+        asyncio.run(_cleanup(mysql_url))
+
+
+async def _run_quality_issues_check(mysql_url: URL) -> None:
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    try:
+        async with factory() as session:
+            repo = SqlAlchemyLegalCorpusInventoryRepository(session)
+            inventory = LegalCorpusInventoryService(repo, repo, "docx-zip-v1")
+            result = await inventory.inventory(
+                (
+                    CorpusFile(
+                        "object://corpus/q1.docx",
+                        "质量门禁失败正文".encode(),
+                    ),
+                )
+            )
+            await session.commit()
+            batch_id = result.batch.id
+
+            # Gate failure: sequence break and missing required field.
+            publish = LegalCorpusPublishService(repo, LegalCorpusQualityGate())
+            rejected, report = await publish.publish(
+                batch_id=batch_id,
+                article_count=2,
+                article_numbers=("第一条", "第三条"),
+                required_field_missing=("effective_on",),
+                parse_failures=0,
+                manifest=result.manifest,
+            )
+            await session.commit()
+            assert rejected.state is DatasetState.REJECTED
+            assert not report.passed
+
+            read_repo = SqlAlchemyLegalCorpusRepository(session)
+            issues = await read_repo.quality_issues_for_batch(batch_id)
+            types = {issue.issue_type for issue in issues}
+            assert "missing_required_fields" in types
+            assert any("sequence" in issue.issue_type for issue in issues)
+            assert all(issue.batch_id == batch_id for issue in issues)
+            assert all(len(issue.file_sha256) == 32 for issue in issues)
+
+            # Re-publishing the same failing batch replaces issue rows (idempotent).
+            rejected_again, _ = await publish.publish(
+                batch_id=batch_id,
+                article_count=2,
+                article_numbers=("第一条", "第三条"),
+                required_field_missing=("effective_on",),
+                parse_failures=0,
+                manifest=result.manifest,
+            )
+            await session.commit()
+            assert rejected_again.state is DatasetState.REJECTED
+            refreshed = await read_repo.quality_issues_for_batch(batch_id)
+            assert {issue.issue_type for issue in refreshed} == {
+                "missing_required_fields",
+                "article_sequence_break",
+            }
+    finally:
+        await engine.dispose()
+
+
+def test_legal_corpus_quality_issues_persist_on_gate_failure(mysql_url: URL) -> None:
+    config = _alembic_config(mysql_url)
+    command.upgrade(config, "head")
+    try:
+        asyncio.run(_run_quality_issues_check(mysql_url))
     finally:
         asyncio.run(_cleanup(mysql_url))

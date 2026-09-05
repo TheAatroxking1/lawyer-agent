@@ -12,6 +12,7 @@ from lawyer_agent.api.v1.legal_corpus import (
     LoadBatchPage,
     LoadBatchSummary,
     ProvisionSummary,
+    QualityIssueSummary,
 )
 from lawyer_agent.application.legal_corpus_diff import (
     LegalVersionDiffCrossInstrument,
@@ -177,3 +178,12 @@ def test_load_batch_not_found_code() -> None:
     error = LegalCorpusLoadBatchNotFound()
     assert error.status == 404
     assert error.code == "legal_corpus_load_batch_not_found"
+
+
+def test_quality_issue_summary_round_trip() -> None:
+    summary = QualityIssueSummary(
+        issue_type="missing_required_fields",
+        message="missing required fields",
+    )
+    assert summary.issue_type == "missing_required_fields"
+    assert summary.message == "missing required fields"

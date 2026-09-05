@@ -20,6 +20,7 @@ from lawyer_agent.domain.legal_corpus import (
     LegalInstrument,
     LoadBatch,
     LoadStatus,
+    QualityIssue,
 )
 
 _TITLE = "中华人民共和国民法典"
@@ -100,6 +101,13 @@ class _FakeCorpus:
                 return batch
         return None
 
+    async def quality_issues_for_batch(
+        self, batch_id: UUID
+    ) -> tuple[QualityIssue, ...]:
+        return tuple(
+            issue for issue in self._owner.quality_issues if issue.batch_id == batch_id
+        )
+
 
 class _FakeUow:
     def __init__(self) -> None:
@@ -109,6 +117,7 @@ class _FakeUow:
         self.empty = False
         self.snapshots: tuple[DatasetSnapshot, ...] = ()
         self.batches: tuple[LoadBatch, ...] = ()
+        self.quality_issues: tuple[QualityIssue, ...] = ()
         self.corpus = _FakeCorpus(self)
 
     async def __aenter__(self) -> _FakeUow:
@@ -226,6 +235,34 @@ async def test_load_batches_maps_cursor_missing_to_stable_error() -> None:
     uow.fail_batch_cursor = True
     with pytest.raises(LegalCorpusLoadBatchCursorInvalid):
         await _service(uow).load_batches(limit=5, before_id=new_uuid7())
+
+
+async def test_quality_issues_returns_for_existing_batch() -> None:
+    uow = _FakeUow()
+    batch = _batch()
+    uow.batches = (batch,)
+    issue = QualityIssue(
+        id=new_uuid7(),
+        batch_id=batch.id,
+        file_sha256=bytes(32),
+        issue_type="no_articles",
+        message="no_articles",
+    )
+    uow.quality_issues = (issue,)
+    rows = await _service(uow).quality_issues(batch_id=batch.id)
+    assert rows == (issue,)
+
+
+async def test_quality_issues_missing_batch_maps_to_not_found() -> None:
+    uow = _FakeUow()
+    with pytest.raises(LegalCorpusLoadBatchNotFound):
+        await _service(uow).quality_issues(batch_id=new_uuid7())
+
+
+async def test_quality_issues_rejects_invalid_batch_id() -> None:
+    service = _service(_FakeUow())
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.quality_issues(batch_id=UUID(int=0))  # not uuid7
 
 
 async def test_instruments_passes_validated_filters_to_uow() -> None:

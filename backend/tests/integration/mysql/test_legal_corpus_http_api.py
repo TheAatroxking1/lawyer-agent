@@ -830,3 +830,152 @@ async def _cleanup_load_batches(mysql_url: URL, ids: list[UUID]) -> None:
                 )
     finally:
         await engine.dispose()
+
+
+async def _seed_batch_with_issues(mysql_url: URL) -> tuple[UUID, list[UUID]]:
+    """One failed batch with two quality issue rows."""
+    import json as _json
+
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    batch_id = new_uuid7()
+    issue_ids = [new_uuid7(), new_uuid7()]
+    file_sha = bytes([9]) * 32
+    counts = {"files": 1, "unique": 1, "duplicates": 0}
+    try:
+        async with factory() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO legal_load_batches "
+                    "(id,batch_no,source_ref,file_sha256,parser_version,status,"
+                    "item_counts_json,started_at,created_at) "
+                    "VALUES (:id,'B20260606000001ZZ','object://corpus/q.docx',"
+                    ":sha,'docx-v1','inventoried',:counts,"
+                    "'2026-06-06 00:00:00.000000','2026-06-06 00:00:00.000000')"
+                ),
+                {
+                    "id": batch_id.bytes,
+                    "sha": file_sha,
+                    "counts": _json.dumps(counts, ensure_ascii=False),
+                },
+            )
+            for index, issue_id in enumerate(issue_ids):
+                await session.execute(
+                    text(
+                        "INSERT INTO legal_quality_issues "
+                        "(id,batch_id,file_sha256,issue_type,message,created_at) "
+                        "VALUES (:id,:batch,:sha,:type,:message,"
+                        "'2026-06-06 00:00:00.000000')"
+                    ),
+                    {
+                        "id": issue_id.bytes,
+                        "batch": batch_id.bytes,
+                        "sha": file_sha,
+                        "type": (
+                            "missing_required_fields"
+                            if index == 0
+                            else "article_sequence_break"
+                        ),
+                        "message": (
+                            "missing required fields"
+                            if index == 0
+                            else "article_sequence_break:第三条"
+                        ),
+                    },
+                )
+            await session.commit()
+    finally:
+        await engine.dispose()
+    return batch_id, issue_ids
+
+
+def test_legal_load_batch_quality_issues_http_over_real_mysql(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    prefix = f"lawyer-test-corpus-quality:{uuid4().hex}:"
+    settings = Settings(
+        environment="test",
+        secret_key="h" * 32,
+        database_url=migrated_mysql_url.render_as_string(hide_password=False),
+        redis_url=redis_url,
+        redis_key_prefix=prefix,
+        trusted_origins=(_ORIGIN,),
+        cookie_secure=True,
+        data_encryption_key_ring={7: _encoded(_CIPHER_KEY)},
+        data_encryption_active_key_version=7,
+        blind_index_key_ring={7: _encoded(_BLIND_KEY)},
+        blind_index_active_key_version=7,
+        blind_index_rollout_phase="legacy-compatible",
+        blind_index_legacy_key_version=7,
+        blind_index_legacy_writers_drained=False,
+    )
+    batch_id, issue_ids = asyncio.run(
+        _seed_batch_with_issues(migrated_mysql_url)
+    )
+    client = TestClient(create_app(settings), base_url="https://testserver")
+    try:
+        with client:
+            registered = client.post(
+                "/api/v1/auth/register",
+                headers={"Origin": _ORIGIN},
+                json={
+                    "username": "corpus-quality-owner",
+                    "password": _PASSWORD,
+                    "display_name": "语料质量用户",
+                },
+            )
+            assert registered.status_code == 201, registered.text
+            account_token = registered.json()["access_token"]
+            base = "/api/v1/legal"
+            headers = {"Authorization": f"Bearer {account_token}"}
+
+            issues = client.get(
+                f"{base}/load-batches/{batch_id}/quality-issues", headers=headers
+            )
+            assert issues.status_code == 200, issues.text
+            rows = issues.json()
+            assert {row["issue_type"] for row in rows} == {
+                "missing_required_fields",
+                "article_sequence_break",
+            }
+            assert {row["message"] for row in rows} == {
+                "missing required fields",
+                "article_sequence_break:第三条",
+            }
+
+            unknown = client.get(
+                f"{base}/load-batches/{new_uuid7()}/quality-issues", headers=headers
+            )
+            assert unknown.status_code == 404
+            assert unknown.json()["code"] == "legal_corpus_load_batch_not_found"
+
+            unauth = client.get(f"{base}/load-batches/{batch_id}/quality-issues")
+            assert unauth.status_code == 401
+    finally:
+        asyncio.run(
+            _cleanup_batch_with_issues(migrated_mysql_url, batch_id, issue_ids)
+        )
+
+
+async def _cleanup_batch_with_issues(
+    mysql_url: URL, batch_id: UUID, issue_ids: list[UUID]
+) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "DELETE FROM legal_quality_issues "
+                    "WHERE id IN (:first,:second)"
+                ),
+                {"first": issue_ids[0].bytes, "second": issue_ids[1].bytes},
+            )
+            await connection.execute(
+                text("DELETE FROM legal_load_batches WHERE id=:id"),
+                {"id": batch_id.bytes},
+            )
+    finally:
+        await engine.dispose()
