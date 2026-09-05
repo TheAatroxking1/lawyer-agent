@@ -11,7 +11,7 @@ API key, the request body or raw provider text (spec 7.2).
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import httpx
@@ -95,6 +95,92 @@ class DeepSeekChatProvider(ModelProviderPort):
                 f"deepseek chat provider returned HTTP {response.status_code}"
             )
         return self._parse_response(response.text)
+
+    async def chat_stream(
+        self,
+        *,
+        messages: Sequence[ChatMessage],
+        timeout_seconds: float,
+    ) -> AsyncIterator[str]:
+        """Streams chat answer text deltas from the OpenAI-compatible endpoint.
+
+        Same request shape as :meth:`chat` with ``stream: true``; each SSE
+        ``data:`` line contributes the next ``choices[0].delta.content`` text.
+        Malformed frames fail loudly (never silently dropped); ``[DONE]`` and a
+        missing/empty delta finish the stream normally.
+        """
+        if not isinstance(messages, Sequence) or not messages:
+            raise ModelInputInvalid("chat messages must be a non-empty sequence")
+        if any(not isinstance(message, ChatMessage) for message in messages):
+            raise ModelInputInvalid("chat messages must be strongly typed")
+        payload = {
+            "model": self._model_name,
+            "messages": [
+                {"role": message.role, "content": message.content}
+                for message in messages
+            ],
+            "stream": True,
+        }
+        try:
+            async with self._client_for().stream(
+                "POST",
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+                timeout=timeout_seconds,
+            ) as response:
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise ModelProviderUnavailable(
+                        "deepseek chat provider returned HTTP "
+                        f"{response.status_code}"
+                    )
+                async for raw_line in response.aiter_lines():
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        return
+                    text = self._parse_stream_chunk(data)
+                    if text:
+                        yield text
+        except httpx.TimeoutException as exc:
+            raise ModelProviderTimeout("deepseek chat provider timed out") from exc
+        except httpx.HTTPError as exc:
+            raise ModelProviderUnavailable("deepseek chat provider failed") from exc
+
+    @staticmethod
+    def _parse_stream_chunk(data: str) -> str:
+        try:
+            body = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ModelProviderInvalidResponse(
+                "deepseek chat stream returned invalid JSON"
+            ) from exc
+        if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
+            raise ModelProviderInvalidResponse(
+                "deepseek chat stream response is missing choices"
+            )
+        choices = body["choices"]
+        # An empty-choices frame (e.g. a usage-only tail) ends a turn normally.
+        if not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise ModelProviderInvalidResponse(
+                "deepseek chat stream choice is invalid"
+            )
+        delta = first.get("delta")
+        if delta is None:
+            return ""
+        if not isinstance(delta, dict):
+            raise ModelProviderInvalidResponse(
+                "deepseek chat stream delta is invalid"
+            )
+        content = delta.get("content")
+        if not isinstance(content, str):
+            return ""
+        return content
 
     def _parse_response(self, raw_text: str) -> tuple[str, TokenUsage]:
         try:

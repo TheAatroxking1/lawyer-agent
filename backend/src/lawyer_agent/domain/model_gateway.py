@@ -20,6 +20,7 @@ class ModelOperation(StrEnum):
     EMBED = "embed"
     RERANK = "rerank"
     CHAT = "chat"
+    CHAT_STREAM = "chat_stream"
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,7 +12,7 @@ here or in the domain module.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -216,6 +216,56 @@ class ModelGateway:
             raise ModelProviderInvalidResponse("chat returned no text")
         await self._record_success(model_ref, ModelOperation.CHAT, started, usage=usage)
         return text, usage
+
+    async def chat_stream(
+        self,
+        *,
+        model_ref: str,
+        messages: Sequence[ChatMessage],
+    ) -> AsyncIterator[str]:
+        """Streams chat answer text deltas (token-level when the provider can).
+
+        Validates inputs exactly like :meth:`chat` and records one call: success
+        after a normal stream end (usage is unknown for streams, so it is left
+        ``None``) or failure on any mid-stream provider error, which is mapped to
+        a typed gateway error — nothing is fabricated, an empty stream is an
+        invalid response.
+        """
+        _require_model_ref(model_ref)
+        if not isinstance(messages, Sequence) or not messages:
+            raise ModelInputInvalid("chat messages must be a non-empty sequence")
+        if any(not isinstance(message, ChatMessage) for message in messages):
+            raise ModelInputInvalid("chat messages must be strongly typed")
+        stream_capable = getattr(self._provider, "chat_stream", None)
+        if not callable(stream_capable):
+            raise ModelProviderUnavailable(
+                "chat streaming is not supported by the configured provider"
+            )
+        started = datetime.now(UTC)
+        emitted = 0
+        try:
+            stream = stream_capable(
+                messages=tuple(messages),
+                timeout_seconds=self._limits.timeout_seconds,
+            )
+            async for text in stream:
+                if not isinstance(text, str) or not text:
+                    raise ModelProviderInvalidResponse("chat stream yielded no text")
+                emitted += 1
+                yield text
+        except ModelGatewayError:
+            await self._record_failure(model_ref, ModelOperation.CHAT_STREAM, started)
+            raise
+        except TimeoutError as exc:
+            await self._record_failure(model_ref, ModelOperation.CHAT_STREAM, started)
+            raise ModelProviderTimeout("model provider timed out") from exc
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            await self._record_failure(model_ref, ModelOperation.CHAT_STREAM, started)
+            raise ModelProviderUnavailable("model provider failed") from exc
+        if emitted == 0:
+            await self._record_failure(model_ref, ModelOperation.CHAT_STREAM, started)
+            raise ModelProviderInvalidResponse("chat stream returned no text")
+        await self._record_success(model_ref, ModelOperation.CHAT_STREAM, started)
 
     async def _record_success(
         self,
