@@ -9,7 +9,7 @@ API never fakes an answer or falls back silently (spec 7.2).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Protocol
 
 from lawyer_agent.domain.model_gateway import ChatMessage, TokenUsage
@@ -65,6 +65,10 @@ class LegalChatHttpService:
         self._gateway = gateway
         self._model_ref = "deepseek-chat"
 
+    @property
+    def gateway_available(self) -> bool:
+        return self._gateway is not None
+
     async def chat(self, messages: Sequence[ChatMessage]) -> tuple[str, TokenUsage]:
         _validate_messages(messages)
         if self._gateway is None:
@@ -80,6 +84,38 @@ class LegalChatHttpService:
                 model_ref=self._model_ref,
                 messages=tuple(messages),
             )
+        except ModelProviderTimeout as exc:
+            raise LegalChatTimeout(str(exc)) from exc
+        except (ModelProviderUnavailable, ModelProviderInvalidResponse) as exc:
+            raise LegalChatProviderFailure(str(exc)) from exc
+
+    async def chat_stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[str]:
+        """Streams answer text deltas when the gateway supports ``chat_stream``.
+
+        Validation and capability checks happen before any delta; mid-stream
+        provider failures are mapped to the same stable codes as :meth:`chat`
+        so the SSE layer can announce an incomplete answer via an ``error`` event.
+        """
+        _validate_messages(messages)
+        if self._gateway is None:
+            raise LegalChatUnavailable("deepseek api key is not configured")
+        stream_capable = getattr(self._gateway, "chat_stream", None)
+        if not callable(stream_capable):
+            raise LegalChatProviderFailure(
+                "chat streaming is not supported by the model gateway"
+            )
+        from lawyer_agent.application.model_gateway import (
+            ModelProviderInvalidResponse,
+            ModelProviderTimeout,
+            ModelProviderUnavailable,
+        )
+
+        try:
+            async for text in stream_capable(
+                model_ref=self._model_ref,
+                messages=tuple(messages),
+            ):
+                yield text
         except ModelProviderTimeout as exc:
             raise LegalChatTimeout(str(exc)) from exc
         except (ModelProviderUnavailable, ModelProviderInvalidResponse) as exc:
