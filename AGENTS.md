@@ -275,8 +275,24 @@
   corpus；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1131 passed + 1
   skipped**（新增 async handler 成功/校验/未知映射 2 项）+ 真实 MySQL+Redis
   全栈（工具清单双工具、corpus 空库调用 ok true 输出 []、limit 字符串
-  invalid_arguments、meta/unknown/422 保持）。更多只读语料能力注册与 Agent
+  invalid_arguments、meta/unknown/422 保持）。Agent
   白名单调用仍为后续。
+- 已完成“语料按 id 深读注册为 Agent 网关工具（检索→身份→版本→条文链路）”
+   非模型切片（2026-09-10 计划）：检索工具只能回目录行、Agent 无法继续读
+   版本与条文——`_build_mcp_gateway_http_service` 继续在同一 closed registry
+   增三个真实只读工具（`corpus.instrument_get` 按 id 读身份、
+   `corpus.versions_list` 按 instrument 读版本清单、
+   `corpus.provisions_list` 按 version 读条文全文），输出字段白名单与 HTTP
+   契约一致（instrument 五字段 / version 九字段含 status/生效废止日期/文号
+   转 iso 字符串 / provision 六字段含 structure_path 转 list），参数 uuid7
+   非法 → handler 内 `MCPGatewayError("invalid_arguments")` 稳定映射、合法但
+   不存在 → 结构化 `{"found": false, …}` 空结果（正常业务缺失不伪装成工具
+   故障）；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1131 passed + 1
+   skipped 保持** + 真实 MySQL+Redis 全栈 **3 passed**（新增 seed 一法规两
+   版本：工具清单 5 个、instrument_get 命中白名单键集/未命中/坏 uuid、
+   versions_list 两版本含 2024 current、provisions_list 命中条文全文/空版本
+   0 条/未命中）。真实逐 token 流式对话与原始文件下载（MinIO 真实存储）仍为
+   后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
