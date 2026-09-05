@@ -44,6 +44,12 @@ const router = createRouter({
           meta: { title: '法规问答' },
         },
         {
+          path: 'documents',
+          name: 'documents',
+          component: () => import('../views/DocumentsView.vue'),
+          meta: { title: '案件文档' },
+        },
+        {
           path: 'corpus',
           name: 'corpus',
           component: () => import('../views/CorpusView.vue'),

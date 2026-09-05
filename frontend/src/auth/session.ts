@@ -6,6 +6,7 @@
 // without a DOM.
 
 export const ACCESS_TOKEN_KEY = 'lawyer_agent.access_token'
+export const TENANT_TOKEN_KEY = 'lawyer_agent.tenant_access_token'
 
 export interface TokenStorage {
   getItem(key: string): string | null
@@ -18,6 +19,9 @@ export interface Session {
   saveToken(token: string): void
   clearToken(): void
   isAuthenticated(): boolean
+  readTenantToken(): string | null
+  saveTenantToken(token: string): void
+  clearTenantToken(): void
 }
 
 function browserStorage(): TokenStorage | null {
@@ -44,6 +48,18 @@ export function createSession(storage: TokenStorage | null = browserStorage()): 
     isAuthenticated(): boolean {
       const token = this.readToken()
       return typeof token === 'string' && token.length > 0
+    },
+    readTenantToken(): string | null {
+      if (!storage) return null
+      return storage.getItem(TENANT_TOKEN_KEY)
+    },
+    saveTenantToken(token: string): void {
+      if (!storage) return
+      storage.setItem(TENANT_TOKEN_KEY, token)
+    },
+    clearTenantToken(): void {
+      if (!storage) return
+      storage.removeItem(TENANT_TOKEN_KEY)
     },
   }
 }

@@ -5,6 +5,7 @@ import type { ApiClient } from './client'
 import { queryString } from './client'
 import type {
   AccessTokenResponse,
+  AccountTenantList,
   ChatMessageInput,
   ChatReply,
   InstrumentListQuery,
@@ -16,6 +17,7 @@ import type {
   RegisterInput,
   RetrievalQuestionInput,
   RetrievalQuestionReply,
+  SwitchTenantInput,
 } from './types'
 
 export async function login(
@@ -97,6 +99,22 @@ export async function askQuestion(
   input: RetrievalQuestionInput,
 ): Promise<RetrievalQuestionReply> {
   return client.request<RetrievalQuestionReply>('/legal/questions', {
+    method: 'POST',
+    body: input,
+  })
+}
+
+export async function myTenants(
+  client: ApiClient,
+): Promise<AccountTenantList> {
+  return client.request<AccountTenantList>('/accounts/me/tenants')
+}
+
+export async function switchTenant(
+  client: ApiClient,
+  input: SwitchTenantInput,
+): Promise<AccessTokenResponse> {
+  return client.request<AccessTokenResponse>('/auth/switch-tenant', {
     method: 'POST',
     body: input,
   })

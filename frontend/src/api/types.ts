@@ -117,6 +117,25 @@ export interface RetrievalQuestionInput {
   target_date?: string
 }
 
+// GET /api/v1/accounts/me/tenants and POST /api/v1/auth/switch-tenant
+export interface AccountTenant {
+  tenant_id: string
+  membership_id: string
+  name: string
+  tenant_type: string
+  tenant_status: string
+  membership_status: string
+}
+
+export interface AccountTenantList {
+  items: AccountTenant[]
+}
+
+export interface SwitchTenantInput {
+  tenant_id: string
+  membership_id: string
+}
+
 // Problem Details body produced by backend/api/errors.py
 export interface ProblemErrors {
   field?: string
