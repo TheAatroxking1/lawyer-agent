@@ -19,7 +19,10 @@ if deployment_url:
 elif not config.get_main_option("sqlalchemy.url").strip():
     raise RuntimeError("an explicit migration database URL is required")
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Apply alembic.ini logging for the alembic/sqlalchemy loggers only.
+    # disable_existing_loggers=False keeps application loggers created before
+    # an in-process migration (tests, bootstrap CLIs) from being disabled.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
