@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
 
 from lawyer_agent.application.legal_corpus_read import (
+    LegalCorpusDatasetSnapshotNotFound,
     LegalCorpusInstrumentCursorInvalid,
     LegalCorpusInvalidRequest,
     LegalCorpusQueryService,
 )
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.legal_corpus import LegalInstrument
+from lawyer_agent.domain.legal_corpus import (
+    DatasetSnapshot,
+    DatasetState,
+    LegalInstrument,
+)
 
 _TITLE = "中华人民共和国民法典"
 _AUTHORITY = "全国人民代表大会"
@@ -59,12 +65,24 @@ class _FakeCorpus:
             ),
         )
 
+    async def dataset_snapshots(self) -> tuple[DatasetSnapshot, ...]:
+        return self._owner.snapshots
+
+    async def dataset_snapshot_by_name(
+        self, dataset_name: str
+    ) -> DatasetSnapshot | None:
+        for snapshot in self._owner.snapshots:
+            if snapshot.dataset_name == dataset_name:
+                return snapshot
+        return None
+
 
 class _FakeUow:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.fail_cursor = False
         self.empty = False
+        self.snapshots: tuple[DatasetSnapshot, ...] = ()
         self.corpus = _FakeCorpus(self)
 
     async def __aenter__(self) -> _FakeUow:
@@ -74,8 +92,54 @@ class _FakeUow:
         del exc
 
 
+def _snapshot(name: str = "dataset_v1") -> DatasetSnapshot:
+    return DatasetSnapshot(
+        id=new_uuid7(),
+        dataset_name=name,
+        parser_version="docx-v1",
+        state=DatasetState.PUBLISHED,
+        manifest={"files": 1},
+        quality_metrics={"article_count": 10, "coverage": 1.0},
+        released_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+
+
 def _service(uow: _FakeUow) -> LegalCorpusQueryService:
     return LegalCorpusQueryService(lambda: uow)
+
+
+async def test_datasets_returns_all_snapshots_from_uow() -> None:
+    uow = _FakeUow()
+    first = _snapshot("dataset_v1")
+    second = _snapshot("dataset_v2")
+    uow.snapshots = (first, second)
+    rows = await _service(uow).datasets()
+    assert rows == (first, second)
+
+
+async def test_dataset_returns_snapshot_by_name() -> None:
+    uow = _FakeUow()
+    target = _snapshot("dataset_v1")
+    uow.snapshots = (_snapshot("dataset_v2"), target)
+    loaded = await _service(uow).dataset(dataset_name="dataset_v1")
+    assert loaded == target
+
+
+async def test_dataset_missing_maps_to_not_found() -> None:
+    uow = _FakeUow()
+    uow.snapshots = (_snapshot("dataset_v2"),)
+    with pytest.raises(LegalCorpusDatasetSnapshotNotFound):
+        await _service(uow).dataset(dataset_name="dataset_v1")
+
+
+async def test_dataset_rejects_blank_or_overlong_name() -> None:
+    service = _service(_FakeUow())
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.dataset(dataset_name="   ")
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.dataset(dataset_name="x" * 65)
+    with pytest.raises(LegalCorpusInvalidRequest):
+        await service.dataset(dataset_name="bad name!")
 
 
 async def test_instruments_passes_validated_filters_to_uow() -> None:

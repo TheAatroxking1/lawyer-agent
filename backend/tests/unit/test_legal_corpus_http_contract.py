@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
 
 from lawyer_agent.api.v1.legal_corpus import (
+    DatasetSnapshotSummary,
     LegalInstrumentPage,
     LegalInstrumentSummary,
     LegalVersionSummary,
@@ -14,6 +16,7 @@ from lawyer_agent.application.legal_corpus_diff import (
     LegalVersionDiffVersionNotFound,
 )
 from lawyer_agent.application.legal_corpus_read import (
+    LegalCorpusDatasetSnapshotNotFound,
     LegalCorpusInstrumentCursorInvalid,
     LegalCorpusInstrumentNotFound,
     LegalCorpusInvalidRequest,
@@ -117,3 +120,28 @@ def test_instrument_cursor_invalid_code() -> None:
     error = LegalCorpusInstrumentCursorInvalid()
     assert error.status == 404
     assert error.code == "legal_corpus_instrument_cursor_invalid"
+
+
+def test_dataset_snapshot_summary_round_trip() -> None:
+    released = datetime(2026, 5, 1, tzinfo=UTC)
+    summary = DatasetSnapshotSummary(
+        dataset_name="dataset_v1",
+        parser_version="docx-v1",
+        state="published",
+        released_at=released,
+        quality_metrics={
+            "article_count": 134,
+            "coverage": 1.0,
+            "parse_failures": 0,
+        },
+    )
+    assert summary.dataset_name == "dataset_v1"
+    assert summary.state == "published"
+    assert summary.released_at == released
+    assert summary.quality_metrics["article_count"] == 134
+
+
+def test_dataset_snapshot_not_found_code() -> None:
+    error = LegalCorpusDatasetSnapshotNotFound()
+    assert error.status == 404
+    assert error.code == "legal_dataset_snapshot_not_found"

@@ -511,3 +511,140 @@ async def _cleanup_list_instruments(mysql_url: URL, ids: list[UUID]) -> None:
                 )
     finally:
         await engine.dispose()
+
+
+async def _seed_dataset_snapshots(mysql_url: URL) -> list[str]:
+    """Two snapshots: one published (dated) and one pending (undated)."""
+    engine = create_async_engine(mysql_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    names = ["dataset_v1", "dataset_v2"]
+    try:
+        async with factory() as session:
+            published_id = new_uuid7()
+            await session.execute(
+                text(
+                    "INSERT INTO legal_dataset_snapshots "
+                    "(id,dataset_name,parser_version,state,manifest_json,"
+                    "quality_metrics_json,released_at) "
+                    "VALUES (:id,'dataset_v1','docx-v1','published',"
+                    "'{\"files\": 134}',"
+                    "'{\"article_count\": 134, \"coverage\": 1.0, "
+                    "\"parse_failures\": 0, \"required_field_missing\": []}',"
+                    "'2026-01-15 00:00:00.000000')"
+                ),
+                {"id": published_id.bytes},
+            )
+            pending_id = new_uuid7()
+            await session.execute(
+                text(
+                    "INSERT INTO legal_dataset_snapshots "
+                    "(id,dataset_name,parser_version,state,manifest_json,"
+                    "quality_metrics_json,released_at) "
+                    "VALUES (:id,'dataset_v2','docx-v2','pending',"
+                    "'{\"files\": 0}',"
+                    "'{\"article_count\": 0, \"coverage\": 0.0, "
+                    "\"parse_failures\": 0, \"required_field_missing\": []}',NULL)"
+                ),
+                {"id": pending_id.bytes},
+            )
+            await session.commit()
+    finally:
+        await engine.dispose()
+    return names
+
+
+def test_legal_dataset_snapshot_read_http_over_real_mysql(
+    migrated_mysql_url: URL,
+) -> None:
+    redis_url = os.getenv("LAWYER_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+    if not asyncio.run(_redis_available(redis_url)):
+        pytest.skip("test Redis unavailable")
+    prefix = f"lawyer-test-corpus-dataset:{uuid4().hex}:"
+    settings = Settings(
+        environment="test",
+        secret_key="h" * 32,
+        database_url=migrated_mysql_url.render_as_string(hide_password=False),
+        redis_url=redis_url,
+        redis_key_prefix=prefix,
+        trusted_origins=(_ORIGIN,),
+        cookie_secure=True,
+        data_encryption_key_ring={7: _encoded(_CIPHER_KEY)},
+        data_encryption_active_key_version=7,
+        blind_index_key_ring={7: _encoded(_BLIND_KEY)},
+        blind_index_active_key_version=7,
+        blind_index_rollout_phase="legacy-compatible",
+        blind_index_legacy_key_version=7,
+        blind_index_legacy_writers_drained=False,
+    )
+    names = asyncio.run(_seed_dataset_snapshots(migrated_mysql_url))
+    client = TestClient(create_app(settings), base_url="https://testserver")
+    try:
+        with client:
+            registered = client.post(
+                "/api/v1/auth/register",
+                headers={"Origin": _ORIGIN},
+                json={
+                    "username": "corpus-dataset-owner",
+                    "password": _PASSWORD,
+                    "display_name": "语料数据集用户",
+                },
+            )
+            assert registered.status_code == 201, registered.text
+            account_token = registered.json()["access_token"]
+            base = "/api/v1/legal"
+            headers = {"Authorization": f"Bearer {account_token}"}
+
+            # 1. Listing returns the published (dated) snapshot first.
+            listing = client.get(f"{base}/datasets", headers=headers)
+            assert listing.status_code == 200, listing.text
+            rows = listing.json()
+            assert [row["dataset_name"] for row in rows] == ["dataset_v1", "dataset_v2"]
+            assert rows[0]["state"] == "published"
+            assert rows[0]["released_at"] is not None
+            assert rows[0]["quality_metrics"] == {
+                "article_count": 134,
+                "coverage": 1.0,
+                "parse_failures": 0,
+            }
+            assert rows[1]["state"] == "pending"
+            assert rows[1]["released_at"] is None
+
+            # 2. Reading by name returns that snapshot's whitelisted fields.
+            by_name = client.get(f"{base}/datasets/dataset_v1", headers=headers)
+            assert by_name.status_code == 200, by_name.text
+            detail = by_name.json()
+            assert detail["dataset_name"] == "dataset_v1"
+            assert detail["parser_version"] == "docx-v1"
+            assert detail["quality_metrics"]["article_count"] == 134
+
+            # 3. Unknown dataset -> 404 stable not-found error.
+            unknown = client.get(f"{base}/datasets/dataset_unknown", headers=headers)
+            assert unknown.status_code == 404
+            assert (
+                unknown.json()["code"]
+                == "legal_dataset_snapshot_not_found"
+            )
+
+            # 4. Invalid name -> 422.
+            invalid = client.get(f"{base}/datasets/not%20valid", headers=headers)
+            assert invalid.status_code == 422
+            assert invalid.json()["code"] == "legal_corpus_invalid_request"
+
+            # 5. Unauthenticated -> 401.
+            unauth = client.get(f"{base}/datasets")
+            assert unauth.status_code == 401
+    finally:
+        asyncio.run(_cleanup_dataset_snapshots(migrated_mysql_url, names))
+
+
+async def _cleanup_dataset_snapshots(mysql_url: URL, names: list[str]) -> None:
+    engine = create_async_engine(mysql_url)
+    try:
+        async with engine.begin() as connection:
+            for name in names:
+                await connection.execute(
+                    text("DELETE FROM legal_dataset_snapshots WHERE dataset_name=:name"),
+                    {"name": name},
+                )
+    finally:
+        await engine.dispose()
