@@ -134,6 +134,23 @@
   （ChatView gzip 2.0 kB）；真实回复需用户配置 key 后手工验证（无 key 503
   语义已由后端全栈覆盖）。SSE 流式问答编排、上传下载页面、MCP 白名单化
   工具、Nginx 托管入 compose 仍为后续。
+- 已完成“落地对话页 + 延时登录弹窗（微信/手机号/账号密码三入口）”非模型
+  切片（2026-09-10 计划，用户确认 UI 全做、真实短信/微信后置）：路由 `/`
+  重定向 `/chat`（打开即对话页）、`home` 移至 `/home`、chat/home/not-found
+  转公开（语料与详情仍受保护 → `/login?next=`），已登录访问 login/register
+  跳 `/chat`；守卫拆分公开/表单两集合纯函数（可单测，默认 next=/chat）；
+  `src/auth/state.ts` 响应式 `authState`+`refreshAuth`（登录/登出即时刷新
+  顶栏与对话页）；`AuthPanel` 三页签：微信/手机号为**未开通占位**（写明需
+  微信开放平台 OAuth 与短信网关，按钮禁用不假装可用），账号密码走既有
+  login 端点成功后存 token+refresh+emit success；`AuthModal`（Teleport
+  遮罩、Esc/遮罩关、aria-modal、支持成功/关闭/go-register 事件）供对话页
+  弹出；`ChatView` 游客可浏览输入并提示“点击发送即登录”，发送/示例点时
+  未认证 → 保留输入弹窗，登录成功**自动补发该句**（pendingSend 不丢不重），
+  真实 401 清 token 后弹窗重登，游客态按钮「登录并发送」；`LoginView` 改
+  三页签面板、`RegisterView` 成功跳 `/chat`；`AppShell` 游客态顶栏
+  注册/登录（带 next）。验证 typecheck 0 错 + vitest 30/30 + build 分包
+  （ChatView gzip 2.6 kB）；后端零改动。真实微信 OAuth/短信/绑定（需外部
+  凭据与后端流程）仍为后续。
 - 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
   spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
   拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
