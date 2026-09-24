@@ -47,11 +47,13 @@ uv run --frozen --extra contract-review python -X utf8 -m lawyer_agent.cli.contr
 Pop-Location
 ```
 
-**启动原有开发栈：** 核对 `deploy/.env` 后在根目录运行 `./scripts/dev.ps1`。该脚本会准备开发配置和秘密文件，并构建/启动 Docker 服务；演示核心 Workflow 不需要启动整套服务。
+**启动通用开发栈：** 核对 `deploy/.env` 后在根目录运行 `./scripts/dev.ps1`。该脚本会准备开发配置和秘密文件，并构建/启动 Docker 服务，网页地址为 `http://127.0.0.1:8080/chat`。这套 Compose 目前只覆盖通用后端和基础设施：后端镜像没有安装 `contract-review` Extra，Compose 也没有挂载 Qwen、第二版 RAG 和合同对象存储配置，因此直接在新机器执行它不会启用真实合同上传审阅。
+
+**完整合同面试演示：** 按 [合同运行说明](docs/contract-review-core.md) 安装 `contract-review` Extra、配置 `deploy/secrets/contract-review.json`、阿里云模型和第二版 RAG，再单独启动合同 API 与 Vite 网页；网页地址为 `http://127.0.0.1:5173/chat`。`/chat` 是面试演示主入口，`/contract-review` 是直接打开合同页面的辅助路由。
 
 **单独开发网页：** 后端就绪后在 `frontend` 执行 `npm ci`、`npm run dev`。网页使用 Vue 3；ReAct 指 Agent 的推理与工具调用模式。
 
-合同页面为 `/contract-review`。需登录、选择租户，并配置 `LAWYER_CONTRACT_REVIEW_CONFIG_FILE`；缺少服务配置时明确返回不可用。具体迁移、环境变量和端口见[运行说明](docs/contract-review-core.md)。
+合同审查需登录、选择租户，并配置 `LAWYER_CONTRACT_REVIEW_CONFIG_FILE`；缺少服务配置时明确返回不可用。具体迁移、环境变量和端口见[运行说明](docs/contract-review-core.md)。
 
 ## 目录分工
 
