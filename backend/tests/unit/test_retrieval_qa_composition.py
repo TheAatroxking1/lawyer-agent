@@ -78,7 +78,7 @@ async def test_lifespan_cleanup_keeps_db_and_redis_cleanup_on_embedding_failure(
     monkeypatch.setattr(
         dependencies, "create_engine", lambda _: types.SimpleNamespace(dispose=dispose)
     )
-    monkeypatch.setattr(dependencies, "create_session_factory", lambda _: object())
+    monkeypatch.setattr(dependencies, "create_session_factory", lambda _: _session_factory)
     monkeypatch.setattr(
         dependencies.RedisAsyncioAdapter,
         "from_url",
