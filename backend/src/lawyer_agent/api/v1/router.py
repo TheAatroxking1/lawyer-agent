@@ -6,6 +6,8 @@ from lawyer_agent.api.v1 import (
     ai_jobs,
     audit,
     auth,
+    contract_reviews,
+    conversations,
     invitations,
     legal_chat,
     legal_corpus,
@@ -34,3 +36,5 @@ api_v1_router.include_router(audit.router)
 api_v1_router.include_router(legal_corpus.router)
 api_v1_router.include_router(legal_chat.router)
 api_v1_router.include_router(legal_retrieval_qa.router)
+api_v1_router.include_router(contract_reviews.router)
+api_v1_router.include_router(conversations.router)

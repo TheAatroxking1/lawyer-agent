@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -148,6 +148,50 @@ async def test_search_empty_results_returns_empty() -> None:
         query="无此内容", model_ref="m", dimension=4, index_name="idx"
     )
     assert hits == ()
+
+
+async def test_multiple_versions_share_one_embedding_and_identical_scope() -> None:
+    other_version = new_uuid7()
+    recorder = _Recorder()
+    transport = _Transport([[_hit_raw(A, PA, 2.0)], [_hit_raw(A, PA, 1.0)]])
+    service = LegalHybridSearchService(
+        ModelGateway(_Provider(), recorder),
+        OpenSearchRestClient(base_url="http://os:9200", transport=transport),
+    )
+    hits = await service.search(
+        query="示例法第一章", model_ref="m", dimension=4, index_name="idx",
+        version_ids=(VERSION, other_version),
+    )
+    assert len(hits) == 1 and hits[0].chunk_id == A
+    assert len(recorder.records) == 1
+    bm25, knn = [_json(request) for request in transport.requests]
+    expected = {"terms": {"version_id": [str(VERSION), str(other_version)]}}
+    assert bm25["query"]["bool"]["filter"] == [expected]
+    assert knn["query"]["knn"]["content_vector"]["filter"] == expected
+
+
+@pytest.mark.parametrize("scope", [(), (VERSION, VERSION), (uuid4(),), [VERSION]])
+async def test_invalid_multi_version_scope_is_rejected_before_embedding(scope: object) -> None:
+    recorder = _Recorder()
+    transport = _Transport([])
+    service = LegalHybridSearchService(
+        ModelGateway(_Provider(), recorder), OpenSearchRestClient(transport=transport),
+    )
+    with pytest.raises(ModelInputInvalid):
+        await service.search(
+            query="示例法", model_ref="m", dimension=4, index_name="idx", version_ids=scope,
+        )
+    assert recorder.records == [] and transport.requests == []
+
+
+async def test_single_and_multi_version_scope_are_mutually_exclusive() -> None:
+    transport = _Transport([])
+    with pytest.raises(ModelInputInvalid, match="mutually exclusive"):
+        await _service(transport).search(
+            query="示例法", model_ref="m", dimension=4, index_name="idx",
+            version_id=VERSION, version_ids=(VERSION,),
+        )
+    assert transport.requests == []
 
 
 async def test_search_truncates_to_limit() -> None:

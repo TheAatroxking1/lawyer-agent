@@ -48,7 +48,7 @@ def _json_body(request: httpx.Request) -> dict[str, object]:
 
 
 async def test_ensure_index_with_vector_dimension_adds_knn_mapping() -> None:
-    transport = RecordingTransport([httpx.Response(200, json={})])
+    transport = RecordingTransport([httpx.Response(200, json={"acknowledged": True})])
     client = OpenSearchRestClient(transport=transport)
     await client.ensure_index("legal_corpus_v2", vector_dimension=1792)
     payload = _json_body(transport.requests[0])
@@ -59,7 +59,7 @@ async def test_ensure_index_with_vector_dimension_adds_knn_mapping() -> None:
 
 
 async def test_ensure_index_without_vector_dimension_keeps_text_only() -> None:
-    transport = RecordingTransport([httpx.Response(200, json={})])
+    transport = RecordingTransport([httpx.Response(200, json={"acknowledged": True})])
     client = OpenSearchRestClient(transport=transport)
     await client.ensure_index("legal_corpus_v1")
     props = _json_body(transport.requests[0])["mappings"]["properties"]

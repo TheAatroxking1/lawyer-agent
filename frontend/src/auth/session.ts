@@ -7,6 +7,12 @@
 
 export const ACCESS_TOKEN_KEY = 'lawyer_agent.access_token'
 export const TENANT_TOKEN_KEY = 'lawyer_agent.tenant_access_token'
+export const ACTIVE_TENANT_KEY = 'lawyer_agent.active_tenant'
+export interface ActiveTenant { tenant_id: string; membership_id: string; name?: string }
+
+export function tokenClaims(token: string | null): Record<string, unknown> | null {
+  try { return JSON.parse(atob((token ?? '').split('.')[1]!.replaceAll('-', '+').replaceAll('_', '/'))) as Record<string, unknown> } catch { return null }
+}
 
 export interface TokenStorage {
   getItem(key: string): string | null
@@ -22,6 +28,11 @@ export interface Session {
   readTenantToken(): string | null
   saveTenantToken(token: string): void
   clearTenantToken(): void
+  readActiveTenant(): ActiveTenant | null
+  saveActiveTenant(tenant: ActiveTenant): void
+  clearActiveTenant(): void
+  accountIdentity(): string | null
+  tenantIdentity(): string | null
 }
 
 function browserStorage(): TokenStorage | null {
@@ -60,6 +71,24 @@ export function createSession(storage: TokenStorage | null = browserStorage()): 
     clearTenantToken(): void {
       if (!storage) return
       storage.removeItem(TENANT_TOKEN_KEY)
+    },
+    readActiveTenant() {
+      try {
+        const value = JSON.parse(storage?.getItem(ACTIVE_TENANT_KEY) ?? 'null') as ActiveTenant | null
+        return value && typeof value.tenant_id === 'string' && typeof value.membership_id === 'string' ? value : null
+      } catch { return null }
+    },
+    saveActiveTenant(tenant) { storage?.setItem(ACTIVE_TENANT_KEY, JSON.stringify(tenant)) },
+    clearActiveTenant() { storage?.removeItem(ACTIVE_TENANT_KEY) },
+    accountIdentity() {
+      const token = this.readToken()
+      const claims = tokenClaims(token)
+      return claims ? `${String(claims.sub)}:${String(claims.sid)}:${String(claims.auth_version)}` : token
+    },
+    tenantIdentity() {
+      const account = this.accountIdentity()
+      const tenant = this.readActiveTenant()
+      return account && tenant ? `${account}:${tenant.tenant_id}:${tenant.membership_id}` : null
     },
   }
 }

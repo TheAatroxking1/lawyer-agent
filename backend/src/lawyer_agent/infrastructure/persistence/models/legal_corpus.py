@@ -28,6 +28,16 @@ class LegalInstrumentModel(TimestampMixin, Base):
     __tablename__ = "legal_instruments"
     __table_args__ = (
         UniqueConstraint("title", "jurisdiction", name="uq_legal_instruments_title_jur"),
+        CheckConstraint(
+            "CAST(category AS BINARY) IN ("
+            "CAST('constitution' AS BINARY),CAST('law' AS BINARY),"
+            "CAST('administrative_regulation' AS BINARY),"
+            "CAST('judicial_interpretation' AS BINARY),"
+            "CAST('local_regulation' AS BINARY),"
+            "CAST('supervisory_regulation' AS BINARY),"
+            "CAST('unknown' AS BINARY))",
+            name="ck_legal_instruments_category",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(UuidBinary(), primary_key=True)
@@ -35,6 +45,9 @@ class LegalInstrumentModel(TimestampMixin, Base):
     issuing_authority: Mapped[str] = mapped_column(String(256), nullable=False)
     jurisdiction: Mapped[str] = mapped_column(String(64), nullable=False)
     region_code: Mapped[str | None] = mapped_column(String(16))
+    category: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="unknown"
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
 
 
@@ -99,8 +112,11 @@ class LegalProvisionModel(TimestampMixin, Base):
 class LegalChunkModel(TimestampMixin, Base):
     __tablename__ = "legal_chunks"
     __table_args__ = (
-        UniqueConstraint(
-            "version_id", "provision_id", "chunk_type", name="uq_legal_chunks_prov_type"
+        CheckConstraint(
+            "(parent_relative_char_start IS NULL AND parent_relative_char_end IS NULL) OR "
+            "(parent_relative_char_start IS NOT NULL AND parent_relative_char_end IS NOT NULL "
+            "AND parent_relative_char_start >= 0 "
+            "AND parent_relative_char_end > parent_relative_char_start)", name="span",
         ),
         CheckConstraint(
             "quality IN ('ok','degraded','failed')",
@@ -117,6 +133,7 @@ class LegalChunkModel(TimestampMixin, Base):
         ForeignKeyConstraint(
             ["parent_chunk_id"], ["legal_chunks.id"], name="fk_legal_chunks_parent_id_legal_chunks"
         ),
+        Index("ix_legal_chunks_version_id", "version_id"),
         Index("ix_legal_chunks_provision_id", "provision_id"),
     )
 
@@ -129,6 +146,8 @@ class LegalChunkModel(TimestampMixin, Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[bytes] = mapped_column(BINARY(32), nullable=False)
     parser_version: Mapped[str | None] = mapped_column(String(64))
+    parent_relative_char_start: Mapped[int | None] = mapped_column(Integer)
+    parent_relative_char_end: Mapped[int | None] = mapped_column(Integer)
 
 
 class LegalDatasetSnapshotModel(TimestampMixin, Base):

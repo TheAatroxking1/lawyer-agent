@@ -4,9 +4,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import LargeBinary, delete, func, select, update
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import (
@@ -15,6 +17,7 @@ from lawyer_agent.domain.legal_corpus import (
     LoadBatch,
     LoadStatus,
 )
+from lawyer_agent.infrastructure.persistence.json_documents import read_json_document
 from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalDatasetSnapshotModel,
     LegalLoadBatchModel,
@@ -50,14 +53,16 @@ def _load_batch(model: LegalLoadBatchModel) -> LoadBatch:
     )
 
 
-def _dataset(model: LegalDatasetSnapshotModel) -> DatasetSnapshot:
+def _dataset(
+    model: LegalDatasetSnapshotModel, manifest: dict[str, Any], quality_metrics: dict[str, Any]
+) -> DatasetSnapshot:
     return DatasetSnapshot(
         id=model.id,
         dataset_name=model.dataset_name,
         parser_version=model.parser_version,
         state=_DATASET_STATE_MAP[model.state],
-        manifest=model.manifest_json,
-        quality_metrics=model.quality_metrics_json,
+        manifest=manifest,
+        quality_metrics=quality_metrics,
         released_at=_aware_optional(model.released_at),
     )
 
@@ -70,9 +75,7 @@ class SqlAlchemyLegalCorpusInventoryRepository:
 
     async def find_batch_by_sha256(self, file_sha256: bytes) -> LoadBatch | None:
         model = await self._session.scalar(
-            select(LegalLoadBatchModel).where(
-                LegalLoadBatchModel.file_sha256 == file_sha256
-            )
+            select(LegalLoadBatchModel).where(LegalLoadBatchModel.file_sha256 == file_sha256)
         )
         return None if model is None else _load_batch(model)
 
@@ -81,18 +84,52 @@ class SqlAlchemyLegalCorpusInventoryRepository:
         await self._session.flush()
 
     async def find_dataset(self, dataset_name: str) -> DatasetSnapshot | None:
-        model = await self._session.scalar(
-            select(LegalDatasetSnapshotModel).where(
-                LegalDatasetSnapshotModel.dataset_name == dataset_name
+        row = (
+            await self._session.execute(
+                select(
+                    LegalDatasetSnapshotModel,
+                    func.sha2(sql_cast(LegalDatasetSnapshotModel.manifest_json, LargeBinary), 256),
+                    func.sha2(
+                        sql_cast(LegalDatasetSnapshotModel.quality_metrics_json, LargeBinary), 256
+                    ),
+                )
+                .options(
+                    defer(LegalDatasetSnapshotModel.manifest_json),
+                    defer(LegalDatasetSnapshotModel.quality_metrics_json),
+                )
+                .where(LegalDatasetSnapshotModel.dataset_name == dataset_name)
+                .execution_options(populate_existing=True)
             )
+        ).one_or_none()
+        if row is None:
+            return None
+        model, manifest_digest, quality_digest = row
+        manifest = await read_json_document(
+            self._session,
+            select(LegalDatasetSnapshotModel.manifest_json).where(
+                LegalDatasetSnapshotModel.id == model.id
+            ),
+            expected_sha256=manifest_digest,
         )
-        return None if model is None else _dataset(model)
+        quality = await read_json_document(
+            self._session,
+            select(LegalDatasetSnapshotModel.quality_metrics_json).where(
+                LegalDatasetSnapshotModel.id == model.id
+            ),
+            expected_sha256=quality_digest,
+        )
+        if manifest is None or quality is None:
+            raise ValueError("dataset_snapshot_json_missing")
+        return _dataset(model, manifest, quality)
 
     async def upsert_dataset(self, snapshot: DatasetSnapshot) -> None:
         model = await self._session.scalar(
-            select(LegalDatasetSnapshotModel).where(
-                LegalDatasetSnapshotModel.dataset_name == snapshot.dataset_name
+            select(LegalDatasetSnapshotModel)
+            .options(
+                defer(LegalDatasetSnapshotModel.manifest_json),
+                defer(LegalDatasetSnapshotModel.quality_metrics_json),
             )
+            .where(LegalDatasetSnapshotModel.dataset_name == snapshot.dataset_name)
         )
         if model is None:
             self._session.add(_dataset_model(snapshot))
@@ -146,9 +183,7 @@ class SqlAlchemyLegalCorpusInventoryRepository:
         if file_sha256 is None or len(file_sha256) != 32:
             raise ValueError("quality issue file sha256 must be 32 bytes")
         await self._session.execute(
-            delete(LegalQualityIssueModel).where(
-                LegalQualityIssueModel.batch_id == batch_id
-            )
+            delete(LegalQualityIssueModel).where(LegalQualityIssueModel.batch_id == batch_id)
         )
         for issue in issues:
             if not isinstance(issue, str) or not issue:

@@ -14,14 +14,14 @@
 - 标题和说明性文字必须使用简体中文，不保留成段英文说明。
 - 命令、文件路径、代码标识符、API 路径和 `LangChain`、`LangGraph`、`MCP`、`RBAC`、`ABAC`、`Evidence Bundle` 等固定技术术语保持原样。
 - 不得改变现有中国大陆法域、证据优先、多租户隔离、人工复核、隐私和工程门禁的含义。
-- 必须同步更新 `AGENTS.md` 与 `docs/superpowers/plans/2026-08-31-agents-md.md` 中的完整内嵌版本及验证关键词。
+- 必须同步更新 `AGENTS.md` 与 `docs/history/plans/2026-08-31-agents-md.md` 中的完整内嵌版本及验证关键词。
 - 所有修改使用 UTF-8，不得引入凭据、私有法律数据、临时任务状态或占位内容。
 
 ## File Map
 
 ```text
 AGENTS.md                                      # 中文仓库级开发指引
-docs/superpowers/plans/2026-08-31-agents-md.md # 同步保存中文 exact content 与契约
+docs/history/plans/2026-08-31-agents-md.md # 同步保存中文 exact content 与契约
 ```
 
 ---
@@ -30,7 +30,7 @@ docs/superpowers/plans/2026-08-31-agents-md.md # 同步保存中文 exact conten
 
 **Files:**
 - Modify: `AGENTS.md`
-- Modify: `docs/superpowers/plans/2026-08-31-agents-md.md`
+- Modify: `docs/history/plans/2026-08-31-agents-md.md`
 
 **Interfaces:**
 - Consumes: 已批准中文化设计、现有英文 `AGENTS.md`、企业架构规格和原实施计划。
@@ -205,7 +205,7 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml config --quiet
 
 - [ ] **Step 3: 同步原实施计划中的 exact content 与契约**
 
-在 `docs/superpowers/plans/2026-08-31-agents-md.md` 中执行两项精确修改：
+在 `docs/history/plans/2026-08-31-agents-md.md` 中执行两项精确修改：
 
 1. 将 `Step 2` 的整个四反引号 `markdown` 内容块替换为本计划 `Step 2` 给出的完整中文内容，保持末尾换行一致。
 2. 将 `Step 3` 中 `$required` 数组替换为：
@@ -254,7 +254,7 @@ $englishHeadings = [regex]::Matches($content, '(?m)^#{1,2}\s+(Scope|Read before|
 if ($englishHeadings.Count -ne 0) {
   throw '仍存在英文说明标题'
 }
-$plan = Get-Content -Raw -Encoding UTF8 docs/superpowers/plans/2026-08-31-agents-md.md
+$plan = Get-Content -Raw -Encoding UTF8 docs/history/plans/2026-08-31-agents-md.md
 $match = [regex]::Match($plan, '(?s)````markdown\r?\n(.*?)\r?\n````')
 if (-not $match.Success) {
   throw '原实施计划缺少 exact content'
@@ -289,7 +289,7 @@ Expected: 当前 12 项测试全部通过，Ruff 输出 `All checks passed!`，m
 运行：
 
 ```powershell
-git add AGENTS.md docs/superpowers/plans/2026-08-31-agents-md.md
+git add AGENTS.md docs/history/plans/2026-08-31-agents-md.md
 git commit -m "docs: localize agent instructions to Chinese"
 git status --short --branch
 ```

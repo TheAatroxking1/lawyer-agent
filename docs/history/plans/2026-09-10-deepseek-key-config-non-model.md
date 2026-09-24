@@ -23,7 +23,7 @@ DeepSeek chat provider（经 ModelGateway）提供配置底座。
     同时给出拒绝；空/空白视为未配置）；
   - JSON 解析严格：仅接受对象含 `api_key` 字符串，拒绝重复键/非对象/多余
     根键/非文本，错误信息不回显内容。
-- 文档：`docs/superpowers/plans/2026-09-10-deepseek-key-config-non-model.md`
+- 文档：`docs/history/plans/2026-09-10-deepseek-key-config-non-model.md`
   即本文件；README 或部署说明在切片内附简短用法。
 
 ## 明确不做

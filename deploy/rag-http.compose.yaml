@@ -1,0 +1,54 @@
+name: lawyer-rag-http
+
+services:
+  rag:
+    image: lawyer-milvus-query:local
+    build:
+      context: ../tools/milvus_query
+      dockerfile: Dockerfile
+      target: runtime
+    entrypoint: ["python", "-m", "uvicorn"]
+    command: ["legal_query.http_service:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--limit-concurrency", "32", "--timeout-graceful-shutdown", "75", "--no-access-log", "--no-proxy-headers"]
+    ports:
+      - "${RAG_BIND_IP:-127.0.0.1}:${RAG_PORT:-8088}:8080"
+    environment:
+      MILVUS_URI: http://standalone:19530
+      MILVUS_DB: blog
+      EMBEDDING_CONFIG_FILE: /run/secrets/embedding.json
+      RAG_API_KEY_FILE: /run/secrets/rag-api-key
+    volumes:
+      - type: bind
+        source: ./secrets/milvus-query.json
+        target: /run/secrets/embedding.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/rag-api-key.txt
+        target: /run/secrets/rag-api-key
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [milvus]
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    cpus: 2
+    mem_limit: 1g
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m,mode=1777"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  milvus:
+    external: true
+    name: milvus

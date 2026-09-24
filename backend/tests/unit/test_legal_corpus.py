@@ -10,6 +10,7 @@ from lawyer_agent.domain.legal_corpus import (
     ChunkType,
     DatasetSnapshot,
     DatasetState,
+    LegalCategory,
     LegalChunk,
     LegalInstrument,
     LegalVersion,
@@ -21,6 +22,31 @@ from lawyer_agent.domain.legal_corpus import (
     QualityIssue,
     content_sha256,
 )
+
+
+def test_legal_category_has_exact_approved_values() -> None:
+    assert {category.value for category in LegalCategory} == {
+        "constitution",
+        "law",
+        "administrative_regulation",
+        "judicial_interpretation",
+        "local_regulation",
+        "supervisory_regulation",
+        "unknown",
+    }
+
+
+def test_instrument_defaults_to_unknown_and_rejects_untyped_category() -> None:
+    instrument = _instrument()
+    assert instrument.category is LegalCategory.UNKNOWN
+    with pytest.raises(ValueError, match="category must be strongly typed"):
+        LegalInstrument(
+            id=new_uuid7(),
+            title="示例法",
+            issuing_authority="示例机关",
+            jurisdiction="national",
+            category="law",  # type: ignore[arg-type]
+        )
 
 
 def _instrument() -> LegalInstrument:

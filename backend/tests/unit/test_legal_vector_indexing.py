@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from uuid import UUID
 
 import httpx
@@ -102,11 +103,29 @@ class RecordingTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if request.url.path.endswith("_bulk"):
+            import json
+
             self._mode = "bulk"
-            return httpx.Response(200, json={"errors": False}, request=request)
+            lines = request.content.decode("utf-8").strip().splitlines()
+            ids = [json.loads(lines[index])["index"]["_id"] for index in range(0, len(lines), 2)]
+            return httpx.Response(
+                200,
+                json={
+                    "errors": False,
+                    "items": [
+                        {"index": {"_id": chunk_id, "status": 201}}
+                        for chunk_id in ids
+                    ],
+                },
+                request=request,
+            )
         if request.url.path.endswith("_delete_by_query"):
             self._mode = "delete"
-            return httpx.Response(200, json={}, request=request)
+            return httpx.Response(
+                200,
+                json={"timed_out": False, "version_conflicts": 0, "failures": []},
+                request=request,
+            )
         if request.method == "PUT":
             return httpx.Response(200, json={}, request=request)
         return httpx.Response(200, json={"ok": True}, request=request)
@@ -188,6 +207,51 @@ async def test_index_version_batches_embeds_and_indexes_vectors() -> None:
     vectors = [document["content_vector"] for document in documents]
     assert all(isinstance(vector, list) and len(vector) == 4 for vector in vectors)
     assert documents[0]["content"] == "第一条 内容甲。"
+
+
+async def test_index_version_embeds_and_indexes_only_leaves() -> None:
+    parent = _chunk(content="第一条全文")
+    child_a = replace(
+        _chunk(content="第一款"),
+        version_id=parent.version_id,
+        provision_id=parent.provision_id,
+        parent_chunk_id=parent.id,
+    )
+    child_b = replace(
+        _chunk(content="第二款"),
+        version_id=parent.version_id,
+        provision_id=parent.provision_id,
+        parent_chunk_id=parent.id,
+    )
+    standalone = _chunk(content="附件全文")
+    transport = RecordingTransport()
+    service, search = _service((parent, child_a, child_b, standalone), transport)
+    count = await service.index_version(
+        version_id=parent.version_id,
+        index_name="legal_corpus_v1",
+        model_ref="embed-m",
+        dimension=4,
+    )
+    assert count == 3
+    assert [document["content"] for document in search.documents] == [
+        "第一款",
+        "第二款",
+        "附件全文",
+    ]
+
+
+async def test_index_version_rejects_damaged_graph_before_search() -> None:
+    child = replace(_chunk(content="悬空子块"), parent_chunk_id=new_uuid7())
+    transport = RecordingTransport()
+    service, search = _service((child,), transport)
+    with pytest.raises(ValueError):
+        await service.index_version(
+            version_id=child.version_id,
+            index_name="legal_corpus_v1",
+            model_ref="embed-m",
+            dimension=4,
+        )
+    assert search.ensure_calls == []
 
 
 async def test_index_version_rejects_bad_batch_size() -> None:

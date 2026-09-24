@@ -18,6 +18,7 @@ from lawyer_agent.domain.legal_corpus import LegalVersionStatus
 def _item(
     *,
     status: LegalVersionStatus = LegalVersionStatus.CURRENT,
+    published_on: date | None = date(2020, 5, 28),
     effective_on: date | None = date(2021, 1, 1),
     repealed_on: date | None = None,
     authorized: bool = True,
@@ -28,7 +29,7 @@ def _item(
         version_id=new_uuid7(),
         version_label="2020 公布版",
         status=status,
-        published_on=date(2020, 5, 28),
+        published_on=published_on,
         effective_on=effective_on,
         repealed_on=repealed_on,
         provision_no="第一条",
@@ -115,3 +116,134 @@ def test_gate_rejects_unauthorized_evidence() -> None:
     )[0]
     assert not verdict.allowed
     assert verdict.reason == "evidence_not_authorized"
+
+
+@pytest.mark.parametrize(
+    ("status", "published_on", "effective_on", "repealed_on", "reason"),
+    [
+        (
+            LegalVersionStatus.DRAFT,
+            date(2020, 1, 1),
+            date(2021, 1, 1),
+            None,
+            "draft_not_effective",
+        ),
+        (
+            LegalVersionStatus.CURRENT,
+            None,
+            date(2021, 1, 1),
+            None,
+            "published_date_unknown",
+        ),
+        (
+            LegalVersionStatus.CURRENT,
+            date(2020, 1, 1),
+            None,
+            None,
+            "effective_date_unknown",
+        ),
+        (
+            LegalVersionStatus.REPEALED,
+            date(2020, 1, 1),
+            date(2021, 1, 1),
+            None,
+            "end_date_unknown",
+        ),
+        (
+            LegalVersionStatus.HISTORICAL,
+            date(2020, 1, 1),
+            date(2021, 1, 1),
+            None,
+            "end_date_unknown",
+        ),
+        (
+            LegalVersionStatus.REPEALED,
+            date(2020, 1, 1),
+            date(2023, 1, 1),
+            date(2022, 1, 1),
+            "effective_date_conflict",
+        ),
+        (
+            LegalVersionStatus.CURRENT,
+            date(2020, 1, 1),
+            date(2021, 1, 1),
+            date(2022, 1, 1),
+            "repealed_on_target_date",
+        ),
+    ],
+)
+def test_gate_rejects_incomplete_or_conflicting_version_metadata(
+    status: LegalVersionStatus,
+    published_on: date | None,
+    effective_on: date | None,
+    repealed_on: date | None,
+    reason: str,
+) -> None:
+    item = _item(
+        status=status,
+        published_on=published_on,
+        effective_on=effective_on,
+        repealed_on=repealed_on,
+    )
+    verdict = CitationGate().verify(
+        EvidenceBundle((item,)),
+        (Citation(0, item.evidence_id),),
+        target_date=date(2023, 1, 1),
+    )[0]
+    assert not verdict.allowed
+    assert verdict.reason == reason
+
+
+def test_gate_allows_complete_historical_interval_including_repeal_date() -> None:
+    item = _item(
+        status=LegalVersionStatus.HISTORICAL,
+        published_on=date(2019, 1, 1),
+        effective_on=date(2020, 1, 1),
+        repealed_on=date(2022, 1, 1),
+    )
+    verdict = CitationGate().verify(
+        EvidenceBundle((item,)),
+        (Citation(0, item.evidence_id),),
+        target_date=date(2022, 1, 1),
+    )[0]
+    assert verdict.allowed
+
+
+def test_gate_keeps_authorization_and_unknown_status_priority() -> None:
+    unauthorized = _item(
+        status=LegalVersionStatus.DRAFT,
+        published_on=None,
+        effective_on=None,
+        authorized=False,
+    )
+    unknown = _item(
+        status=LegalVersionStatus.STATUS_UNKNOWN,
+        published_on=None,
+        effective_on=None,
+    )
+    gate = CitationGate()
+    unauthorized_verdict = gate.verify(
+        EvidenceBundle((unauthorized,)),
+        (Citation(0, unauthorized.evidence_id),),
+        target_date=date(2023, 1, 1),
+    )[0]
+    unknown_verdict = gate.verify(
+        EvidenceBundle((unknown,)),
+        (Citation(0, unknown.evidence_id),),
+        target_date=date(2023, 1, 1),
+    )[0]
+    assert unauthorized_verdict.reason == "evidence_not_authorized"
+    assert unknown_verdict.reason == "effective_status_unknown"
+
+
+def test_gate_does_not_treat_publication_after_effective_date_as_conflict() -> None:
+    item = _item(
+        published_on=date(2021, 2, 1),
+        effective_on=date(2021, 1, 1),
+    )
+    verdict = CitationGate().verify(
+        EvidenceBundle((item,)),
+        (Citation(0, item.evidence_id),),
+        target_date=date(2023, 1, 1),
+    )[0]
+    assert verdict.allowed

@@ -54,6 +54,7 @@ class _Hybrid:
         limit: int,
         bm25_size: int,
         knn_size: int,
+        version_ids: tuple[UUID, ...] | None = None,
     ) -> tuple[LegalSearchHit, ...]:
         self._recorder.calls.append(
             {
@@ -65,6 +66,7 @@ class _Hybrid:
                 "limit": limit,
                 "bm25_size": bm25_size,
                 "knn_size": knn_size,
+                "version_ids": version_ids,
             }
         )
         return (
@@ -87,12 +89,25 @@ class _Alias:
         return self._target
 
 
+class _Navigation:
+    def __init__(self, candidates: tuple[UUID, ...] | None = None) -> None:
+        self.candidates = candidates
+        self.calls: list[tuple[str, str]] = []
+
+    async def candidate_versions(
+        self, *, main_index_name: str, query: str,
+    ) -> tuple[UUID, ...] | None:
+        self.calls.append((main_index_name, query))
+        return self.candidates
+
+
 def _service(target: str | None) -> tuple[LegalDatasetSearchService, _Recorder]:
     recorder = _Recorder()
     return (
         LegalDatasetSearchService(
             hybrid=_Hybrid(recorder),
             alias=_Alias(target),
+            navigation=_Navigation(),
         ),
         recorder,
     )
@@ -167,8 +182,52 @@ async def test_search_dataset_returns_empty_when_hybrid_has_no_hits() -> None:
     service = LegalDatasetSearchService(
         hybrid=EmptyHybrid(),  # type: ignore[arg-type]
         alias=_Alias("legal_idx_2024"),
+        navigation=_Navigation(),
     )
     hits = await service.search_dataset(
         alias="dataset_v1", query="无此内容", model_ref="m", dimension=8
     )
     assert hits == ()
+
+
+async def test_navigation_candidates_scope_the_single_hybrid_call() -> None:
+    recorder = _Recorder()
+    navigation = _Navigation((VERSION,))
+    service = LegalDatasetSearchService(
+        hybrid=_Hybrid(recorder), alias=_Alias("legal_idx_2024"), navigation=navigation,
+    )
+    await service.search_dataset(alias="dataset_v1", query="示例法", model_ref="m", dimension=8)
+    assert navigation.calls == [("legal_idx_2024", "示例法")]
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0]["version_ids"] == (VERSION,)
+    assert recorder.calls[0]["version_id"] is None
+
+
+async def test_explicit_version_bypasses_navigation() -> None:
+    recorder = _Recorder()
+    navigation = _Navigation((new_uuid7(),))
+    service = LegalDatasetSearchService(
+        hybrid=_Hybrid(recorder), alias=_Alias("legal_idx_2024"), navigation=navigation,
+    )
+    await service.search_dataset(
+        alias="dataset_v1", query="示例法", model_ref="m", dimension=8, version_id=VERSION,
+    )
+    assert navigation.calls == []
+    assert recorder.calls[0]["version_id"] == VERSION
+    assert recorder.calls[0]["version_ids"] is None
+
+
+async def test_navigation_infrastructure_failure_is_not_empty_candidates() -> None:
+    class FailedNavigation(_Navigation):
+        async def candidate_versions(
+            self, *, main_index_name: str, query: str,
+        ) -> tuple[UUID, ...] | None:
+            raise RuntimeError("navigation unavailable")
+
+    recorder = _Recorder()
+    service = LegalDatasetSearchService(
+        hybrid=_Hybrid(recorder), alias=_Alias("legal_idx_2024"), navigation=FailedNavigation(),
+    )
+    with pytest.raises(RuntimeError, match="navigation unavailable"):
+        await service.search_dataset(alias="dataset_v1", query="示例法", model_ref="m", dimension=8)
+    assert recorder.calls == []

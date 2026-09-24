@@ -1,0 +1,20 @@
+# Allow only dependency manifests and runtime source into the build context.
+*
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!simple_search.py
+!evaluate_ragas.py
+!evaluate_ragas_answers.py
+!legal_query/
+!legal_query/**
+!tests/
+!tests/**
+**/__pycache__/
+**/*.py[cod]
+**/.env*
+**/secrets/
+**/*.json
+**/*.pem
+**/*.key

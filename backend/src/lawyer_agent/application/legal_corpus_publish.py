@@ -15,8 +15,11 @@ from lawyer_agent.domain.legal_corpus import (
     DatasetState,
     LoadBatch,
 )
+from lawyer_agent.domain.legal_dataset_quality import ArticleNumberingReview
 
-_ARTICLE_NO = re.compile(r"第([一二三四五六七八九十百千零〇0-9０-９]+)条")
+_NUMBER_PATTERN = r"[一二三四五六七八九十百千零〇0-9０-９]+"
+_ARTICLE_NO = re.compile(rf"第({_NUMBER_PATTERN})条(?:之({_NUMBER_PATTERN}))?")
+_LEGACY_NUMERIC_ARTICLE_NO = re.compile(r"[0-9０-９]+")
 
 
 class LegalCorpusPublishPort(Protocol):
@@ -49,25 +52,48 @@ class QualityReport:
     issues: tuple[str, ...]
 
 
-def _cn_number(value: str) -> int:
-    digits = {
-        "零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
-        "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
-    }
-    if value.isdigit() or all(ch in "０１２３４５６７８９" for ch in value):
-        normalized = value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-        return int(normalized)
-    if value in {"十", "10"}:
-        return 10
+def _cn_number(value: str) -> int | None:
+    """Parse positive Arabic or standard Chinese ten/hundred/thousand numerals."""
+    normalized = value.translate(str.maketrans("０１２３４５６７８９〇", "0123456789零"))
+    if re.fullmatch(r"[0-9]+", normalized):
+        try:
+            number = int(normalized)
+            return number if number > 0 else None
+        except ValueError:
+            return None
+    digits = "零一二三四五六七八九"
+    units = {"十": 10, "百": 100, "千": 1000}
     total = 0
     section = 0
-    for ch in value:
+    for ch in normalized:
         if ch in digits:
-            section = digits[ch]
-        elif ch == "十":
-            total += (section if section else 1) * 10
+            section = digits.index(ch)
+        elif ch in units:
+            total += (section if section else 1) * units[ch]
             section = 0
-    return total + section
+        else:
+            return None
+    total += section
+    if not 1 <= total <= 9999:
+        return None
+    # Round-trip validation prevents guessing omitted/repeated/out-of-order units.
+    canonical = ""
+    remaining = total
+    zero_needed = False
+    for unit, suffix in ((1000, "千"), (100, "百"), (10, "十"), (1, "")):
+        digit, remaining = divmod(remaining, unit)
+        if digit:
+            if zero_needed:
+                canonical += "零"
+            if not (unit == 10 and digit == 1 and not canonical):
+                canonical += digits[digit]
+            canonical += suffix
+            zero_needed = False
+        elif canonical and remaining:
+            zero_needed = True
+    if canonical == normalized or (10 <= total <= 19 and "一" + canonical == normalized):
+        return total
+    return None
 
 
 class LegalCorpusQualityGate:
@@ -108,6 +134,8 @@ class LegalCorpusQualityGate:
             issues.append("coverage_below_threshold")
         if required_field_missing:
             issues.append("missing_required_fields")
+        if article_count != len(article_numbers):
+            issues.append("article_count_mismatch")
         sequence_broken = self._sequence_break(article_numbers)
         if sequence_broken is not None:
             issues.append(f"article_sequence_break:{sequence_broken}")
@@ -119,14 +147,58 @@ class LegalCorpusQualityGate:
         }
         return QualityReport(passed=not issues, metrics=metrics, issues=tuple(issues))
 
-    def _sequence_break(self, numbers: tuple[str, ...]) -> str | None:
-        parsed: list[int | None] = []
+    def _sequence_break(
+        self,
+        numbers: tuple[str, ...],
+        *,
+        numbering_review: ArticleNumberingReview | None = None,
+    ) -> str | None:
+        if numbering_review is not None and len(numbers) != (
+            numbering_review.last_article - numbering_review.first_article + 1
+        ):
+            return "reviewed_interval_count"
+        current_article = numbering_review.first_article - 1 if numbering_review else 0
+        current_supplement = 0
         for item in numbers:
-            match = _ARTICLE_NO.search(item)
-            parsed.append(_cn_number(match.group(1)) if match else None)
-        for index, value in enumerate(parsed):
-            if value is not None and value != index + 1:
-                return numbers[index]
+            match = _ARTICLE_NO.fullmatch(item)
+            if match is None:
+                # The parser retains bare Arabic/fullwidth numbers for ordinary
+                # articles. Accept that existing identity without rewriting it.
+                if _LEGACY_NUMERIC_ARTICLE_NO.fullmatch(item) is None:
+                    return item
+                article = _cn_number(item)
+                supplement_token = None
+            else:
+                article = _cn_number(match.group(1))
+                supplement_token = match.group(2)
+            if article is None:
+                return item
+            article_token = match.group(1) if match is not None else item
+            if numbering_review is not None:
+                normalized_token = article_token.translate(
+                    str.maketrans("０１２３４５６７８９", "0123456789")
+                )
+                if (
+                    re.fullmatch(r"[0-9]+", normalized_token)
+                    and len(normalized_token) > 1
+                    and normalized_token.startswith("0")
+                ):
+                    return item
+            if supplement_token is None:
+                if article != current_article + 1:
+                    return item
+                current_article = article
+                current_supplement = 0
+            else:
+                if numbering_review is not None:
+                    return item
+                supplement = _cn_number(supplement_token)
+                if (article != current_article or supplement is None
+                        or supplement != current_supplement + 1):
+                    return item
+                current_supplement = supplement
+        if numbering_review is not None and current_article != numbering_review.last_article:
+            return "reviewed_interval_end"
         return None
 
 

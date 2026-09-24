@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router'
 import { ApiError, apiClient, getInstrument, getVersion, listProvisionsForVersion, listVersionsForInstrument } from '../api'
 import type { InstrumentSummary, LegalVersionSummary, ProvisionSummary } from '../api'
 import ErrorNote from '../components/ErrorNote.vue'
-import { isoDate, versionStatusLabel } from '../lib/format'
+import { isoDate, legalCategoryLabel, versionStatusLabel } from '../lib/format'
 
 const route = useRoute()
 const instrumentId = computed(() => String(route.params.instrumentId ?? ''))
@@ -88,6 +88,7 @@ watch(
         <h1>{{ instrument.title }}</h1>
         <p class="meta">
           <span>{{ instrument.issuing_authority }}</span>
+          <span class="chip">{{ legalCategoryLabel(instrument.category) }}</span>
           <span class="chip">{{ instrument.jurisdiction }}</span>
           <span v-if="instrument.region_code" class="chip">{{ instrument.region_code }}</span>
         </p>

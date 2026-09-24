@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
+from lawyer_agent.application.legal_index_chunks import select_index_leaves
 from lawyer_agent.application.model_gateway import ModelGateway
 from lawyer_agent.domain.legal_corpus import LegalChunk
 from lawyer_agent.infrastructure.search.opensearch import (
@@ -52,7 +53,9 @@ class LegalVectorIndexingService:
     ) -> int:
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
-        all_chunks = await self._chunks.chunks_for_version(version_id)
+        all_chunks = select_index_leaves(
+            await self._chunks.chunks_for_version(version_id)
+        )
         if not all_chunks:
             return 0
         await self._search.ensure_index(index_name, vector_dimension=dimension)

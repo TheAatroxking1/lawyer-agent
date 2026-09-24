@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { authRedirectDecision } from '../auth/guard'
 import { session } from '../auth/session'
+import { ensureSession } from '../auth/transport'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -50,6 +51,12 @@ const router = createRouter({
           meta: { title: '案件文档' },
         },
         {
+          path: 'contract-review',
+          name: 'contract-review',
+          component: () => import('../views/ContractReviewView.vue'),
+          meta: { title: '合同审查' },
+        },
+        {
           path: 'agent-tools',
           name: 'agent-tools',
           component: () => import('../views/AgentToolsView.vue'),
@@ -78,7 +85,8 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
+  try { await ensureSession() } catch { /* Views show recoverable connection errors. */ }
   const redirect = authRedirectDecision({
     routeName: String(to.name ?? ''),
     hasToken: session.isAuthenticated(),

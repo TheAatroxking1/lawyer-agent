@@ -18,7 +18,7 @@ from lawyer_agent.api.dependencies import (
 from lawyer_agent.api.errors import ApiProblem
 from lawyer_agent.application.identity import LoginIdentifier, RegisterCommand
 from lawyer_agent.application.platform import PlatformActor
-from lawyer_agent.application.sessions import SwitchTenantCommand
+from lawyer_agent.application.sessions import REMEMBER_DEVICE_SECONDS, SwitchTenantCommand
 from lawyer_agent.domain.authorization import Principal, PrincipalAudience
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.identity import IdentityKind, normalize_identifier, normalize_username
@@ -95,6 +95,10 @@ class AccessTokenResponse(StrictModel):
     token_type: Literal["Bearer"] = "Bearer"  # noqa: S105
 
 
+class TenantAccessResponse(StrictModel):
+    access_token: str
+
+
 class StepUpResponse(StrictModel):
     access_token: str
     token_type: Literal["Bearer"] = "Bearer"  # noqa: S105
@@ -139,6 +143,7 @@ def _set_session_cookies(
     response.set_cookie(
         REFRESH_COOKIE_NAME,
         refresh_token,
+        max_age=REMEMBER_DEVICE_SECONDS,
         httponly=True,
         secure=True,
         samesite="lax",
@@ -147,6 +152,7 @@ def _set_session_cookies(
     response.set_cookie(
         CSRF_COOKIE_NAME,
         csrf_token,
+        max_age=REMEMBER_DEVICE_SECONDS,
         httponly=False,
         secure=True,
         samesite="lax",
@@ -283,6 +289,20 @@ async def logout(
         httponly=False,
         samesite="lax",
     )
+
+
+@router.post("/tenant-access", response_model=TenantAccessResponse)
+async def tenant_access(
+    body: SwitchTenantRequest, services: Services, current: AccountSession,
+    audit: Audit, trusted_origin: TrustedOrigin,
+) -> TenantAccessResponse:
+    del trusted_origin
+    await _limit(services, SWITCH_RULE, {"session": current.session_id})
+    token = await services.sessions.tenant_access(
+        SwitchTenantCommand(current.session_id, body.tenant_id, body.membership_id),
+        audit_context=audit,
+    )
+    return TenantAccessResponse(access_token=token)
 
 
 @router.post("/switch-tenant", response_model=AccessTokenResponse)

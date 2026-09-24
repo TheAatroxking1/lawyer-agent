@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.application.security_locks import (
@@ -60,8 +60,14 @@ class SecurityWriteLockRepository:
         await self._session.execute(
             select(RefreshTokenRecordModel.id)
             .where(
-                RefreshTokenRecordModel.tenant_id == request.tenant_id,
-                RefreshTokenRecordModel.membership_id.in_(membership_ids),
+                or_(
+                    and_(RefreshTokenRecordModel.tenant_id == request.tenant_id,
+                         RefreshTokenRecordModel.membership_id.in_(membership_ids)),
+                    and_(RefreshTokenRecordModel.session_id == request.actor_session_id,
+                         RefreshTokenRecordModel.user_id == request.actor_user_id,
+                         RefreshTokenRecordModel.tenant_id.is_(None),
+                         RefreshTokenRecordModel.membership_id.is_(None)),
+                ),
             )
             .order_by(
                 RefreshTokenRecordModel.family_id,
@@ -72,10 +78,17 @@ class SecurityWriteLockRepository:
         await self._session.execute(
             select(AuthSessionModel.id)
             .where(
-                AuthSessionModel.tenant_id == request.tenant_id,
                 or_(
-                    AuthSessionModel.id == request.actor_session_id,
-                    AuthSessionModel.membership_id.in_(membership_ids),
+                    and_(
+                        AuthSessionModel.tenant_id == request.tenant_id,
+                        or_(AuthSessionModel.id == request.actor_session_id,
+                            AuthSessionModel.membership_id.in_(membership_ids)),
+                    ),
+                    and_(AuthSessionModel.id == request.actor_session_id,
+                         AuthSessionModel.user_id == request.actor_user_id,
+                         AuthSessionModel.tenant_id.is_(None),
+                         AuthSessionModel.membership_id.is_(None),
+                         AuthSessionModel.authz_version_at_issue.is_(None)),
                 ),
             )
             .order_by(AuthSessionModel.id)

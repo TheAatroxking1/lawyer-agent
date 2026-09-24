@@ -27,6 +27,7 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusVersionNotFound,
 )
 from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.legal_corpus import LegalCategory
 
 
 def test_version_summary_round_trip() -> None:
@@ -59,9 +60,11 @@ def test_instrument_summary_round_trip() -> None:
         issuing_authority="全国人民代表大会",
         jurisdiction="national",
         region_code=None,
+        category=LegalCategory.LAW,
     )
     assert summary.title == "中华人民共和国民法典"
     assert summary.issuing_authority == "全国人民代表大会"
+    assert summary.category is LegalCategory.LAW
 
 
 def test_version_not_found_code() -> None:
@@ -106,6 +109,7 @@ def test_instrument_page_round_trip() -> None:
         issuing_authority="全国人民代表大会",
         jurisdiction="national",
         region_code=None,
+        category=LegalCategory.UNKNOWN,
     )
     page = LegalInstrumentPage(items=[summary], next_before_id=None)
     assert page.items[0].id == instrument_id

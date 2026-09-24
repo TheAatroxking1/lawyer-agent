@@ -1,0 +1,39 @@
+name: lawyer-milvus-query
+
+services:
+  query:
+    image: lawyer-milvus-query:local
+    build:
+      context: ../tools/milvus_query
+      dockerfile: Dockerfile
+      target: runtime
+    environment:
+      MILVUS_URI: http://standalone:19530
+      MILVUS_DB: blog
+      EMBEDDING_CONFIG_FILE: /run/secrets/embedding.json
+    volumes:
+      - type: bind
+        source: ./secrets/milvus-query.json
+        target: /run/secrets/embedding.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - milvus
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 2
+    mem_limit: 1g
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    init: true
+
+networks:
+  milvus:
+    external: true
+    name: milvus

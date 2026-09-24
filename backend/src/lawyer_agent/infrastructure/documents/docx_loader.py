@@ -11,6 +11,7 @@ import re
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import PurePath
+from xml.parsers import expat
 
 from lawyer_agent.domain.common import require_uuid7  # noqa: F401  (kept for hashing parity)
 from lawyer_agent.infrastructure.documents.loader import (
@@ -25,6 +26,9 @@ _BREAK_TAG = f"{_WORD_NS}br"
 _STYLE_TAG = f"{_WORD_NS}pStyle"
 _MAX_PARAGRAPHS = 200_000
 _MAX_TEXT_BYTES = 32 * 1024 * 1024
+_MAX_XML_BYTES = 16 * 1024 * 1024
+_MAX_EXPANDED_BYTES = 64 * 1024 * 1024
+_MAX_ZIP_MEMBERS = 2048
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -48,12 +52,19 @@ class ZipDocxLoader:
             raise InvalidDocx("docx payload has an invalid size")
         try:
             with zipfile.ZipFile(__import__("io").BytesIO(payload)) as archive:
+                infos = archive.infolist()
+                if len(infos) > _MAX_ZIP_MEMBERS:
+                    raise InvalidDocx("docx ZIP member count exceeds the limit")
+                if sum(info.file_size for info in infos) > _MAX_EXPANDED_BYTES:
+                    raise InvalidDocx("docx expanded archive size exceeds the limit")
                 if any(
                     name.lower().endswith((".docm", ".doc", ".zip", ".7z", ".rar"))
                     for name in archive.namelist()
                 ):
                     raise InvalidDocx("macro or archive payloads are not supported")
                 try:
+                    if archive.getinfo("word/document.xml").file_size > _MAX_XML_BYTES:
+                        raise InvalidDocx("docx expanded document XML size exceeds the limit")
                     xml_bytes = archive.read("word/document.xml")
                 except KeyError as exc:
                     raise InvalidDocx("docx is missing word/document.xml") from exc
@@ -64,7 +75,7 @@ class ZipDocxLoader:
 
         try:
             root = _parse_without_entities(xml_bytes)
-        except (ET.ParseError, InvalidDocx) as exc:
+        except (ET.ParseError, expat.ExpatError, InvalidDocx) as exc:
             if isinstance(exc, InvalidDocx):
                 raise
             raise InvalidDocx("docx document xml cannot be parsed") from exc
@@ -101,10 +112,17 @@ def _parse_without_entities(xml_bytes: bytes) -> ET.Element:
     stdlib ElementTree does not resolve external entities, but internal entity
     expansion can still be large; rejecting any DOCTYPE keeps document XML safe.
     """
-    if b"<!DOCTYPE" in xml_bytes or b"<!ENTITY" in xml_bytes:
+    parser = expat.ParserCreate()
+
+    def reject(*_args: object) -> None:
         raise InvalidDocx("docx document xml must not declare a DTD or entities")
-    # DTD/ENTITY are rejected above; stdlib ElementTree never resolves
-    # external entities, so this remaining parse is entity-safe.
+
+    # Let the XML parser detect encoding (including BOM-less UTF-16). Raw byte
+    # substring checks cannot reject declarations consistently across encodings.
+    parser.StartDoctypeDeclHandler = reject
+    parser.EntityDeclHandler = reject
+    parser.Parse(xml_bytes, True)
+    # DTD/ENTITY have been rejected before constructing the document tree.
     return ET.fromstring(xml_bytes)  # noqa: S314
 
 

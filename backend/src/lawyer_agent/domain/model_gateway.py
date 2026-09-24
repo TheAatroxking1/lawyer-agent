@@ -9,7 +9,7 @@ Provider-specific schemas, credentials and model names must never live here.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
@@ -59,15 +59,40 @@ class RankedDocument:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatImage:
+    """Bounded inline image, never a supplier URL or loggable document payload."""
+
+    data: bytes = field(repr=False)
+    media_type: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes) or not 0 < len(self.data) <= 2 * 1024 * 1024:
+            raise ValueError("invalid image size")
+        signatures = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff"}
+        if (
+            self.media_type not in signatures
+            or not self.data.startswith(signatures[self.media_type])
+        ):
+            raise ValueError("invalid image format")
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Literal["system", "user", "assistant"]
     content: str
+    images: tuple[ChatImage, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if self.role not in {"system", "user", "assistant"}:
             raise ValueError("chat role must be system, user or assistant")
         if not isinstance(self.content, str):
             raise ValueError("chat content must be text")
+        if (
+            not isinstance(self.images, tuple) or len(self.images) > 30
+            or any(not isinstance(image, ChatImage) for image in self.images)
+            or (self.images and self.role != "user")
+        ):
+            raise ValueError("invalid chat images")
 
 
 @dataclass(frozen=True, slots=True)

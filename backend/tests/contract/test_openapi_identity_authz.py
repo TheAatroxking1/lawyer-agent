@@ -197,6 +197,7 @@ def test_compose_wires_app_dependencies_and_read_only_secret_files() -> None:
         "LAWYER_REFRESH_TOKEN_KEY_B64_FILE",
         "LAWYER_CSRF_KEY_B64_FILE",
         "LAWYER_JWT_ED25519_KEY_RING_FILE",
+        "LAWYER_DEEPSEEK_API_KEY_FILE",
     } <= file_variables.keys()
     assert {
         "LAWYER_DATA_ENCRYPTION_ACTIVE_KEY_VERSION",
@@ -206,18 +207,28 @@ def test_compose_wires_app_dependencies_and_read_only_secret_files() -> None:
         "LAWYER_COOKIE_SECURE",
         "LAWYER_JWT_ISSUER",
     } <= environment.keys()
-    for path in file_variables.values():
+    generated_secret_targets = set()
+    for name, path in file_variables.items():
         assert path.startswith("/run/secrets/")
         target = path.removeprefix("/run/secrets/")
         assert set(mounted[target]) == {"source", "target"}
         secret_source = mounted[target]["source"]
-        assert compose["secrets"][secret_source] == {"file": f"./secrets/{target}"}
+        if name == "LAWYER_DEEPSEEK_API_KEY_FILE":
+            assert target == "lawyer_deepseek_config"
+            assert compose["secrets"][secret_source] == {
+                "file": "${LAWYER_DEEPSEEK_CONFIG_PATH:-./deepseek.config.example.json}"
+            }
+        else:
+            assert compose["secrets"][secret_source] == {"file": f"./secrets/{target}"}
+            generated_secret_targets.add(target)
 
     gitignore = (REPOSITORY_ROOT / ".gitignore").read_text("utf-8")
     dev_script = (REPOSITORY_ROOT / "scripts/dev.ps1").read_text("utf-8")
     example = (REPOSITORY_ROOT / "deploy/compose.env.example").read_text("utf-8")
     assert "deploy/secrets/" in gitignore
-    assert all(target in dev_script for target in mounted)
+    assert all(target in dev_script for target in generated_secret_targets)
+    assert "deploy/deepseek.config.json" in gitignore
+    assert "LAWYER_DEEPSEEK_CONFIG_PATH=./deepseek.config.example.json" in example
     assert "LAWYER_DATABASE_URL=mysql+asyncmy://lawyer:" in example
     assert "@mysql:3306/lawyer_agent" in example
     assert "LAWYER_DATA_ENCRYPTION_KEY_B64=" in example

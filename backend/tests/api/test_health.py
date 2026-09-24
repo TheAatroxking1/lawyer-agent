@@ -73,3 +73,23 @@ def test_unknown_route_uses_problem_details() -> None:
 def test_request_id_is_reused_as_trace_id() -> None:
     response = build_client().get("/missing", headers={"x-request-id": "request-123"})
     assert response.json()["trace_id"] == "request-123"
+
+
+def test_trusted_origin_put_upload_preflight_is_allowed() -> None:
+    origin = "https://law.example"
+    client = TestClient(create_app(Settings(
+        environment="test", secret_key="x" * 32, trusted_origins=(origin,)
+    )))
+
+    response = client.options(
+        "/api/v1/tenants/tenant-a/contract-reviews/run-a/document",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+    assert "PUT" in response.headers["access-control-allow-methods"]

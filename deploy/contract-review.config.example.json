@@ -1,0 +1,11 @@
+{
+  "retrieval_backend": "window_v2",
+  "dashscope_config_file": "C:/absolute/project/deploy/secrets/dashscope.json",
+  "rag_base_url": "http://127.0.0.1:8089",
+  "rag_api_key_file": "C:/absolute/project/deploy/secrets/rag-api-key.txt",
+  "corpus_root": null,
+  "s3_endpoint": "http://127.0.0.1:9000",
+  "s3_bucket": "lawyer-contracts",
+  "s3_access_key": "",
+  "s3_secret_key": ""
+}

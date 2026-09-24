@@ -2,8 +2,7 @@
 import { ref } from 'vue'
 
 import { ApiError, apiClient, login } from '../api'
-import { refreshAuth } from '../auth/state'
-import { session } from '../auth/session'
+import { acceptLogin } from '../auth/transport'
 import ErrorNote from './ErrorNote.vue'
 
 type AuthMethod = 'wechat' | 'phone' | 'password'
@@ -35,8 +34,7 @@ async function submitPassword(): Promise<void> {
       identifier: name,
       password: password.value,
     })
-    session.saveToken(result.access_token)
-    refreshAuth()
+    acceptLogin(result.access_token)
     emit('success')
   } catch (cause) {
     error.value =
@@ -124,6 +122,7 @@ function pick(next: AuthMethod): void {
           required
         />
       </label>
+      <p class="remember-note">登录后在此浏览器保持登录，退出账号可结束此设备会话。</p>
       <button type="submit" :disabled="busy">{{ busy ? '登录中…' : '登录' }}</button>
     </form>
 

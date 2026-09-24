@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from uuid import UUID
 
@@ -16,6 +17,7 @@ from lawyer_agent.application.legal_corpus_import import (
 )
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import (
+    LegalCategory,
     LegalInstrument,
     LegalVersion,
     LegalVersionStatus,
@@ -36,6 +38,7 @@ def _command(
     jurisdiction: str = JURISDICTION,
     version_label: str = "2020-05-28 公布版",
     status: LegalVersionStatus = LegalVersionStatus.CURRENT,
+    category: LegalCategory = LegalCategory.UNKNOWN,
     law_number: str = "主席令第四十五号",
     text_a: str = "第一条 为了保护民事主体的合法权益，调整民事关系，制定本法。",
     text_b: str | None = (
@@ -78,6 +81,7 @@ def _command(
         dataset_version="dataset_v1",
         parser_version="docx-v1",
         provisions=tuple(provisions),
+        category=category,
     )
 
 
@@ -133,6 +137,7 @@ async def test_import_creates_instrument_version_and_provisions() -> None:
     assert repo.instrument is not None
     assert repo.instrument.title == TITLE
     assert repo.instrument.issuing_authority == AUTHORITY
+    assert repo.instrument.category is LegalCategory.UNKNOWN
     assert len(repo.created_instruments) == 1
     assert len(repo.created_versions) == 1
     assert len(repo.created_provisions) == 2
@@ -177,6 +182,48 @@ async def test_import_replays_same_version_when_content_matches() -> None:
     assert second.version_id == first.version_id
     assert len(repo.created_versions) == 1
     assert len(repo.created_provisions) == 2
+
+
+async def test_import_replays_same_category_and_rejects_different_category_before_write() -> None:
+    instrument = LegalInstrument(
+        id=new_uuid7(),
+        title=TITLE,
+        issuing_authority=AUTHORITY,
+        jurisdiction=JURISDICTION,
+        category=LegalCategory.LAW,
+    )
+    repo = _Repo(instrument=instrument)
+    service = _service(repo)
+    first = await service.import_version(_command(category=LegalCategory.LAW))
+    assert first.replayed is False
+    replay = await service.import_version(_command(category=LegalCategory.LAW))
+    assert replay.replayed is True
+
+    versions_before = list(repo.created_versions)
+    provisions_before = list(repo.created_provisions)
+    with pytest.raises(LegalCorpusImportConflict, match="category"):
+        await service.import_version(
+            _command(
+                category=LegalCategory.JUDICIAL_INTERPRETATION,
+                version_label="2024 公布版",
+            )
+        )
+    assert repo.created_versions == versions_before
+    assert repo.created_provisions == provisions_before
+
+
+async def test_import_rejects_untyped_category() -> None:
+    command = _command()
+    invalid = LegalImportCommand(
+        **{
+            field: getattr(command, field)
+            for field in command.__dataclass_fields__
+            if field != "category"
+        },
+        category="law",  # type: ignore[arg-type]
+    )
+    with pytest.raises(LegalCorpusImportError, match="category must be strongly typed"):
+        await _service(_Repo()).import_version(invalid)
 
 
 async def test_import_conflicts_when_same_label_different_content() -> None:
@@ -224,6 +271,43 @@ async def test_import_conflicts_when_authority_mismatches() -> None:
     repo = _Repo(instrument=existing)
     with pytest.raises(LegalCorpusImportConflict, match="instrument"):
         await _service(repo).import_version(_command())
+
+
+@pytest.mark.parametrize("existing_region,incoming_region", [
+    ("110000", "120000"), (None, "110000"), ("110000", None),
+])
+@pytest.mark.parametrize("new_version", [False, True])
+async def test_import_rejects_region_conflict_before_replay_or_new_writes(
+    existing_region: str | None, incoming_region: str | None, new_version: bool,
+) -> None:
+    repo = _Repo()
+    service = _service(repo)
+    command = replace(_command(), region_code=existing_region)
+    await service.import_version(command)
+    versions_before = dict(repo.versions)
+    provisions_before = list(repo.created_provisions)
+    incoming = replace(command, region_code=incoming_region,
+                       version_label="new-version" if new_version else command.version_label)
+    with pytest.raises(LegalCorpusImportConflict, match="region"):
+        await service.import_version(incoming)
+    assert repo.versions == versions_before
+    assert repo.created_provisions == provisions_before
+    assert len(repo.created_instruments) == 1
+    assert repo.instrument is not None and repo.instrument.region_code == existing_region
+
+
+@pytest.mark.parametrize("region", [None, "110000"])
+async def test_import_same_region_allows_replay_and_new_version(region: str | None) -> None:
+    repo = _Repo()
+    service = _service(repo)
+    command = replace(_command(), region_code=region)
+    first = await service.import_version(command)
+    replay = await service.import_version(command)
+    next_version = await service.import_version(replace(command, version_label="new-version"))
+    assert replay.replayed and replay.version_id == first.version_id
+    assert next_version.instrument_id == first.instrument_id
+    assert not next_version.replayed and next_version.version_id != first.version_id
+    assert len(repo.created_versions) == 2
 
 
 async def test_import_rejects_empty_or_invalid_commands() -> None:

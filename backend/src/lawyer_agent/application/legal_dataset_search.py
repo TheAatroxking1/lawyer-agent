@@ -32,11 +32,18 @@ class _HybridSearchPort(Protocol):
         limit: int,
         bm25_size: int,
         knn_size: int,
+        version_ids: tuple[UUID, ...] | None = None,
     ) -> tuple[LegalSearchHit, ...]: ...
 
 
 class _DatasetAliasPort(Protocol):
     async def active_dataset_index(self, alias: str) -> str | None: ...
+
+
+class _NavigationSearchPort(Protocol):
+    async def candidate_versions(
+        self, *, main_index_name: str, query: str,
+    ) -> tuple[UUID, ...] | None: ...
 
 
 class LegalDatasetSearchService:
@@ -46,6 +53,7 @@ class LegalDatasetSearchService:
         self,
         hybrid: _HybridSearchPort,
         alias: _DatasetAliasPort,
+        navigation: _NavigationSearchPort,
     ) -> None:
         if not hasattr(hybrid, "search"):
             raise ValueError("dataset search requires a hybrid search service")
@@ -53,6 +61,7 @@ class LegalDatasetSearchService:
             raise ValueError("dataset search requires an alias service")
         self._hybrid = hybrid
         self._alias = alias
+        self._navigation = navigation
 
     async def search_dataset(
         self,
@@ -73,6 +82,16 @@ class LegalDatasetSearchService:
             raise LegalDatasetNotPublished(
                 f"dataset {alias} is not published under any index"
             )
+        if version_id is None:
+            candidates = await self._navigation.candidate_versions(
+                main_index_name=index_name, query=query,
+            )
+            if candidates is not None:
+                return await self._hybrid.search(
+                    query=query, model_ref=model_ref, dimension=dimension,
+                    index_name=index_name, version_id=None, version_ids=candidates,
+                    limit=limit, bm25_size=bm25_size, knn_size=knn_size,
+                )
         return await self._hybrid.search(
             query=query,
             model_ref=model_ref,

@@ -21,6 +21,7 @@ def _item(
     *,
     provision_text: str = "承租人应当按照约定的期限支付租金。",
     status: LegalVersionStatus = LegalVersionStatus.CURRENT,
+    published_on: date | None = date(2020, 5, 28),
     effective_on: date | None = date(2021, 1, 1),
     repealed_on: date | None = None,
     authorized: bool = True,
@@ -34,7 +35,7 @@ def _item(
             version_id=version_id,
             version_label="2020",
             status=status,
-            published_on=date(2020, 5, 28),
+            published_on=published_on,
             effective_on=effective_on,
             repealed_on=repealed_on,
             provision_no=provision_no,
@@ -276,6 +277,29 @@ async def test_status_unknown_refused() -> None:
     )
     assert answer.refused is True
     assert answer.reason == "claim_not_supported:effective_status_unknown"
+
+
+@pytest.mark.asyncio
+async def test_draft_evidence_refuses_without_answer_or_citations() -> None:
+    (item,) = _item(status=LegalVersionStatus.DRAFT)
+    service, _, _ = _service(
+        bundle=_bundle(item),
+        chat_text=_claims_json(
+            {"text": "不应流出的草案结论", "evidence_ids": [str(item.evidence_id)]}
+        ),
+    )
+    answer = await service.answer(
+        alias="dataset_v1",
+        question="该规则是否生效？",
+        model_ref="deepseek-chat",
+        dimension=512,
+        target_date=date(2024, 1, 1),
+    )
+    assert answer.refused is True
+    assert answer.reason == "claim_not_supported:draft_not_effective"
+    assert "不应流出的草案结论" not in answer.text
+    assert answer.claims == ()
+    assert answer.citations == ()
 
 
 @pytest.mark.asyncio

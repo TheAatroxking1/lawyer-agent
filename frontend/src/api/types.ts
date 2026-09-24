@@ -27,9 +27,19 @@ export interface RegisterInput {
 }
 
 // GET /api/v1/legal/instruments (LegalInstrumentSummary / LegalInstrumentPage)
+export type LegalCategory =
+  | 'constitution'
+  | 'law'
+  | 'administrative_regulation'
+  | 'judicial_interpretation'
+  | 'local_regulation'
+  | 'supervisory_regulation'
+  | 'unknown'
+
 export interface InstrumentSummary {
   id: string
   title: string
+  category: LegalCategory
   issuing_authority: string
   jurisdiction: string
   region_code: string | null
@@ -117,7 +127,7 @@ export interface RetrievalQuestionInput {
   target_date?: string
 }
 
-// GET /api/v1/accounts/me/tenants and POST /api/v1/auth/switch-tenant
+// GET /api/v1/me/tenants and POST /api/v1/auth/switch-tenant
 export interface AccountTenant {
   tenant_id: string
   membership_id: string

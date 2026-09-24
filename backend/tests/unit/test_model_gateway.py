@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 
 import pytest
@@ -153,6 +154,33 @@ async def test_gateway_embed_success_records_call_and_forwards_timeout() -> None
     assert record.status == "success"
     assert record.vector_count == 2
     assert record.error_code is None
+
+
+async def test_embedding_cancellation_is_recorded_and_propagated():
+    class CancelledProvider(DeterministicProvider):
+        async def embed(self, **kwargs):
+            raise asyncio.CancelledError
+    recorder = MemoryRecorder()
+    with pytest.raises(asyncio.CancelledError):
+        await _gateway(CancelledProvider(), recorder).embed(
+            model_ref="synthetic", texts=("synthetic",), dimension=2,
+        )
+    assert len(recorder.records) == 1
+    assert recorder.records[0].status == "error"
+    assert recorder.records[0].operation == ModelOperation.EMBED
+
+
+@pytest.mark.parametrize("texts", ["synthetic", b"synthetic", bytearray(b"synthetic")])
+async def test_embed_rejects_scalar_text_containers_before_provider(texts):
+    class UncalledProvider(DeterministicProvider):
+        async def embed(self, **kwargs):
+            pytest.fail("scalar text must not become a batch of characters")
+    recorder = MemoryRecorder()
+    with pytest.raises(ModelInputInvalid):
+        await _gateway(UncalledProvider(), recorder).embed(
+            model_ref="synthetic", texts=texts, dimension=2,
+        )
+    assert recorder.records == []
 
 
 async def test_gateway_rejects_blank_model_ref_and_empty_inputs() -> None:

@@ -138,18 +138,52 @@ class CitationGate:
                 citation.claim_index,
                 citation.evidence_id,
             )
-        if target_date < (item.effective_on or date.min):
+        if item.status is LegalVersionStatus.DRAFT:
+            return CitationVerdict(
+                False,
+                "draft_not_effective",
+                citation.claim_index,
+                citation.evidence_id,
+            )
+        if item.published_on is None:
+            return CitationVerdict(
+                False,
+                "published_date_unknown",
+                citation.claim_index,
+                citation.evidence_id,
+            )
+        if item.effective_on is None:
+            return CitationVerdict(
+                False,
+                "effective_date_unknown",
+                citation.claim_index,
+                citation.evidence_id,
+            )
+        if (
+            item.status in {LegalVersionStatus.REPEALED, LegalVersionStatus.HISTORICAL}
+            and item.repealed_on is None
+        ):
+            return CitationVerdict(
+                False,
+                "end_date_unknown",
+                citation.claim_index,
+                citation.evidence_id,
+            )
+        if item.repealed_on is not None and item.effective_on > item.repealed_on:
+            return CitationVerdict(
+                False,
+                "effective_date_conflict",
+                citation.claim_index,
+                citation.evidence_id,
+            )
+        if target_date < item.effective_on:
             return CitationVerdict(
                 False,
                 "not_effective_on_target_date",
                 citation.claim_index,
                 citation.evidence_id,
             )
-        if (
-            item.status is LegalVersionStatus.REPEALED
-            and item.repealed_on is not None
-            and target_date > item.repealed_on
-        ):
+        if item.repealed_on is not None and target_date > item.repealed_on:
             return CitationVerdict(
                 False,
                 "repealed_on_target_date",

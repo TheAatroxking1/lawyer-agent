@@ -1201,8 +1201,14 @@ class TenantService:
             session is None
             or session.id != principal.session_id
             or session.user_id != principal.user_id
-            or session.tenant_id != principal.tenant_id
-            or session.membership_id != principal.membership_id
+            # Account device sessions use the validated token's tenant context;
+            # legacy tenant sessions must still match the stored complete binding.
+            or (session.tenant_id, session.membership_id, session.authz_version_at_issue)
+            not in {
+                (None, None, None),
+                (principal.tenant_id, principal.membership_id,
+                 snapshot.actor_membership.authz_version),
+            }
             or principal.user_id != original_context.membership_user_id
             or principal.tenant_id != original_context.tenant_id
             or principal.membership_id != original_context.membership_id
@@ -1217,7 +1223,6 @@ class TenantService:
             or original_context.authz_version != snapshot.actor_membership.authz_version
             or original_context.session_authz_version
             != snapshot.actor_membership.authz_version
-            or session.authz_version_at_issue != snapshot.actor_membership.authz_version
         ):
             raise TenantAuthorizationDenied("session_invalid")
 

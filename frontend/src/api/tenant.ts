@@ -5,6 +5,7 @@
 
 import { createApiClient } from './client'
 import { session } from '../auth/session'
+import { authenticatedFetch } from '../auth/transport'
 import type {
   CreateMatterInput,
   DocumentHeaderSummary,
@@ -21,6 +22,7 @@ const apiBase: string =
 export const tenantApiClient = createApiClient({
   baseUrl: apiBase,
   tokenProvider: () => session.readTenantToken(),
+  fetchImpl: (url, init) => authenticatedFetch('tenant', url, init),
 })
 
 export async function listMatters(
@@ -78,7 +80,7 @@ export async function downloadReport(
   const headers: Record<string, string> = {}
   const token = session.readTenantToken()
   if (token) headers.Authorization = `Bearer ${token}`
-  const response = await fetch(
+  const response = await authenticatedFetch('tenant',
     `${apiBase}/tenants/${encodeURIComponent(tenantId)}/documents/${encodeURIComponent(documentId)}/report.docx`,
     { headers, signal },
   )

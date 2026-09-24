@@ -27,6 +27,7 @@ def _item(
     evidence_id: UUID,
     *,
     status: LegalVersionStatus = LegalVersionStatus.CURRENT,
+    published_on: date | None = date(2020, 5, 28),
     effective_on: date | None = date(2021, 1, 1),
     repealed_on: date | None = None,
     authorized: bool = True,
@@ -37,7 +38,7 @@ def _item(
         version_id=VERSION,
         version_label="2020 公布版",
         status=status,
-        published_on=date(2020, 5, 28),
+        published_on=published_on,
         effective_on=effective_on,
         repealed_on=repealed_on,
         provision_no="第一条",
@@ -158,6 +159,16 @@ async def test_refused_unknown_status() -> None:
     )
     assert result.refused
     assert result.reason == "claim_not_supported:effective_status_unknown"
+
+
+async def test_refused_missing_published_date_uses_stable_reason() -> None:
+    bundle = _bundle(_item(EVIDENCE_A, published_on=None))
+    result = await _gate(bundle).verify(
+        claims=(LegalClaim(text="结论。", evidence_ids=(EVIDENCE_A,)),),
+        target_date=date(2023, 6, 1),
+    )
+    assert result.refused
+    assert result.reason == "claim_not_supported:published_date_unknown"
 
 
 async def test_refused_empty_claims() -> None:

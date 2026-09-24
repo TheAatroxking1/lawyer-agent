@@ -16,7 +16,7 @@ from lawyer_agent.application.model_gateway import (
     ModelInputInvalid,
 )
 from lawyer_agent.application.retrieval_fusion import reciprocal_rank_fusion
-from lawyer_agent.domain.legal_search import LegalSearchHit
+from lawyer_agent.domain.legal_search import LegalSearchHit, validate_version_scope
 from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
 
 
@@ -51,6 +51,7 @@ class LegalHybridSearchService:
         dimension: int,
         index_name: str,
         version_id: UUID | None = None,
+        version_ids: tuple[UUID, ...] | None = None,
         limit: int = 20,
         bm25_size: int = 100,
         knn_size: int = 100,
@@ -66,6 +67,10 @@ class LegalHybridSearchService:
                 raise ModelInputInvalid(f"{name} must be a positive integer")
         if not isinstance(index_name, str) or not index_name.strip():
             raise ModelInputInvalid("index_name must be non-empty text")
+        try:
+            validate_version_scope(version_id, version_ids)
+        except ValueError as exc:
+            raise ModelInputInvalid(str(exc)) from exc
         if self._chunks is not None and version_id is not None:
             if not await self._chunks.version_is_indexed(version_id):
                 return ()
@@ -75,6 +80,15 @@ class LegalHybridSearchService:
             texts=(query.strip(),),
             dimension=dimension,
         )
+        if version_ids is not None:
+            bm25_hits = await self._search.search_bm25(
+                index_name, query=query.strip(), limit=bm25_size, version_ids=version_ids,
+            )
+            knn_hits = await self._search.search_knn(
+                index_name, query_vector=query_vector.values,
+                limit=knn_size, version_ids=version_ids,
+            )
+            return reciprocal_rank_fusion(bm25_hits, knn_hits)[:limit]
         bm25_hits = await self._search.search_bm25(
             index_name,
             query=query.strip(),

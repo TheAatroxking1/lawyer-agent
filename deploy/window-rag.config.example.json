@@ -1,0 +1,8 @@
+{
+  "embedding_config_file": "C:/绝对路径/deploy/secrets/milvus-query.json",
+  "rerank": {
+    "model": "qwen3-rerank",
+    "endpoint": "https://你的业务空间.cn-beijing.maas.aliyuncs.com/compatible-api/v1/reranks",
+    "api_key_file": null
+  }
+}

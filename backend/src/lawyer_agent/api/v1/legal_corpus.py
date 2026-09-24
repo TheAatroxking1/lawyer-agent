@@ -20,7 +20,7 @@ from lawyer_agent.application.legal_corpus_read import (
     LegalCorpusQueryError,
     LegalCorpusQueryService,
 )
-from lawyer_agent.domain.legal_corpus import DatasetSnapshot, LegalVersion
+from lawyer_agent.domain.legal_corpus import DatasetSnapshot, LegalCategory, LegalVersion
 
 
 class StrictModel(BaseModel):
@@ -47,6 +47,7 @@ class LegalInstrumentSummary(StrictModel):
     issuing_authority: str
     jurisdiction: str
     region_code: str | None = None
+    category: LegalCategory
 
 
 class LegalInstrumentPage(StrictModel):
@@ -318,6 +319,7 @@ async def list_instruments(
             issuing_authority=instrument.issuing_authority,
             jurisdiction=instrument.jurisdiction,
             region_code=instrument.region_code,
+            category=instrument.category,
         )
         for instrument in instruments
     ]
@@ -346,6 +348,7 @@ async def get_instrument(
         issuing_authority=instrument.issuing_authority,
         jurisdiction=instrument.jurisdiction,
         region_code=instrument.region_code,
+        category=instrument.category,
     )
 
 

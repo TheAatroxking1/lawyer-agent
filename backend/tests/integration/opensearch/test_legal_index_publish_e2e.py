@@ -18,12 +18,19 @@ from lawyer_agent.application.legal_index_alias import LegalDatasetAliasService
 from lawyer_agent.application.legal_index_publish import (
     LegalDatasetIndexPublishService,
 )
+from lawyer_agent.application.legal_navigation_index import LegalNavigationIndexService
 from lawyer_agent.application.legal_vector_indexing import (
     LegalVectorIndexingService,
 )
 from lawyer_agent.application.model_gateway import ModelGateway
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.legal_corpus import content_sha256
+from lawyer_agent.domain.legal_corpus import (
+    LegalInstrument,
+    LegalVersion,
+    Provision,
+    content_sha256,
+)
+from lawyer_agent.domain.legal_navigation import navigation_index_name
 from lawyer_agent.domain.model_gateway import (
     CallLimits,
     EmbeddingVector,
@@ -35,6 +42,7 @@ from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
     SqlAlchemyLegalCorpusChunkRepository,
     SqlAlchemyLegalCorpusRepository,
 )
+from lawyer_agent.infrastructure.search.legal_navigation import OpenSearchNavigationClient
 from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
 
 pytestmark = [pytest.mark.integration, pytest.mark.mysql]
@@ -96,6 +104,33 @@ class _ChunkStore:
             async with factory() as session:
                 repo = SqlAlchemyLegalCorpusChunkRepository(session)
                 return await repo.chunks_for_version(version_id)
+        finally:
+            await engine.dispose()
+
+
+class _NavigationSource:
+    def __init__(self, mysql_url: URL) -> None:
+        self._mysql_url = mysql_url
+
+    async def version_with_instrument(
+        self, version_id: UUID
+    ) -> tuple[LegalVersion, LegalInstrument] | None:
+        engine = create_async_engine(self._mysql_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                return await SqlAlchemyLegalCorpusRepository(session).version_with_instrument(
+                    version_id
+                )
+        finally:
+            await engine.dispose()
+
+    async def provisions_for_version(self, version_id: UUID) -> tuple[Provision, ...]:
+        engine = create_async_engine(self._mysql_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                return await SqlAlchemyLegalCorpusRepository(session).provisions_for_version(
+                    version_id
+                )
         finally:
             await engine.dispose()
 
@@ -192,12 +227,15 @@ async def _run_scenario(
     index_b: str,
 ) -> None:
     os_client = OpenSearchRestClient(base_url="http://127.0.0.1:9200")
+    nav_client = OpenSearchNavigationClient(base_url="http://127.0.0.1:9200")
+    navigation = LegalNavigationIndexService(_NavigationSource(mysql_url), nav_client)
     indexer = LegalVectorIndexingService(
         chunks=_ChunkStore(mysql_url),
         gateway=_gateway(),
         search=os_client,
     )
     publisher = LegalDatasetIndexPublishService(
+        navigation=navigation,
         indexer=indexer,
         alias=LegalDatasetAliasService(os_client),
     )
@@ -210,6 +248,8 @@ async def _run_scenario(
             model_ref="synthetic-v1",
             dimension=8,
         )
+        assert await nav_client.navigation_schema(index_a) == 1
+        assert await nav_client.count_documents(navigation_index_name(index_a)) == 1
         assert first.indexed_documents == 1
         assert first.previous_target is None
         assert await alias_service.active_dataset_index(alias) == index_a
@@ -221,11 +261,17 @@ async def _run_scenario(
             model_ref="synthetic-v1",
             dimension=8,
         )
+        assert await nav_client.navigation_schema(index_b) == 1
+        assert await nav_client.count_documents(navigation_index_name(index_b)) == 1
         assert second.indexed_documents == 1
         assert second.previous_target == index_a
         assert await alias_service.active_dataset_index(alias) == index_b
         assert await os_client.index_exists(index_a)  # history index retained
     finally:
+        for main_index in (index_a, index_b):
+            nav_index = navigation_index_name(main_index)
+            assert re.fullmatch(r"lawyer-nav-[a-f0-9]{32}", nav_index)
+            await os_client.delete_index(nav_index)
         await os_client.drop_alias(alias)
         await os_client.delete_index(index_a)
         await os_client.delete_index(index_b)

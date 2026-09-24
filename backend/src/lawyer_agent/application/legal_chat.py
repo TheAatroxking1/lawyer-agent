@@ -1,8 +1,8 @@
-"""Public legal chat HTTP orchestration (non-model glue, DeepSeek gateway).
+"""Public legal chat HTTP orchestration (non-model glue, configured model gateway).
 
 A logged-in account can ask a legal question through the project-owned Model
 Gateway. The gateway/provider are composed by the container from Settings;
-when no DeepSeek API key is configured the service is created with no gateway
+when no model provider is configured the service is created with no gateway
 and every call fails with a stable 503 ``model_provider_unavailable`` -- the
 API never fakes an answer or falls back silently (spec 7.2).
 """
@@ -61,9 +61,9 @@ class _GatewayPort(Protocol):
 class LegalChatHttpService:
     """Composition facade used by the legal chat endpoint."""
 
-    def __init__(self, gateway: _GatewayPort | None) -> None:
+    def __init__(self, gateway: _GatewayPort | None, model_ref: str = "deepseek-chat") -> None:
         self._gateway = gateway
-        self._model_ref = "deepseek-chat"
+        self._model_ref = model_ref
 
     @property
     def gateway_available(self) -> bool:
@@ -72,7 +72,7 @@ class LegalChatHttpService:
     async def chat(self, messages: Sequence[ChatMessage]) -> tuple[str, TokenUsage]:
         _validate_messages(messages)
         if self._gateway is None:
-            raise LegalChatUnavailable("deepseek api key is not configured")
+            raise LegalChatUnavailable("chat provider is not configured")
         from lawyer_agent.application.model_gateway import (
             ModelProviderInvalidResponse,
             ModelProviderTimeout,
@@ -89,21 +89,21 @@ class LegalChatHttpService:
         except (ModelProviderUnavailable, ModelProviderInvalidResponse) as exc:
             raise LegalChatProviderFailure(str(exc)) from exc
 
-    async def chat_stream(self, messages: Sequence[ChatMessage]) -> AsyncIterator[str]:
+    async def chat_stream(
+        self, messages: Sequence[ChatMessage], *, server_owned_history: bool = False
+    ) -> AsyncIterator[str]:
         """Streams answer text deltas when the gateway supports ``chat_stream``.
 
         Validation and capability checks happen before any delta; mid-stream
         provider failures are mapped to the same stable codes as :meth:`chat`
         so the SSE layer can announce an incomplete answer via an ``error`` event.
         """
-        _validate_messages(messages)
+        _validate_messages(messages, server_owned_history=server_owned_history)
         if self._gateway is None:
-            raise LegalChatUnavailable("deepseek api key is not configured")
+            raise LegalChatUnavailable("chat provider is not configured")
         stream_capable = getattr(self._gateway, "chat_stream", None)
         if not callable(stream_capable):
-            raise LegalChatProviderFailure(
-                "chat streaming is not supported by the model gateway"
-            )
+            raise LegalChatProviderFailure("chat streaming is not supported by the model gateway")
         from lawyer_agent.application.model_gateway import (
             ModelProviderInvalidResponse,
             ModelProviderTimeout,
@@ -122,13 +122,13 @@ class LegalChatHttpService:
             raise LegalChatProviderFailure(str(exc)) from exc
 
 
-def _validate_messages(messages: Sequence[ChatMessage]) -> None:
+def _validate_messages(
+    messages: Sequence[ChatMessage], *, server_owned_history: bool = False
+) -> None:
     if not isinstance(messages, Sequence) or not messages:
         raise LegalChatInvalidRequest("messages must be a non-empty sequence")
     if len(messages) > _MAX_MESSAGES:
-        raise LegalChatInvalidRequest(
-            f"messages must contain at most {_MAX_MESSAGES} entries"
-        )
+        raise LegalChatInvalidRequest(f"messages must contain at most {_MAX_MESSAGES} entries")
     for message in messages:
         if not isinstance(message, ChatMessage):
             raise LegalChatInvalidRequest("messages must be strongly typed")
@@ -136,7 +136,10 @@ def _validate_messages(messages: Sequence[ChatMessage]) -> None:
             raise LegalChatInvalidRequest("chat role must be system, user or assistant")
         if not isinstance(message.content, str) or not message.content.strip():
             raise LegalChatInvalidRequest("chat content must be non-empty text")
-        if len(message.content) > _MAX_CONTENT_CHARS:
+        content_limit = (
+            65536 if server_owned_history and message.role == "assistant" else _MAX_CONTENT_CHARS
+        )
+        if len(message.content) > content_limit:
             raise LegalChatInvalidRequest(
-                f"chat content must be at most {_MAX_CONTENT_CHARS} characters"
+                f"chat content must be at most {content_limit} characters"
             )

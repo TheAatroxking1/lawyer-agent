@@ -15,7 +15,9 @@ from alembic import command
 from lawyer_agent.application.legal_index_publish import (
     LegalDatasetIndexPublishService,
 )
+from lawyer_agent.application.legal_navigation_index import NavigationBuildResult
 from lawyer_agent.domain.legal_corpus import DatasetState
+from lawyer_agent.domain.legal_navigation import navigation_index_name
 from lawyer_agent.infrastructure.persistence.repositories.legal_corpus_inventory import (
     SqlAlchemyLegalCorpusInventoryRepository,
 )
@@ -52,6 +54,13 @@ class _FakeIndexer:
         return self._indexed
 
 
+class _FakeNavigation:
+    async def build(
+        self, *, version_ids: tuple[UUID, ...], main_index_name: str, parser_version: str
+    ) -> NavigationBuildResult:
+        return NavigationBuildResult(navigation_index_name(main_index_name), 2)
+
+
 class _FakeAlias:
     def __init__(self, previous: str | None = None) -> None:
         self._previous = previous
@@ -72,6 +81,7 @@ async def _run(mysql_url: URL) -> None:
             repo = SqlAlchemyLegalCorpusInventoryRepository(session)
             alias = _FakeAlias(previous=None)
             service = LegalDatasetIndexPublishService(
+                navigation=_FakeNavigation(),
                 indexer=_FakeIndexer(),
                 alias=alias,
                 snapshot=repo,
@@ -101,8 +111,12 @@ async def _run(mysql_url: URL) -> None:
                 "model_ref": "bge-small-zh",
                 "dimension": 512,
                 "indexed_documents": 3,
+                "navigation_index": navigation_index_name("legal_idx_v1"),
+                "navigation_schema_version": 1,
+                "navigation_documents": 2,
             }
             assert stored.quality_metrics == {
+                "navigation_documents": 2,
                 "indexed_documents": 3,
                 "dimension": 512,
             }
@@ -113,6 +127,7 @@ async def _run(mysql_url: URL) -> None:
         async with factory() as session:
             repo = SqlAlchemyLegalCorpusInventoryRepository(session)
             service = LegalDatasetIndexPublishService(
+                navigation=_FakeNavigation(),
                 indexer=_FakeIndexer(),
                 alias=_FakeAlias(previous="legal_idx_v1"),
                 snapshot=repo,
@@ -132,6 +147,8 @@ async def _run(mysql_url: URL) -> None:
             assert updated.id == first_row_id
             assert updated.manifest["index_name"] == "legal_idx_v2"
             assert updated.quality_metrics["indexed_documents"] == 3
+            assert updated.manifest["navigation_index"] == navigation_index_name("legal_idx_v2")
+            assert updated.quality_metrics["navigation_documents"] == 2
             rows = await repo.find_dataset("dataset_v2")
             assert rows is not None and rows.id == first_row_id
             await session.commit()
@@ -140,6 +157,7 @@ async def _run(mysql_url: URL) -> None:
         async with factory() as session:
             repo = SqlAlchemyLegalCorpusInventoryRepository(session)
             service = LegalDatasetIndexPublishService(
+                navigation=_FakeNavigation(),
                 indexer=_FakeIndexer(indexed=0),
                 alias=_FakeAlias(),
                 snapshot=repo,

@@ -3,9 +3,9 @@
 spec 6.6: build a fresh OpenSearch index for a dataset, then atomically
 re-point the dataset alias so readers get the new current index while older
 indexes remain for history and fast rollback. This service composes the
-vector indexing service (version -> index) with the dataset alias service
-(alias -> index). It never moves data, never writes MySQL and never publishes
-an empty index under an alias.
+vector indexing service (version -> index), verified navigation builder and
+dataset alias service (alias -> index). It never publishes an empty index
+under an alias; an optional repository records the resulting snapshot.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
+from lawyer_agent.application.legal_navigation_index import NavigationBuildResult
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import DatasetSnapshot, DatasetState
 
@@ -58,14 +59,23 @@ class DatasetSnapshotWritePort(Protocol):
     async def upsert_dataset(self, snapshot: DatasetSnapshot) -> None: ...
 
 
+class NavigationBuildPort(Protocol):
+    async def build(
+        self,
+        *,
+        version_ids: tuple[UUID, ...],
+        main_index_name: str,
+        parser_version: str,
+    ) -> NavigationBuildResult: ...
+
+
 class LegalDatasetIndexPublishService:
     """Indexes a version and points the dataset alias at the new index.
 
     Optionally records a PUBLISHED dataset snapshot row after a successful
     alias switch (see spec 6.6: a human-approved release becomes the new
     dataset version that the read/inventory layer can list). Recording is
-    purely additive: callers that construct the service without a snapshot
-    port keep the exact legacy behaviour.
+    purely additive; every publish requires a verified navigation sidecar.
     """
 
     def __init__(
@@ -74,6 +84,7 @@ class LegalDatasetIndexPublishService:
         alias: _AliasPort,
         snapshot: DatasetSnapshotWritePort | None = None,
         *,
+        navigation: NavigationBuildPort,
         dataset_parser_version: str = "docx-zip-v1",
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -81,11 +92,14 @@ class LegalDatasetIndexPublishService:
             raise ValueError("dataset publish requires a vector indexing service")
         if not hasattr(alias, "publish_dataset"):
             raise ValueError("dataset publish requires an alias service")
+        if not hasattr(navigation, "build"):
+            raise ValueError("dataset publish requires a navigation builder")
         if not isinstance(dataset_parser_version, str) or not dataset_parser_version.strip():
             raise ValueError("dataset parser version must be non-empty text")
         self._indexer = indexer
         self._alias = alias
         self._snapshot = snapshot
+        self._navigation = navigation
         self._parser_version = dataset_parser_version
         self._now = now if now is not None else lambda: datetime.now(UTC)
 
@@ -124,6 +138,11 @@ class LegalDatasetIndexPublishService:
                 "no documents indexed; refusing to publish an empty dataset "
                 "under the alias"
             )
+        navigation = await self._navigation.build(
+            version_ids=(version_id,),
+            main_index_name=index_name,
+            parser_version=self._parser_version,
+        )
         previous = await self._alias.publish_dataset(alias, index_name)
         if self._snapshot is not None:
             await self._record_snapshot(
@@ -133,6 +152,7 @@ class LegalDatasetIndexPublishService:
                 model_ref=model_ref,
                 dimension=dimension,
                 indexed_documents=indexed,
+                navigation=navigation,
             )
         return DatasetPublishResult(
             index_name=index_name,
@@ -149,6 +169,7 @@ class LegalDatasetIndexPublishService:
         model_ref: str,
         dimension: int,
         indexed_documents: int,
+        navigation: NavigationBuildResult,
     ) -> None:
         assert self._snapshot is not None
         existing = await self._snapshot.find_dataset(alias)
@@ -164,9 +185,13 @@ class LegalDatasetIndexPublishService:
                 "model_ref": model_ref,
                 "dimension": dimension,
                 "indexed_documents": indexed_documents,
+                "navigation_index": navigation.index_name,
+                "navigation_schema_version": 1,
+                "navigation_documents": navigation.indexed_documents,
             },
             quality_metrics={
                 "indexed_documents": indexed_documents,
+                "navigation_documents": navigation.indexed_documents,
                 "dimension": dimension,
             },
             released_at=self._now(),

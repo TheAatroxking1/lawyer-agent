@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import logging
 from base64 import b64decode
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -102,6 +103,8 @@ class ApplicationServices:
     legal_chat_http: Any = None
     legal_retrieval_qa_http: Any = None
     mcp_gateway_http: Any = None
+    contract_review_http: Any = None
+    conversation_http: Any = None
     invitation_delivery: InvitationDeliveryCapability = field(
         default_factory=lambda: InvitationDeliveryCapability(None)
     )
@@ -210,57 +213,87 @@ async def application_services(
         idempotency=idempotency,
         step_up=step_up,
     )
-    active = ApplicationServices(
-        identity=identity,
-        sessions=sessions,
-        tenancy=tenancy,
-        invitations=invitations,
-        platform=platform,
-        rate_limiter=RateLimiter(
-            redis=redis,
-            hmac_key=_derived_key(b"rate-limit", csrf_key),
-        ),
-        step_up=step_up,
-        csrf=CsrfService(key=csrf_key, trusted_origins=settings.trusted_origins),
-        token_service=token_service,
-        accounts=AccountQueryService(
-            uow_factory=lambda: cast(
-                AccountQueryUnitOfWork,
-                SqlAlchemyAccountQueryUnitOfWork(session_factory),
-            )
-        ),
-        ai_jobs=_build_ai_job_service(session_factory, idempotency),
-        rule_check_http=_build_rule_check_http_service(session_factory, idempotency),
-        matter_document_http=_build_matter_document_http_service(
-            session_factory, idempotency
-        ),
-        document_review_http=_build_document_review_http_service(
-            session_factory, idempotency
-        ),
-        rule_pack_admin_http=_build_rule_pack_admin_http_service(
-            session_factory, idempotency
-        ),
-        audit_query_http=_build_audit_query_http_service(session_factory),
-        legal_corpus_http=_build_legal_corpus_http_service(session_factory),
-        legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
-        legal_chat_http=_build_legal_chat_http_service(settings),
-        legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(
-            settings, session_factory
-        ),
-        mcp_gateway_http=_build_mcp_gateway_http_service(session_factory),
-        invitation_delivery=delivery_capability,
-        readiness=ConcurrentReadinessProbe(
-            checks=(mysql_readiness, redis_readiness),
-            timeout_seconds=2.0,
-        ),
-    )
+    cleanups: list[Callable[[], Awaitable[None]]] = []
     try:
+        contract_review = None
+        if settings.contract_review_config_file is not None:
+            try:
+                from lawyer_agent.infrastructure.contract_review.runtime import (
+                    build_contract_review_service,
+                )
+
+                contract_review = await build_contract_review_service(
+                    settings.contract_review_config_file, session_factory,
+                )
+                cleanups.append(contract_review.aclose)
+            except Exception:
+                # This optional capability fails closed without exporting configuration.
+                logging.getLogger(__name__).error("contract_review_initialization_failed")
+        from lawyer_agent.application.conversations import ConversationService
+        from lawyer_agent.infrastructure.persistence.conversations import ConversationRepository
+
+        legal_chat = _build_legal_chat_http_service(settings, cleanups=cleanups)
+        active = ApplicationServices(
+            identity=identity,
+            sessions=sessions,
+            tenancy=tenancy,
+            invitations=invitations,
+            platform=platform,
+            rate_limiter=RateLimiter(
+                redis=redis,
+                hmac_key=_derived_key(b"rate-limit", csrf_key),
+            ),
+            step_up=step_up,
+            csrf=CsrfService(key=csrf_key, trusted_origins=settings.trusted_origins),
+            token_service=token_service,
+            accounts=AccountQueryService(
+                uow_factory=lambda: cast(
+                    AccountQueryUnitOfWork,
+                    SqlAlchemyAccountQueryUnitOfWork(session_factory),
+                )
+            ),
+            ai_jobs=_build_ai_job_service(session_factory, idempotency),
+            rule_check_http=_build_rule_check_http_service(session_factory, idempotency),
+            matter_document_http=_build_matter_document_http_service(
+                session_factory, idempotency
+            ),
+            document_review_http=_build_document_review_http_service(
+                session_factory, idempotency
+            ),
+            rule_pack_admin_http=_build_rule_pack_admin_http_service(
+                session_factory, idempotency
+            ),
+            audit_query_http=_build_audit_query_http_service(session_factory),
+            legal_corpus_http=_build_legal_corpus_http_service(session_factory),
+            legal_version_diff_http=_build_legal_version_diff_http_service(session_factory),
+            legal_chat_http=legal_chat,
+            conversation_http=ConversationService(
+                ConversationRepository(session_factory), legal_chat,
+            ),
+            legal_retrieval_qa_http=_build_legal_retrieval_qa_http_service(
+                settings, session_factory, cleanups=cleanups
+            ),
+            mcp_gateway_http=_build_mcp_gateway_http_service(session_factory),
+            contract_review_http=contract_review,
+            invitation_delivery=delivery_capability,
+            readiness=ConcurrentReadinessProbe(
+                checks=(mysql_readiness, redis_readiness),
+                timeout_seconds=2.0,
+            ),
+        )
         yield active
     finally:
         try:
-            await redis.aclose()
+            for cleanup in reversed(cleanups):
+                try:
+                    await cleanup()
+                except Exception:
+                    logging.getLogger(__name__).warning("application_resource_close_failed")
         finally:
-            await engine.dispose()
+            try:
+                await redis.aclose()
+            finally:
+                await engine.dispose()
 
 
 def _build_ai_job_service(
@@ -369,11 +402,13 @@ def _build_legal_corpus_http_service(session_factory: Any) -> Any:
     )
 
 
-def _build_legal_chat_http_service(settings: Any) -> Any:
+def _build_legal_chat_http_service(
+    settings: Any, *, cleanups: list[Callable[[], Awaitable[None]]] | None = None,
+) -> Any:
     """Composition root for the public legal chat HTTP service.
 
-    Without a configured DeepSeek API key the gateway is None and every call
-    fails with a stable 503 ``model_provider_unavailable`` (never a fake reply).
+    Configured contract deployments share Qwen with ordinary chat. Legacy
+    deployments retain DeepSeek; invalid configuration fails closed without fallback.
     """
     from lawyer_agent.application.legal_chat import LegalChatHttpService
     from lawyer_agent.application.model_gateway import ModelGateway
@@ -383,6 +418,39 @@ def _build_legal_chat_http_service(settings: Any) -> Any:
         LoggingModelCallRecorder,
     )
 
+    contract_config = getattr(settings, "contract_review_config_file", None)
+    if contract_config is not None:
+        import json
+        from pathlib import Path
+
+        import httpx
+
+        from lawyer_agent.infrastructure.providers.dashscope import (
+            DashScopeChatProvider,
+            DashScopeSettings,
+        )
+
+        try:
+            path = Path(contract_config)
+            if path.stat().st_size > 64 * 1024:
+                raise ValueError("configuration exceeds limit")
+            config = json.loads(path.read_text(encoding="utf-8"))
+            model_settings = DashScopeSettings.load(Path(config["dashscope_config_file"]))
+            if cleanups is None:
+                raise ValueError("chat client requires a lifecycle owner")
+        except (OSError, ValueError, KeyError, TypeError):
+            logging.getLogger(__name__).error("chat_configuration_invalid")
+            return LegalChatHttpService(gateway=None)
+        client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
+        cleanups.append(client.aclose)
+        return LegalChatHttpService(
+            gateway=ModelGateway(
+                provider=DashScopeChatProvider(settings=model_settings, client=client),
+                recorder=LoggingModelCallRecorder(),
+                limits=CallLimits(timeout_seconds=90.0, max_attempts=1),
+            ),
+            model_ref=model_settings.model_name,
+        )
     api_key = getattr(settings, "deepseek_api_key", None)
     if not api_key:
         return LegalChatHttpService(gateway=None)
@@ -409,6 +477,8 @@ def _build_legal_version_diff_http_service(session_factory: Any) -> Any:
 def _build_legal_retrieval_qa_http_service(
     settings: Any,
     session_factory: Any,
+    *,
+    cleanups: list[Callable[[], Awaitable[None]]] | None = None,
 ) -> Any:
     """Composition root for retrieval-grounded Q&A over the legal dataset.
 
@@ -437,6 +507,7 @@ def _build_legal_retrieval_qa_http_service(
     from lawyer_agent.application.legal_index_alias import (
         LegalDatasetAliasService,
     )
+    from lawyer_agent.application.legal_navigation_search import LegalNavigationSearchService
     from lawyer_agent.application.legal_retrieval_qa import (
         DEFAULT_EMBED_DIMENSION,
         DEFAULT_EMBED_MODEL_REF,
@@ -451,6 +522,7 @@ def _build_legal_retrieval_qa_http_service(
     from lawyer_agent.infrastructure.providers.recorder import (
         LoggingModelCallRecorder,
     )
+    from lawyer_agent.infrastructure.search.legal_navigation import OpenSearchNavigationClient
     from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
 
     embed_model_ref = getattr(
@@ -459,10 +531,17 @@ def _build_legal_retrieval_qa_http_service(
     embed_dimension = getattr(
         settings, "embedding_dimension", DEFAULT_EMBED_DIMENSION
     )
+    from lawyer_agent.infrastructure.providers.lifecycle import close_embedding_provider
+
+    provider = LocalSentenceTransformerEmbeddingProvider(
+        model_name_or_path=embed_model_ref,
+        device=getattr(settings, "embedding_device", "cpu"),
+        local_files_only=getattr(settings, "embedding_local_files_only", True),
+    )
+    if cleanups is not None:
+        cleanups.append(lambda: close_embedding_provider(provider))
     embed_gateway = ModelGateway(
-        provider=LocalSentenceTransformerEmbeddingProvider(
-            model_name_or_path=embed_model_ref
-        ),
+        provider=provider,
         recorder=LoggingModelCallRecorder(),
         limits=CallLimits(timeout_seconds=60.0, max_attempts=1),
     )
@@ -472,6 +551,9 @@ def _build_legal_retrieval_qa_http_service(
     dataset_search = LegalDatasetSearchService(
         hybrid=hybrid,
         alias=alias_service,
+        navigation=LegalNavigationSearchService(
+            OpenSearchNavigationClient(base_url=opensearch_url)
+        ),
     )
     assembly = LegalEvidenceAssemblyService(
         query=_LegalEvidenceAssemblyQueryAdapter(session_factory)
@@ -528,6 +610,7 @@ def _corpus_instrument_payload(instrument: Any) -> dict[str, Any]:
         "issuing_authority": instrument.issuing_authority,
         "jurisdiction": instrument.jurisdiction,
         "region_code": instrument.region_code,
+        "category": instrument.category.value,
     }
 
 

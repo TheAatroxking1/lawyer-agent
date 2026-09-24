@@ -5,8 +5,8 @@ from typing import Self
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
-    SqlAlchemyLegalCorpusRepository,
+from lawyer_agent.infrastructure.persistence.repositories.legal_corpus_read import (
+    SqlAlchemyLegalCorpusReadRepository,
 )
 
 
@@ -16,13 +16,13 @@ class SqlAlchemyLegalCorpusReadUnitOfWork:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
-        self.corpus: SqlAlchemyLegalCorpusRepository
+        self.corpus: SqlAlchemyLegalCorpusReadRepository
 
     async def __aenter__(self) -> Self:
         if self._session is not None:
             raise RuntimeError("unit of work is already active")
         self._session = self._session_factory()
-        self.corpus = SqlAlchemyLegalCorpusRepository(self._session)
+        self.corpus = SqlAlchemyLegalCorpusReadRepository(self._session)
         return self
 
     async def __aexit__(

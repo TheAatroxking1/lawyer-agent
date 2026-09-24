@@ -1,6 +1,30 @@
 import { describe, expect, it } from 'vitest'
 
-import { isoDate, versionStatusLabel } from './format'
+import { isoDate, legalCategoryLabel, versionStatusLabel } from './format'
+
+describe('legalCategoryLabel', () => {
+  it.each([
+    ['constitution', '宪法'],
+    ['law', '法律'],
+    ['administrative_regulation', '行政法规'],
+    ['judicial_interpretation', '司法解释'],
+    ['local_regulation', '地方法规'],
+    ['supervisory_regulation', '监察法规'],
+    ['unknown', '类别未知'],
+  ])('maps %s to %s', (category, label) => {
+    expect(legalCategoryLabel(category)).toBe(label)
+  })
+
+  it('uses the unknown label for an absent category', () => {
+    expect(legalCategoryLabel(null)).toBe('类别未知')
+    expect(legalCategoryLabel(undefined)).toBe('类别未知')
+    expect(legalCategoryLabel('')).toBe('类别未知')
+  })
+
+  it('keeps an unrecognized category visible', () => {
+    expect(legalCategoryLabel('departmental_rule')).toBe('departmental_rule')
+  })
+})
 
 describe('versionStatusLabel', () => {
   it('maps known statuses to Chinese labels', () => {

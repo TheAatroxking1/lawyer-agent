@@ -176,19 +176,9 @@ class AIJobModel(VersionMixin, TimestampMixin, Base):
             name="fk_ai_jobs_tenant_membership_user",
         ),
         ForeignKeyConstraint(
-            [
-                "tenant_id",
-                "created_by_session_id",
-                "created_by_user_id",
-                "created_by_membership_id",
-            ],
-            [
-                "auth_sessions.tenant_id",
-                "auth_sessions.id",
-                "auth_sessions.user_id",
-                "auth_sessions.membership_id",
-            ],
-            name="fk_ai_jobs_tenant_session_actor",
+            ["created_by_user_id", "created_by_session_id"],
+            ["auth_sessions.user_id", "auth_sessions.id"],
+            name="fk_ai_jobs_user_session_actor",
         ),
         ForeignKeyConstraint(
             ["tenant_id", "idempotency_record_id"],

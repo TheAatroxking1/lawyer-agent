@@ -18,6 +18,7 @@ from uuid import UUID
 
 from lawyer_agent.domain.common import new_uuid7
 from lawyer_agent.domain.legal_corpus import (
+    LegalCategory,
     LegalInstrument,
     LegalVersion,
     LegalVersionStatus,
@@ -25,10 +26,19 @@ from lawyer_agent.domain.legal_corpus import (
     ProvisionLevel,
     content_sha256,
 )
+from lawyer_agent.domain.legal_parser_profiles import (
+    EXACT_TEXT_HASH_DOMAINS,
+    EXACT_TEXT_PARSER_VERSIONS,
+)
 
 
 class LegalCorpusImportError(ValueError):
     """Base import failure carrying a stable message."""
+
+
+def provision_text_for_parser(text: str, parser_version: str | None) -> str:
+    """Return the persisted provision text for the selected parser profile."""
+    return text if parser_version in EXACT_TEXT_PARSER_VERSIONS else text.strip()
 
 
 class LegalCorpusImportConflict(LegalCorpusImportError):
@@ -60,6 +70,7 @@ class LegalImportCommand:
     dataset_version: str
     parser_version: str
     provisions: tuple[LegalProvisionDraft, ...]
+    category: LegalCategory = LegalCategory.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +96,10 @@ class LegalCorpusImportPort(Protocol):
     async def create_provisions(self, provisions: tuple[Provision, ...]) -> None: ...
 
 
+class _HashSink(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+
 class LegalCorpusImportService:
     """Validates and persists one instrument version with its provisions."""
 
@@ -108,12 +123,22 @@ class LegalCorpusImportService:
                 issuing_authority=command.issuing_authority,
                 jurisdiction=command.jurisdiction,
                 region_code=command.region_code,
+                category=command.category,
             )
             await self._repository.create_instrument(instrument)
         elif instrument.issuing_authority != command.issuing_authority:
             raise LegalCorpusImportConflict(
                 "instrument identity conflicts on issuing authority; "
                 "similar statutes are never merged automatically"
+            )
+        elif instrument.category is not command.category:
+            raise LegalCorpusImportConflict(
+                "instrument identity conflicts on category; existing category is immutable"
+            )
+        elif instrument.region_code != command.region_code:
+            raise LegalCorpusImportConflict(
+                "instrument identity conflicts on region; "
+                "statutes from different or unconfirmed regions are never merged automatically"
             )
 
         existing = await self._repository.find_version(
@@ -131,7 +156,11 @@ class LegalCorpusImportService:
             )
 
         version_id = new_uuid7()
-        provisions = _derive_provisions(version_id, command.provisions)
+        provisions = _derive_provisions(
+            version_id,
+            command.provisions,
+            parser_version=command.parser_version,
+        )
         version = LegalVersion(
             id=version_id,
             instrument_id=instrument.id,
@@ -141,7 +170,10 @@ class LegalCorpusImportService:
             effective_on=command.effective_on,
             repealed_on=command.repealed_on,
             law_number=command.law_number,
-            content_hash=_content_hash(command.provisions),
+            content_hash=_content_hash(
+                command.provisions,
+                parser_version=command.parser_version,
+            ),
             source_ref=command.source_ref,
             dataset_version=command.dataset_version,
             parser_version=command.parser_version,
@@ -172,6 +204,8 @@ def validate_import_command(command: LegalImportCommand) -> None:
             raise LegalCorpusImportError(f"{name} must be non-empty text")
     if not isinstance(command.status, LegalVersionStatus):
         raise LegalCorpusImportError("version status must be strongly typed")
+    if not isinstance(command.category, LegalCategory):
+        raise LegalCorpusImportError("category must be strongly typed")
     if not command.provisions:
         raise LegalCorpusImportError("at least one provision is required")
     numbers: set[str] = set()
@@ -194,12 +228,15 @@ def validate_import_command(command: LegalImportCommand) -> None:
 
 
 def _derive_provisions(
-    version_id: UUID, drafts: tuple[LegalProvisionDraft, ...]
+    version_id: UUID,
+    drafts: tuple[LegalProvisionDraft, ...],
+    *,
+    parser_version: str | None = None,
 ) -> tuple[Provision, ...]:
     derived: list[Provision] = []
     cursor = 0
     for draft in drafts:
-        text = draft.full_text.strip()
+        text = provision_text_for_parser(draft.full_text, parser_version)
         char_start = cursor
         char_end = char_start + len(text)
         cursor = char_end
@@ -220,11 +257,53 @@ def _derive_provisions(
     return tuple(derived)
 
 
-def _content_hash(drafts: tuple[LegalProvisionDraft, ...]) -> bytes:
+def _content_hash(
+    drafts: tuple[LegalProvisionDraft, ...],
+    *,
+    parser_version: str | None = None,
+) -> bytes:
     hasher = sha256()
+    if parser_version in EXACT_TEXT_PARSER_VERSIONS:
+        assert parser_version is not None
+        hasher.update(EXACT_TEXT_HASH_DOMAINS[parser_version])
+        hasher.update(len(drafts).to_bytes(8, "big"))
+        for draft in drafts:
+            hasher.update(b"provision\x00")
+            _update_hash_field(hasher, "provision_no", draft.provision_no)
+            _update_hash_field(hasher, "level", draft.level.value)
+            hasher.update(len(draft.structure_path).to_bytes(8, "big"))
+            for part in draft.structure_path:
+                _update_hash_field(hasher, "structure_path", part)
+            _update_hash_nullable_field(hasher, "title", draft.title)
+            _update_hash_field(hasher, "full_text", draft.full_text)
+        return hasher.digest()
     for draft in drafts:
         hasher.update(draft.full_text.strip().encode("utf-8"))
     return hasher.digest()
+
+
+def _update_hash_field(hasher: _HashSink, name: str, value: str) -> None:
+    encoded_name = name.encode("utf-8")
+    encoded_value = value.encode("utf-8")
+    hasher.update(len(encoded_name).to_bytes(4, "big"))
+    hasher.update(encoded_name)
+    hasher.update(len(encoded_value).to_bytes(8, "big"))
+    hasher.update(encoded_value)
+
+
+def _update_hash_nullable_field(
+    hasher: _HashSink, name: str, value: str | None
+) -> None:
+    encoded_name = name.encode("utf-8")
+    hasher.update(len(encoded_name).to_bytes(4, "big"))
+    hasher.update(encoded_name)
+    if value is None:
+        hasher.update(b"\x00")
+        return
+    hasher.update(b"\x01")
+    encoded_value = value.encode("utf-8")
+    hasher.update(len(encoded_value).to_bytes(8, "big"))
+    hasher.update(encoded_value)
 
 
 def _version_matches(existing: LegalVersion, command: LegalImportCommand) -> bool:
@@ -239,5 +318,9 @@ def _version_matches(existing: LegalVersion, command: LegalImportCommand) -> boo
         and existing.source_ref == command.source_ref
         and existing.dataset_version == command.dataset_version
         and existing.parser_version == command.parser_version
-        and existing.content_hash == _content_hash(command.provisions)
+        and existing.content_hash
+        == _content_hash(
+            command.provisions,
+            parser_version=command.parser_version,
+        )
     )

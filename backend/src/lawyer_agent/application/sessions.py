@@ -25,8 +25,9 @@ from lawyer_agent.domain.sessions import (
 )
 
 _ACCESS_TTL = timedelta(minutes=10)
-_REFRESH_ABSOLUTE_TTL = timedelta(days=30)
-_REFRESH_IDLE_TTL = timedelta(days=7)
+REMEMBER_DEVICE_SECONDS = 365 * 24 * 60 * 60
+_REFRESH_ABSOLUTE_TTL = timedelta(seconds=REMEMBER_DEVICE_SECONDS)
+_REFRESH_IDLE_TTL = _REFRESH_ABSOLUTE_TTL
 _REFRESH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 
 
@@ -271,7 +272,9 @@ class SessionRepositoryPort(Protocol):
         now: datetime,
     ) -> None: ...
 
-    async def touch_session(self, session_id: UUID, now: datetime) -> None: ...
+    async def touch_session(
+        self, session_id: UUID, now: datetime, *, expires_at: datetime,
+    ) -> None: ...
 
     async def revoke_family(
         self,
@@ -526,8 +529,8 @@ class SessionService:
                         tenant_id=current.tenant_id,
                         membership_id=current.membership_id,
                         issued_at=now,
-                        expires_at=current.expires_at,
-                        idle_expires_at=min(current.expires_at, now + _REFRESH_IDLE_TTL),
+                        expires_at=now + _REFRESH_ABSOLUTE_TTL,
+                        idle_expires_at=now + _REFRESH_IDLE_TTL,
                     )
                     await uow.sessions.mark_refresh_used(
                         token_id=current.id,
@@ -541,7 +544,9 @@ class SessionService:
                         replacement_id=replacement_id,
                         now=now,
                     )
-                    await uow.sessions.touch_session(current.session_id, now)
+                    await uow.sessions.touch_session(
+                        current.session_id, now, expires_at=replacement.expires_at,
+                    )
                     await uow.audit.append(
                         _audit_event(
                             audit_context,
@@ -568,6 +573,7 @@ class SessionService:
             raise RefreshReplayDetected
         if invalid or outcome is None:
             raise InvalidRefreshToken
+        await self._invalidate_cache(outcome.session_id)
         return outcome
 
     async def refresh_session_id(self, raw_token: str) -> UUID:
@@ -590,6 +596,40 @@ class SessionService:
             claims = self._tokens.verify(encoded, audience=audience, now=now)
         except InvalidToken:
             raise InvalidSession from None
+
+        if audience is Audience.TENANT:
+            # A tenant token may be derived from an account device session. Load
+            # the claim's exact membership in the same authoritative read unit;
+            # the session-id cache cannot represent multiple tenant contexts.
+            async with self._uow_factory() as uow:
+                state = await uow.sessions.get_validation_state(claims.session_id)
+                if state is not None and state.session_tenant_id is None:
+                    if (
+                        not _state_is_authoritative(state, None, now)
+                        or claims.session_id != state.session_id
+                        or claims.user_id != state.user_id
+                        or claims.auth_version != state.user_auth_version
+                        or claims.tenant_id is None or claims.membership_id is None
+                    ):
+                        raise InvalidSession
+                    tenant = await uow.sessions.get_tenant_context(
+                        user_id=state.user_id, tenant_id=claims.tenant_id,
+                        membership_id=claims.membership_id,
+                    )
+                    if (
+                        tenant is None or not _tenant_is_active(tenant, now)
+                        or tenant.membership_user_id != state.user_id
+                        or tenant.tenant_id != claims.tenant_id
+                        or tenant.membership_id != claims.membership_id
+                        or tenant.authz_version != claims.authz_version
+                    ):
+                        raise InvalidSession
+                    return ValidatedSession(state.user_id, state.session_id,
+                                            tenant.tenant_id, tenant.membership_id)
+                if state is None or not _state_is_authoritative(state, claims, now):
+                    raise InvalidSession
+                return ValidatedSession(state.user_id, state.session_id,
+                                        state.session_tenant_id, state.session_membership_id)
 
         # Redis is only an optimization hint. A positive cache entry never replaces
         # the authoritative MySQL check, so revocation cannot fail open when cache
@@ -647,6 +687,49 @@ class SessionService:
             )
             await uow.sessions.flush()
         await self._invalidate_cache(session_id)
+
+    async def tenant_access(
+        self, command: SwitchTenantCommand, *, audit_context: AuditContext,
+    ) -> str:
+        """Derive a short tenant token without replacing the account device login."""
+        now = self._now()
+        async with self._uow_factory() as locator_uow:
+            locator = await locator_uow.sessions.locate_session(command.session_id)
+        if locator is None or locator.tenant_id is not None:
+            raise InvalidSession
+        async with self._uow_factory() as uow:
+            if not await uow.security_locks.acquire_session_family(_session_family_lock(
+                session_id=locator.session_id, family_id=locator.family_id,
+                tenant_ids=_ordered_tenant_ids(command.tenant_id),
+            )):
+                raise InvalidSession
+            tenant = await uow.sessions.lock_tenant_context(
+                user_id=locator.user_id, tenant_id=command.tenant_id,
+                membership_id=command.membership_id,
+            )
+            current = await uow.sessions.lock_session(command.session_id)
+            if (
+                current is None or not _session_matches_locator(current, locator)
+                or current.session_tenant_id is not None
+                or not _state_is_authoritative(current, None, now)
+                or tenant is None or not _tenant_is_active(tenant, now)
+                or tenant.membership_user_id != current.user_id
+                or tenant.tenant_id != command.tenant_id
+                or tenant.membership_id != command.membership_id
+            ):
+                raise InvalidSession
+            access = self._issue_access(NewSession(
+                current.session_id, current.user_id, tenant.tenant_id, tenant.membership_id,
+                current.current_family_id, current.user_auth_version, tenant.authz_version,
+                now, current.expires_at,
+            ), now)
+            await uow.audit.append(_audit_event(
+                audit_context, actor_user_id=current.user_id, tenant_id=tenant.tenant_id,
+                membership_id=tenant.membership_id, action="session.tenant_access",
+                result="success", reason="derived", session_id=current.session_id, now=now,
+            ))
+            await uow.sessions.flush()
+        return access
 
     async def switch_tenant(
         self,

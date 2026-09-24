@@ -1,0 +1,6 @@
+{
+  "base_url": "https://your-embedding-endpoint.example/compatible-mode/v1",
+  "api_key": "填写当前Embedding端点对应的密钥",
+  "model": "qwen3.7-text-embedding",
+  "dimensions": 1024
+}

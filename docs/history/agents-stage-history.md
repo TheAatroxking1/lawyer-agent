@@ -1,0 +1,521 @@
+# AGENTS.md 历史阶段记录（重整前归档）
+
+> 本文完整保留本次重整前 AGENTS.md 的“当前阶段”原文，包括当时未提交的多法规发布及 S1 记录。
+> 这是历史记录，不是当前状态或新的操作授权。其日期、测试数字、“已完成”和“待续”可能相互覆盖；请从 [项目现状与续做入口](../project-status.md) 核对现状，仅在需要追溯时阅读本文。
+
+## 当前阶段
+
+- 用户 2026-09-10 明确转向「全栈最终实现」：DeepSeek API key 由用户自己在
+  JSON 配置文件填写（模板 `deploy/deepseek.config.example.json` 已提交，
+  真实 key 文件 `deploy/deepseek.config.json` 被 .gitignore 忽略、绝不入库）；
+  其余全栈任务由开发者完成：Vue 3 前端骨架（frontend/：路由/登录/语料浏览/
+  对话/上传下载）+ 后端补齐（检索 HTTP、DeepSeek chat provider 经
+  ModelGateway、SSE 问答、MCP 客户端网关白名单化工具、文件上传下载端点）＋
+  真实语料入库/发布编排；embedding/OpenSearch 检索已授权可执行。
+- 已完成“DeepSeek API key JSON 配置底座”（2026-09-10 计划）：`Settings` 增
+  `deepseek_api_key`（可经环境变量或 JSON 文件，repr/exclude 永不泄露）与
+  `deepseek_api_key_file`（绝对路径、常规文件、有界读取、UTF-8 无 NUL、
+  JSON 必须单 `api_key` 字段；文件与值二选一）；16 项单测 green；
+  真实 key 文件由用户填写后生效，后续 DeepSeek provider 切片读取该值。
+- 已完成“DeepSeek chat provider 适配器”（2026-09-10 计划）：新
+  `infrastructure/providers/deepseek.py` `DeepSeekChatProvider` 实现项目自有
+  `ModelProviderPort.chat`（OpenAI 兼容 `POST {base}/chat/completions`，
+  httpx 无 SDK、client 可注入 MockTransport；Bearer api_key；body
+  model+messages 逐条 role/content，`stream:false`；解析
+  `choices[0].message.content` 与 usage，缺字段按 0）；构造 api_key 非空否则
+  拒绝；错误稳定映射（空/非 ChatMessage → `ModelInputInvalid` 且不发请求、
+  超时 → `ModelProviderTimeout`、非 2xx → `ModelProviderUnavailable`（只带
+  HTTP 状态，**不回显 key/正文/请求体**）、坏 JSON/空 choices/空 content →
+  `ModelProviderInvalidResponse`）；embed/rerank 明确
+  `ModelProviderUnavailable`；10 项离线单测（请求形态/Bearer/body、成功解析
+  +usage、空消息不发请求、401/500 不泄 key、超时、坏 JSON 族、usage 缺省
+  归零、embed/rerank unavailable、空 key 拒绝、与 `ModelGateway.chat` 组合
+  成功记 usage/失败记 error）green；对话 HTTP/SSE、前端仍为后续。
+- 已完成“法规对话 HTTP（chat 端点，经 ModelGateway）”非模型切片
+  （2026-09-10 计划）：对话无 HTTP 入口——新增 `POST /api/v1/legal/chat`
+  （登录账号、公共问答）：Pydantic 严格 body `{messages:[{role,content}]}`、
+  白名单 role/≤32 条/≤4000 字（422 `legal_chat_invalid_request`）；应用
+  `application/legal_chat.py` `LegalChatHttpService(gateway|None)` 委托
+  `ModelGateway.chat`（model_ref=deepseek-chat 由装配固定，不接受任意
+  model_ref），错误稳定映射（无 key → 503 `model_provider_unavailable`、
+  网关 timeout → 504 `model_provider_timeout`、unavailable/invalid_response
+  → 502 `model_provider_failure`，绝不伪造回复）；`infrastructure/providers/
+  recorder.py` `LoggingModelCallRecorder`（结构化脱敏日志，无
+  prompt/key/正文）；装配 `ApplicationServices.legal_chat_http`：
+  `settings.deepseek_api_key` 空 → gateway=None（启动可用、调用 503）；
+  非空 → DeepSeek provider+recorder+ModelGateway；7 项离线单测（无 key
+  503、委托透传、messages 校验族、网关错误映射）+ recorder 2 项 + 契约 +
+  真实 MySQL+Redis 全栈（无 key 登录 POST → 503 stable、坏 role/空 messages
+  422、未认证 401）green；全量门禁复跑发现 `alembic/env.py` 的
+  `fileConfig` 默认 `disable_existing_loggers=True` 会在进程内跑迁移时
+  禁用 collection 期已创建的全部应用 logger（含 recorder 的
+  `lawyer_agent.model_gateway`，使其 INFO 静默丢失、caplog 为空）——
+  修复为 `disable_existing_loggers=False`（只配置 alembic 自己的
+  logger，不误伤无关 logger），publisher/consumer+recorder 最小复现与
+  rabbitmq 目录全绿；SSE/证据检索问答编排、前端仍为后续。
+- 已完成“Vue 3 前端骨架（frontend/ 工程）”非模型切片（2026-09-10 计划）：
+  仓库此前零前端代码——新增 `frontend/` 独立 npm 工程（node v24/npm 11、
+  Vite+Vue 3.5+TS strict（vue-tsc）、vue-router 4，仅 vue/vue-router 两个
+  运行时依赖；`npm install` 0 漏洞）：`src/api/` 类型化 API 客户端
+  （fetch 封装：Bearer 注入、非 2xx 按 Problem Details `{status,code,title,
+  trace_id,errors}` 映射稳定 `ApiError`、请求超时 AbortController，base
+  默认同源 `/api/v1`、Vite dev proxy `/api`→`http://127.0.0.1:8000`）+
+  端点函数镜像后端 auth（register/login）/legal/instruments 契约（仅取后端
+  回显字段）；`src/auth/session.ts` Access Token 会话（localStorage 键
+  `lawyer_agent.access_token`，Storage 可注入、无 DOM 环境降级 no-op，
+  Refresh Token 为 httpOnly Cookie 由浏览器携带不读取）；`src/auth/guard.ts`
+  路由守卫决策纯函数 + 全局 beforeEach（匿名访问受保护页 → `/login?next=`、
+  已登录访问 login/register → 首页）；页面：登录/注册（本地校验 + 后端
+  code/title 展示、成功后落 token 跳 next）、AppShell（顶栏导航/退出）、
+  首页、语料目录列表（title 检索 + limit/before_id keyset 翻页，读链路
+  最小可用）、对话占位页（说明 JSON key 配置三步 + 未配置 503 语义）、
+  404；无 UI 框架，语义化 CSS 令牌；验证 `npm run typecheck` 0 错误 +
+  vitest 18 项（Bearer 注入/Problem 映射/401/500 派生/超时 AbortError/
+  坏 body 抛 ApiError、session 持久化/空 token/无存储降级、guard 决策矩阵）
+  全绿 + `npm run build`（vue-tsc && vite build）产物正常分包；后端零改动。
+  法规对话界面与 SSE、上传下载页面、Nginx 托管入 compose 仍为后续。
+- 已完成“法规语料详情页（版本清单 + 条文全文）”非模型切片
+  （2026-09-10 计划）：骨架只交付语料目录、行不可点——`frontend/`
+  补详情读链路：`types.ts` 镜像 `LegalVersionSummary`/`ProvisionSummary`
+  契约并修正 `InstrumentSummary.region_code` 可空；`endpoints.ts` 增
+  getInstrument/listVersionsForInstrument/getVersion/
+  listProvisionsForVersion（id encodeURIComponent）；`lib/format.ts` 纯展示
+  `versionStatusLabel`（current→现行/repealed→已废止/historical→历史版本/
+  status_unknown→状态未知/未知原样）与 `isoDate`（截取/空值安全）；
+  `CorpusInstrumentView` 详情页（/corpus/:instrumentId）：身份头、版本胶囊
+  （服务端 newest-first 默认首个）、选中版本元数据白名单 dl、条文全文有序
+  列表；目录行改 RouterLink；错误统一 ErrorNote；vitest +7 项合计
+  **25/25 绿**（endpoints 路径组/format）+ typecheck 0 错误 + build 分包
+  （详情页 gzip 1.8 kB）；后端零改动。法规对话界面与 SSE、上传下载页面、
+  Nginx 托管入 compose 仍为后续。
+- 已完成“法规对话页面（多轮会话接入 chat 端点）”非模型切片
+  （2026-09-10 计划）：占位页此前无真实对话——`types.ts` 镜像
+  `ChatMessageInput`（role system/user/assistant）/`ChatUsage`/
+  `ChatReply{text,usage}`；`endpoints.chat()` → POST `/legal/chat`；
+  `chat/messages.ts` 纯函数 `composeChatMessages(turns, maxTurns=12)`
+  （按轮保留最近历史保证配对完整、滤空白、不改写文本，超长交后端 422，
+  前端 textarea maxlength=4000 前置约束）；`ChatView` 重写为真实多轮会话：
+  滚动/自动滚底 + aria-live 会话区、气泡（我/律师 Agent）、Enter 发送 +
+  Shift+Enter 换行、发送中禁用与「正在思考…」、错误横幅 code+title 与
+  引导（503 → JSON key 三步；401 → 清 token 跳登录）、最近回答 token
+  用量、清空对话、空态快捷提问示例与免责声明；Home 卡片文案同步；
+  vitest +5 项合计 **30/30 绿** + typecheck 0 错误 + build 分包
+  （ChatView gzip 2.0 kB）；真实回复需用户配置 key 后手工验证（无 key 503
+  语义已由后端全栈覆盖）。SSE 流式问答编排、上传下载页面、MCP 白名单化
+  工具、Nginx 托管入 compose 仍为后续。
+- 已完成“落地对话页 + 延时登录弹窗（微信/手机号/账号密码三入口）”非模型
+  切片（2026-09-10 计划，用户确认 UI 全做、真实短信/微信后置）：路由 `/`
+  重定向 `/chat`（打开即对话页）、`home` 移至 `/home`、chat/home/not-found
+  转公开（语料与详情仍受保护 → `/login?next=`），已登录访问 login/register
+  跳 `/chat`；守卫拆分公开/表单两集合纯函数（可单测，默认 next=/chat）；
+  `src/auth/state.ts` 响应式 `authState`+`refreshAuth`（登录/登出即时刷新
+  顶栏与对话页）；`AuthPanel` 三页签：微信/手机号为**未开通占位**（写明需
+  微信开放平台 OAuth 与短信网关，按钮禁用不假装可用），账号密码走既有
+  login 端点成功后存 token+refresh+emit success；`AuthModal`（Teleport
+  遮罩、Esc/遮罩关、aria-modal、支持成功/关闭/go-register 事件）供对话页
+  弹出；`ChatView` 游客可浏览输入并提示“点击发送即登录”，发送/示例点时
+  未认证 → 保留输入弹窗，登录成功**自动补发该句**（pendingSend 不丢不重），
+  真实 401 清 token 后弹窗重登，游客态按钮「登录并发送」；`LoginView` 改
+  三页签面板、`RegisterView` 成功跳 `/chat`；`AppShell` 游客态顶栏
+  注册/登录（带 next）。验证 typecheck 0 错 + vitest 30/30 + build 分包
+  （ChatView gzip 2.6 kB）；后端零改动。真实微信 OAuth/短信/绑定（需外部
+  凭据与后端流程）仍为后续。
+- 已完成“前端检索问答页（有据问答）”非模型切片（2026-09-10 计划）：后端
+  /legal/questions 已真实装配但无前端面——`types.ts` 镜像
+  `RetrievalCitation`（七字段白名单）/`RetrievalQuestionReply`/输入契约；
+  `endpoints.askQuestion` → POST `/legal/questions`；`AskView`（路由 `/ask`
+  公开，AppShell 导航增「法规问答」）：游客可输入、提交弹 AuthModal 三页签
+  登录并成功自动补发；结果区 拒答卡片（reason+文案）/支持回答文本+引用卡片
+  （法规·版本·条号·全文·来源·数据集）+usage；错误族引导
+  （retrieval_qa_unavailable/dataset_not_published/provider 系列）；
+  「重新提问」；vitest 31/31（新增 askQuestion 断言）+ typecheck 0 + build
+  分包（AskView gzip 2.4 kB）。AskView 已接 SSE（见下条）、上传下载、Nginx
+  入 compose 仍为后续。
+- 已完成“前端消费检索问答 SSE”非模型切片（2026-09-10 计划）：后端 SSE
+  端点就绪但前端仍走一次性 POST——`lib/sse.ts` 框架无关解析
+  `parseSseBlock/parseSseStream`（event/多条 data 行 \n 拼接/忽略注释/空行分
+  帧/\r\n 兼容）；`api/sse.ts` `askQuestionStream(input, signal?)` →
+  AsyncIterable{event,data}（POST /legal/questions/stream，Bearer 注入、
+  reader+TextDecoder 增量按 `\n\n` 分帧解析 JSON、非 2xx 解析 Problem → 抛
+  ApiError、finally releaseLock）；`AskView` 改为流式消费：answer 事件渲染
+  （与卡片/拒答共用 UI）、error 事件构造 ApiError 走既有引导、done 结束、
+  searching 阶段提示；验证 typecheck 0 + vitest 38/38（新增 sse 解析 7 项）
+  + build（AskView gzip 3.1 kB）；真实逐 token 流待 provider chat_stream
+  后置。上传下载仍为后续。
+- 已完成“Web 服务并入 Compose（Vue 静态托管 + Nginx 反代 API）”部署切片
+  （2026-09-10 计划）：spec 默认栈含 Vue/Nginx——新增 `frontend/nginx/
+  nginx.conf`（listen 8080、SPA fallback、/assets 长缓存、`/api/` 反代
+  api:8000（HTTP/1.1 + X-Forwarded-*、proxy_buffering off 透传 SSE、
+  read_timeout 120s、client_max_body_size 25m）、/health/ready 反代、gzip）、
+  `frontend/Dockerfile`（node:22-alpine `npm ci && npm run build` →
+  `nginxinc/nginx-unprivileged:1.27-alpine` 非 root 运行）与 .dockerignore；
+  `deploy/compose.yaml` 增 `web` 服务（context ../frontend、ports
+  127.0.0.1:8080:8080、depends_on api healthy、read_only + tmpfs /tmp 与
+  /var/cache/nginx + no-new-privileges、wget healthcheck）并把
+  `http://localhost:8080` 加入 api 默认可信源；验证 `docker compose config
+  --quiet` 通过；镜像 build 因本机 Docker Hub 拉取不可达未能在本会话完成
+  （仓库内 npm 构建已绿，网络恢复后复跑 build）。
+- 已完成“案件文档工作台基础（租户列表/切换/会话租户 token）”非模型切片
+  （2026-09-10 计划）：案件/文档属租户内部数据，前端此前无租户上下文——
+  `session.ts` 增独立 `TENANT_TOKEN_KEY` 与
+  saveTenantToken/readTenantToken/clearTenantToken（与账号 token 互不覆盖、
+  可注入 Storage 可测）；`api/types` 镜像 `AccountTenant/AccountTenantList/
+  SwitchTenantInput`，`endpoints.myTenants`（GET /accounts/me/tenants）与
+  `switchTenant`（POST /auth/switch-tenant → token）；`DocumentsView`（路由
+  /documents 受保护，顶栏「案件文档」）：加载租户成员列表——空 → 指引卡
+  （邀请 / 申请创建租户经平台审核 / 部署 CLI 提权首个管理员，明确公开注册
+  不自动归属租户）；有 → 仅 active 成员+active 租户可「进入工作台」（换取
+  租户 token 存会话），否则提示未生效；进入后展示当前租户与能力说明（上传
+  登记/Rule Check 报告下载已备；原始文件下载与 MinIO 预签名后置）；「退出
+  当前租户」清租户 token；验证 typecheck 0 + vitest 40/40（session 租户/账号
+  token 独立 + endpoints 两调用断言）+ build；后端零改动。租户内案件/文档
+  上传下载列表、规则报告下载 UI 仍为后续。
+- 已完成“租户内案件列表/新建 + 文档上传登记”非模型切片（2026-09-10 计划）：
+  进入租户后补齐案件与上传闭环——`api/types` 镜像
+  MatterSummary/MatterPage/CreateMatterInput（kind 五枚举）/
+  RegisterDocumentInput/DocumentSummary/DocumentHeaderSummary；
+  `api/tenant.ts` 租户专用客户端（tokenProvider=session.readTenantToken 与
+  账号 token 隔离）与 listMatters（GET /tenants/{id}/matters?limit=50）、
+  createMatter、listDocuments、registerDocument（POST payload_b64）；
+  `DocumentsView` 扩展：案件列表（类型/状态胶囊、「文档 ▼」展开）、新建
+  案件（名称+类型，创建后刷新）、案件内 DOCX 上传（.docx/对应 MIME、
+  ≤25MB 前置拦截）→ arrayBuffer→base64→registerDocument（后端白名单校验
+  201）→ 展示最近登记版本 upload/review 状态与版本列表、分块错误横幅；验证
+  typecheck 0 + vitest 40/40 保持 + build（DocumentsView gzip 3.8 kB）。
+  Rule Check 报告下载已补（见下条）、运行按钮与案件详情仍为后续；原始文件
+  下载与 MinIO 预签名属既有延后项。
+- 已完成“文档风险项查看与 DOCX 报告下载（工作台内）”非模型切片
+  （2026-09-10 计划）：上传登记后缺风险结果查看与下载——`api/types` 镜像
+  `RiskIssueSummary`；`api/tenant` 增 `listRiskIssues(tenantId, docId)`（GET
+  …/risk-issues）与 `downloadReport`（GET …/report.docx，租户 Bearer、blob
+  返回，非 2xx 抛错）；`DocumentsView` 文档行内 风险项/报告下载 按钮 → 风险
+  内联列表（级别·命中文本·条号·状态）或「暂无风险项」、报告以 objectURL 触发
+  保存、错误横幅与下载中禁用；验证 typecheck 0 + vitest 41/41 + build；后端
+  run→list→report 读回语义已由 Rule Check 全栈覆盖（报告下载仅在运行过检查
+  的文档可用）。「运行检查」需激活规则包+条文输入（租户运营流程）、案件详情
+  仍为后续。
+- 已完成“MCP 客户端网关（受控、白名单化工具分派）”非模型切片
+  （2026-09-10 计划）：spec 要求 MCP 走受控 Client Gateway、首期不依赖外部
+  MCP Server——新增 `application/mcp_gateway.py`：`ToolSpec`（name 白名单
+  `^[a-z][a-z0-9_.]{0,63}$`/description ≤512/input_schema 子集校验，坏键、
+  坏类型/数组 items/enum/required 未声明稳定拒绝）；`validate_args`（非对象/
+  缺必填/未知参数/类型不符/enum 越界/数组逐项类型不符 → invalid_arguments）；
+  `AllowedToolRegistry`（closed set，重复登记 duplicate_tool）；
+  `MCPClientGateway(registry, allowlist?)`：allowed/call → ToolResult，错误
+  码 unknown_tool/tool_not_allowed/invalid_arguments/handler_failure（不回
+  显参数与异常细节），成功失败均结构化脱敏日志（name/ok/code/latency），空
+  登记自动注册内置 `meta.list_tools`；验证 ruff+mypy strict（163 文件）零错
+  + 21 项单测（调用/未知/白名单空集禁全部/重复/坏名坏 Schema 族/参数非法
+  族/handler 失败不回显/meta 自注册/specs 稳定排序）green + 全 unit **1129
+  passed + 1 skipped**。Agent 侧接入网关工具仍为后续。
+- 已完成“MCP 网关 HTTP 面”非模型切片（2026-09-10 计划）：网关就绪但无
+  HTTP 暴露——`MCPClientGateway` 增公开只读 `specs()`；新
+  `api/v1/agent_gateway.py`（/platform/agent）：GET /tools →
+  list[AgentToolInfo{name,description}]、POST /tools/call 严格 body
+  {tool≤64, args 默认 {}} → `AgentToolCallResult{ok, output|error_code|
+  error_message}`（unknown_tool/tool_not_allowed/invalid_arguments/
+  handler_failure 原样透出、HTTP 200 语义化；服务缺失 503
+  agent_gateway_unavailable；extra=forbid）；dependencies 增
+  `ApplicationServices.mcp_gateway_http` + 空登记器装配（自动注册内置
+  meta.list_tools，零外部依赖）；验证 ruff/mypy strict（164 文件）零错 +
+  全 unit 1129 passed + 1 skipped 保持 + **2 项真实 MySQL+Redis 全栈**（未
+  认证 401；登录后 GET 含 meta 描述、调用成功、unknown_tool、多余参数
+  invalid_arguments、未知键 422）。把语料/检索注册为网关工具并授予 Agent
+  工具白名单的显式收敛见最新条目。
+- 已完成“Agent 工具面板（对接 MCP 网关 HTTP）”非模型切片（2026-09-10 计划）：
+  网关 HTTP 面就绪但无前端——`api/types` 增 AgentToolInfo/AgentToolCallResult/
+  AgentToolCallInput；`endpoints.listAgentTools`（GET /platform/agent/tools）与
+  `callAgentTool`（POST /platform/agent/tools/call，args 缺省 {}）；
+  `AgentToolsView`（路由 /agent-tools 受保护、顶栏「智能工具」）：加载白名单
+  工具（code+描述）→ 行内调用 → JSON 输出展示/错误横幅走 ApiError；验证
+  typecheck 0 + vitest 41/41（endpoints +1 断言含默认 args）+ build；后端
+  2 项全栈已覆盖真实调用语义。
+- 已完成“语料检索注册为 Agent 网关工具（async handler + 真实工具）”非模型
+  切片（2026-09-10 计划）：网关此前仅内置 meta 自省——`AllowedToolRegistry.
+  ensure_meta()`（meta 无条件存在，不再只对空登记注册）、`MCPClientGateway`
+  __init__ 调 ensure_meta 并新增 `call_async(name,args)`（与 call 同白名单/
+  Schema/错误映射，handler 返回可等待对象即 await、异常亦映射
+  handler_failure）；`/platform/agent/tools/call` 改 await call_async；
+  `_build_mcp_gateway_http_service(session_factory)` 登记真实只读工具
+  `corpus.instruments_search`（title 子串可选 / limit∈{10,20,50,100} 默认
+  20、additionalProperties False，handler 用与语料 HTTP 同源
+  LegalCorpusQueryService 异步读库并只回七字段白名单 id/title/
+  issuing_authority/jurisdiction/region_code）；GET /tools 同时含 meta 与
+  corpus；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1131 passed + 1
+  skipped**（新增 async handler 成功/校验/未知映射 2 项）+ 真实 MySQL+Redis
+  全栈（工具清单双工具、corpus 空库调用 ok true 输出 []、limit 字符串
+  invalid_arguments、meta/unknown/422 保持）。Agent
+  工具白名单显式收敛见最新条目。
+- 已完成“语料按 id 深读注册为 Agent 网关工具（检索→身份→版本→条文链路）”
+   非模型切片（2026-09-10 计划）：检索工具只能回目录行、Agent 无法继续读
+   版本与条文——`_build_mcp_gateway_http_service` 继续在同一 closed registry
+   增三个真实只读工具（`corpus.instrument_get` 按 id 读身份、
+   `corpus.versions_list` 按 instrument 读版本清单、
+   `corpus.provisions_list` 按 version 读条文全文），输出字段白名单与 HTTP
+   契约一致（instrument 五字段 / version 九字段含 status/生效废止日期/文号
+   转 iso 字符串 / provision 六字段含 structure_path 转 list），参数 uuid7
+   非法 → handler 内 `MCPGatewayError("invalid_arguments")` 稳定映射、合法但
+   不存在 → 结构化 `{"found": false, …}` 空结果（正常业务缺失不伪装成工具
+   故障）；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1131 passed + 1
+   skipped 保持** + 真实 MySQL+Redis 全栈 **3 passed**（新增 seed 一法规两
+   版本：工具清单 5 个、instrument_get 命中白名单键集/未命中/坏 uuid、
+   versions_list 两版本含 2024 current、provisions_list 命中条文全文/空版本
+   0 条/未命中）。真实逐 token 流式对话分三步推进（见下条）；原始文件下载（MinIO 真实存储）仍为
+   后续。
+- 已完成“真实逐 token 流式对话 · provider chat_stream + ModelGateway 流式委托”
+   非模型切片（2026-09-10 计划，对话流式化第 1/3 步）：对话/问答此前只能一次
+   拿全量文本——`domain.model_gateway.ModelOperation` 增 `CHAT_STREAM`；
+   `DeepSeekChatProvider.chat_stream(messages, timeout) -> AsyncIterator[str]`
+   （OpenAI 兼容 `stream:true`，httpx `.stream` 逐行只认 `data: `、`[DONE]` 正常
+   收尾、空 choices 帧跳过、坏 JSON/缺 choices/delta 非对象 → invalid、401/超时
+   稳定映射且不回显 key）；`ModelGateway.chat_stream(model_ref, messages)` 与
+   chat 同输入校验，能力探测 `provider.chat_stream`（无则 unavailable 不假装），
+   流结束零增量 → invalid response、中途故障记 error 并稳定映射、正常结束记
+   success（流式 usage 未知如实 None）；验证 ruff/mypy strict（164 文件）零错 +
+   全 unit **1144 passed + 1 skipped**（provider 流 8 项 + gateway 流 6 项）。
+  对话流式化第 2/3、3/3 步见下两条。
+- 已完成“真实逐 token 流式对话 · /legal/chat/stream SSE 端点”非模型切片
+  （2026-09-10 计划，对话流式化第 2/3 步）：`LegalChatHttpService` 增
+  `gateway_available` 属性与 `chat_stream(messages) -> AsyncIterator[str]`
+  （校验先行、无 gateway → 503、能力探测 gateway.chat_stream（无 →
+  `LegalChatProviderFailure`）、中途错误与 chat 同码映射）；`POST
+  /api/v1/legal/chat/stream`（登录账号，body 与 /chat 同构）以
+  StreamingResponse(text/event-stream, no-cache, X-Accel-Buffering: no) 推送
+  稳定事件序 `started → delta* | error → done`（delta 事件
+  `data: {"text": <增量>}`；配置缺失开流前 503 `model_provider_unavailable`；
+  运行期故障 → error 事件携带 status/code/title，已发部分增量不撤回、流仍以
+  done 收尾）；验证 ruff/mypy strict（164 文件）零错 + 全 unit **1149 passed
+  + 1 skipped**（chat_stream 服务单测 +5）+ 真实 MySQL+Redis 全栈
+  **6 passed**（stream 401、无 key 503、坏 role/空 422、Fake 服务
+  started/delta/delta/done、中途超时 → error 事件 504）。ChatView 逐 token 消费见下条（第 3/3 步）。
+- 已完成“真实逐 token 流式对话 · ChatView 消费逐 token 渲染”非模型切片
+  （2026-09-10 计划，对话流式化第 3/3 步）：`api/sse.ts` 把 SSE 流消费提取为
+  通用 `postEventStream(path, payload, signal)`（非 2xx 映射 ApiError、finally
+  releaseLock），原 `askQuestionStream` 变薄封装、新增
+  `chatStream(messages, signal)` → POST /legal/chat/stream；`ChatView.vue` 发送
+  改为先入 `{role:'assistant', content:'…'}` 占位气泡，`delta` 事件逐段原地
+  追加（每帧滚底）、`error` 事件构造 ApiError（缺省兜底 chat_stream_error）、
+  `done` 结束；零增量失败移除占位气泡只留横幅、部分增量失败保留已生成文本并
+  报错（不假装完整）；移除一次性 POST/usage 展示（流式无 usage 诚实不展示）；
+  验证 typecheck 0 错误 + vitest 41/41 保持 + build 分包（ChatView gzip
+  2.44 kB）。真实逐 token 体验需用户配置 DeepSeek key 后手工验证（无 key
+  503/事件序/error 语义均有后端真实 MySQL+Redis 全栈覆盖）。
+- 已完成“Agent 网关工具白名单显式收敛（specs() 投影 + 装配 allowlist）”非模型
+  切片（2026-09-10 计划）：网关 `allowlist` 此前从未在 HTTP 装配层传入、且
+  `specs()` 返回全部 registry 工具（未来新登记工具会无意识暴露给调用方）——
+  `MCPClientGateway.specs()` 改为在配置 allowlist 时只投影允许子集（调用方看
+  不到未授权工具）；`_build_mcp_gateway_http_service` 传显式 allowlist
+  （meta.list_tools + corpus.instruments_search/instrument_get/versions_list/
+  provisions_list 共 5 个），未来登记新工具不自动暴露、需刻意扩元组；内置
+  meta.list_tools 保持注册表范围；验证 ruff/mypy strict（164 文件）零错 +
+  mcp_gateway 单测 **24 passed**（+1 specs 投影/允许判定）+ 全 unit **1150
+  passed + 1 skipped** + 真实 MySQL+Redis 网关全栈 **3 passed 保持**。另尝试
+  `docker compose build web`（Vue+Nginx 镜像）仍被 Docker Hub 网络不可达阻塞
+  （环境性，仓库内 npm 构建已绿）。
+- 已完成“语料导入发布 CLI（corpus_publish）+ 真实 dataset_v1 跑通”非模型切片
+  （2026-09-10）：导入/发布此前只在服务层与测试、无用户运行入口——新增
+  `backend/src/lawyer_agent/cli/corpus_publish.py`（DOCX→LegalStructureParser→显式
+  元数据映射→受控导入→PROVISION 分块→本地 BGE 分批 embed→OpenSearch k-NN→
+  LegalDatasetIndexPublishService 原子切 alias 并登记 snapshot；重跑幂等 replay、
+  换 alias 生成新快照不动旧索引；坏参数/空文件返回码不写库）与
+  `scripts/make_sample_law_docx.py` 样例生成器；在主库 `lawyer_agent` 上
+  `alembic upgrade head` 成功后真实跑通：imported articles=10 chunks=10 →
+  published index=lawyer_dataset_7791fc0a0c4d alias=dataset_v1
+  indexed_documents=10，OS `/_alias/dataset_v1` 可解析且 _count=10，MySQL
+  snapshot 为 published 且 manifest/质量指标落库（versions=1/provisions=10/
+  chunks=10）；ruff+mypy strict（165 文件）零错；用法与证据见
+  `docs/history/plans/2026-09-10-corpus-publish-cli.md`。
+- 已完成“多法规数据集发布（set publish）+ 司法解释试点”非模型切片
+  （2026-09-10，用户确认先试点后全量）：新增
+  `application/legal_dataset_set_publish.py`（多 version chunks 合并 embed 进同一
+  OS 索引 → 原子切 dataset 别名，snapshot manifest 记录 version_ids/version_count，
+  空版本拒发/空集拒发；doc 保留 version/provision id 供跨法规权威证据组装）与
+  `corpus_publish --import-only`；试点 5 部司法解释（非法行医/妨害文物/非法采矿/
+  非法信息网络/侵犯公民个人信息）导入并集合发布：index=lawyer_dataset_b085352f09c8
+  72 条、version_count=5、Yuan/1792；BM25 跨法规命中 2017 侵犯公民个人信息解释；
+  样例 10 条数据已按用户要求清理（MySQL 行 + 两个旧索引），dataset_v1 现指向合集；
+  ruff+mypy strict（166 文件）零错 + 全 unit 1155 passed + 1 skipped。
+- 已完成“结构化层级分块引擎（S1）”非模型切片（2026-09-10，用户确认父子层级
+  方案）：parser 升级保留条内段落序列（ParsedArticle.paragraphs）；domain
+  ChunkType 增 paragraph/item（目沿用 sub_item）；新增
+  `application/legal_chunk_structure.derive_hierarchical_chunks`——每条条文独立
+  PROVISION 父块（不跨条、极短不合并），子块按 款/项/目 生成并经 parent_chunk_id
+  指向父块（父链表达继承整条语义），条内首段剥离“第X条”前缀；超长叶子按滑动
+  窗口兜底（>600 字 → 400 字窗口/60 重叠/句末对齐，窗口不跨款不跨条）；真实 5 部
+  司法解释样本验证：72 条 → 230 子单元（款/项/目，未触发窗口）；ruff+mypy strict
+  （167 文件）零错 + 全 unit **1161 passed + 1 skipped**（引擎单测 6 项）。
+  说明：当前 DB/OS 仍为旧“一条一块”模型；S2 category 字段、S3 标题/章节摘要
+  索引、S4 子块检索+整条回填与索引叶子过滤、S5 其他类型分段器待续。
+- 已完成“embedding 主模型切换 Yuan-embedding-2.0-zh + L2 归一化 + 真实重建
+  dataset_v1”非模型切片（2026-09-10，用户 A 项）：经 hf-mirror 下载缓存
+  `IEITYuan/Yuan-embedding-2.0-zh`（实测输出 **1792 维**，非 config hidden 1024）；
+  `LocalSentenceTransformerEmbeddingProvider` 默认 **L2 归一化**（可关闭，OS l2
+  按余弦排序，BGE/Yuan 检索规范一致）；`Settings` 默认
+  embedding_model_ref/dimension 切为 Yuan/1792；用 Yuan 重建发布 dataset_v1：
+  `index=lawyer_dataset_1dd4236b12ae indexed=10 previous=lawyer_dataset_7791fc0a0c4d`
+  （旧 bge 索引保留回滚），snapshot manifest 记录 model_ref/dimension=1792；语义
+  spot-check：query 1792 维 L2=1.0，k-NN top1 命中第五条（迟延租金违约金，
+  score 0.7472）；验证 ruff+mypy strict（165 文件）零错 + 全 unit **1151 passed
+  + 1 skipped**。运行后端前需重启加载新默认（或显式设置两项环境变量一致）；
+  `ritrieve_zh_v1` 输出形态与 BGE-M3 长文本接线仍待后续确认。
+- 已完成“embedding 模型参数化（Settings + 检索服务 + corpus_publish CLI）”非模型
+  切片（2026-09-10）：模型此前写死默认 `BAAI/bge-small-zh-v1.5`/512——`Settings`
+  增 `embedding_model_ref`（默认同前）与 `embedding_dimension`（默认 512）及校验；
+  检索问答装配读取配置（对鸭子类型 settings 以常量回退，保持单测兼容），
+  `LegalRetrievalQaService` 构造注入实例级 embed 默认、`answer` 支持调用级覆盖；
+  `corpus_publish` CLI 增 `--model-ref/--dimension`（缺省取 Settings），可逐模型
+  重建发布；模型卡经 hf-mirror 确认 `IEITYuan/Yuan-embedding-2.0-zh`=1024 维、
+  `BAAI/bge-m3`=1024 维长文本、`richinfoai/ritrieve_zh_v1` 为对照候选（输出形态
+  待确认）；验证 ruff+mypy strict（165 文件）零错 + 全 unit **1150 passed + 1
+  skipped**；注意发布与运行期模型/维度须一致，切换后需重新发布 dataset_v1。
+- 已完成“全栈最终实现交付核验审计”非模型轮（2026-09-10 主线收尾）：逐项对照
+  主目标列清单并复核证据（key 配置底座 / DeepSeek chat provider+chat_stream 经
+  ModelGateway / /legal/chat 与 /legal/chat/stream SSE / Vue3 全前端面（登录·语料
+  目录与详情·对话·有据问答 SSE·案件文档工作台·Agent 工具面板）/ 检索问答编排
+  HTTP+SSE / MCP 受控网关白名单（含语料只读工具与显式 allowlist）/ 真实语料
+  导入与发布编排 / Embedding+OpenSearch 混合检索真实 E2E），全部实现并提交；
+  本轮复跑门禁：后端 ruff 通过 + mypy strict 164 文件零错 + 全 unit **1150 passed
+  + 1 skipped**；前端 typecheck 0 错 + vitest 41/41 + build 正常；审计文档
+  `docs/history/plans/2026-09-10-fullstack-delivery-audit.md` 记录交付物表、
+  用户侧运行步骤与延后项。环境性/外部凭据延后项维持：web Docker 镜像 build
+  （Docker Hub 不可达，npm 构建已绿）、MinIO 真实存储/原始文件下载、工作台
+  「运行检查」按钮、微信/短信登录（均不属主线交付阻塞）。
+- 已完成“证据检索问答编排服务（非流）”非模型切片（2026-09-10 计划，
+  spec 6.5 管道）：检索/解析/门禁/chat 各自就绪但无「问题→有据回答或安全
+  拒答」单一入口——新增 `application/legal_retrieval_qa.py`：纯函数
+  `build_claims_system_prompt`（条目按序编号 `[n]（依据编号 uuid）…`、超长
+  条文显式截断加「条文过长已截断…核验以编号对应权威条文为准」标记、总
+  预算 12000 字/条上限 3000 字、坏参数稳定 ValueError）与
+  `LegalRetrievalQaService.answer(alias, question, model_ref, dimension,
+  target_date, version_id?, limit=12, bm25=80, knn=80) ->
+  LegalRetrievalAnswer{text, refused, reason, claims, citations(EvidenceItem),
+  usage}`：检索空 → 拒答 `no_evidence`（零模型调用）；有据 → system+user →
+  chat 一次 → `parse_claims_text`（失败 → `claim_parse_failed` 拒答保留
+  usage）→ `LegalClaimGate(CitationGate).verify(target_date)` 不通过 →
+  拒答 reason 原样 `claim_not_supported:<code>`（含 out-of-bundle/未授权/
+  生效前/已废止/状态未知）；通过 → claims 编号成 text、citations 按引用
+  首现去重保序；provider 故障以类型化 `ModelGatewayError` 上抛不并入拒答；
+  拒答文案确定性中文；15 项离线单测（allowed 全链/解析/五类引用拒答/解析
+  失败/no_evidence 零调用/网关上抛/非法输入族/prompt 顺序·截断·预算）green
+  + ruff/mypy 零错 + 全 unit **1105 passed + 1 skipped**；无 Schema/DB 改动。
+  检索问答 HTTP 端点已完成（见下条）、SSE/装配/前端流式界面仍为后续。
+- 已完成“检索问答 HTTP API”非模型切片（2026-09-10 计划）：编排服务就绪
+  但无 HTTP 面——新增 `POST /api/v1/legal/questions`（登录账号）：body 严格
+  `{question 非空≤4000, alias 默认 dataset_v1 白名单 [a-zA-Z0-9_.-]{1,64},
+  target_date? 默认今日 UTC, version_id?}`；响应
+  `LegalRetrievalReply{refused, reason, text, usage?, citations[]}`，
+  citation 白名单投影仅 evidence_id/instrument_title/version_label/
+  provision_no/provision_text/source_ref/dataset_version 七字段；错误映射
+  （服务缺失 503 `retrieval_qa_unavailable`、`LegalDatasetNotPublished` 503
+  `legal_dataset_not_published`、网关 timeout 504/unavailable 503/其余 502、
+  ValueError 422）；`ApplicationServices.legal_retrieval_qa_http` 默认 None +
+  `_build_legal_retrieval_qa_http_service` 占位（注明配置面未就绪不伪造）；
+  编排微调：embed model_ref/dimension 收敛为组合层默认
+  （DEFAULT_EMBED_MODEL_REF/DIMENSION，客户端不可指定）、claims chat 固定
+  `CHAT_MODEL_REF=deepseek-chat`（不再误传 embed model_ref 给 chat 网关）；
+  验证 ruff+mypy strict（162 文件）零错、15 项编排单测仍绿 + **6 项真实
+  MySQL+Redis 全栈 HTTP**（未认证 401、默认装配 503、fake allowed 200 含
+  白名单键集、refusal no_evidence 稳定、504/503/503 三错误码、空白/坏
+  alias/未知键 422）；SSE 流式问答、前端问答页仍为后续。
+- 已完成“检索问答生产装配（全链组合 + opensearch_url 配置面）”非模型
+  切片（2026-09-10 计划）：端点/编排就绪但装配返回 None 永久 503——
+  `config.py` 增 `opensearch_url`（默认 http://127.0.0.1:9200，pattern
+  `^https?://[^\s]+$`；embed model_ref/dimension 沿用编排组合层默认常量不
+  重复配置面）；`api/dependencies.py` `_build_legal_retrieval_qa_http_service
+  (settings, session_factory)`：deepseek key 或 opensearch_url 缺失 → None
+  （503 兜底不变），齐全 → 装配 `LocalSentenceTransformerEmbeddingProvider
+  (DEFAULT_EMBED_MODEL_REF)→ModelGateway(embed)` + `OpenSearchRestClient` +
+  `LegalDatasetAliasService` + `LegalHybridSearchService` +
+  `LegalDatasetSearchService` + `LegalEvidenceAssemblyService` +
+  `LegalDatasetEvidenceService` + DeepSeek chat ModelGateway → 返回
+  `LegalRetrievalQaService`（构造全惰性：零网络/零模型加载）；新增
+  `_LegalEvidenceAssemblyQueryAdapter(session_factory)`（每次独立会话委托
+  `SqlAlchemyLegalCorpusRepository.version_with_instrument/
+  provisions_for_version`）；协议修正 `_EvidenceAssemblyPort.assemble`
+  参数 object → `Sequence[LegalSearchHit]`（mypy strict 兼容真实实现）；
+  验证 ruff+mypy（162 文件）零错 + 3 项装配单测（无 key/无 url → None、
+  齐全可构造且 session_factory 零调用）+ 全 unit + 检索问答全栈合计
+  **1114 passed + 1 skipped**；真实运行前提：本地 embedding 权重 + OS 在线
+  + dataset_v1 已发布 + DeepSeek key。SSE 端点已完成（见下条）、前端问答页
+  仍为后续。
+- 已完成“检索问答 SSE 流式端点”非模型切片（2026-09-10 计划，spec 9.3）：
+  `POST /api/v1/legal/questions/stream` 以 `StreamingResponse
+  (text/event-stream, Cache-Control: no-cache, X-Accel-Buffering: no)` 推送
+  稳定事件序 `started → answer|error → done`（started 带问题原文；answer 与
+  `LegalRetrievalReply` 同构含 usage 与七字段 citations；运行期网关/检索失败
+  转 `error` 事件携带与 HTTP 层一致 status/code/title，绝不伪造流内容；鉴权
+  与输入校验仍在开流前普通 Problem Details，服务缺失开流前 503）；复用既有
+  body 校验/默认今日 target_date/错误映射；验证 ruff+mypy strict 零错 + 10
+  项真实 MySQL+Redis 全栈（原 6 + 新增 4：stream 未认证 401、allowed 事件序
+  started/answer/done 且 answer 字段、refusal no_evidence 稳定、timeout →
+  error 事件 504）；前端消费 SSE（fetch 流解析）与真实逐 token 流（provider
+  chat_stream）仍为后续。
+- 阶段 0“工程与安全底座”保持进行中，直到其已批准验收门禁全部通过。
+- 后端包、本地容器栈、MySQL/Alembic、全局身份、租户成员关系、租户绑定 Token、RBAC/ABAC、跨租户反向隔离测试已完成。
+- “租户级持久 AI Job 运行时”增量（2026-09-03 计划）已按用户指示缩简收尾：签名信封/拓扑/Outbox Publisher、Worker 验签+Inbox+权威 Claim、Consumer、AI Job HTTP API（202/GET/Cancel）均已实现并有真实 MySQL/RabbitMQ 测试；Effect/Retry/Maintenance、Synthetic Handler Harness、Compose 多进程、故障注入与零跳过全量门禁仍为明确延后项。
+- 下一主线是“阶段 1：法规数据与有据问答”中不依赖 Embedding 模型运行的任务（Embedding/OpenSearch 检索相关步骤仅在用户另行授权时执行）。
+- 阶段 1 非 Embedding 先行切片已完成（2026-09-04 计划）：法规版本模型/条文/Chunk/数据集快照 Schema、时点查询、DOCX 只读解析（真实样本 134 条）、盘点/Manifest/质量门禁与 dataset_v1 发布、Evidence Bundle 与 Citation Gate 后端校验；OpenSearch/Embedding/Reranker/DeepSeek/SSE 与完整问答链路仍为待授权延后项。
+- 阶段 1 增补“语料 LegalChunk 生成与持久化”非模型切片已完成（2026-09-10 计划）：此前 `legal_chunks` 只有表/域模型、无任何生成与落库代码——新增应用纯函数 `derive_chunks`（每条非空 Provision 派生一个 `chunk_type=PROVISION/quality=OK` 的 chunk，content=full_text、sha256、按 char_start 排序，禁止跨条拼接，款项目/表格附件子 chunk 待 parser 演进）与仓储 `replace_chunks_for_version`（单事务删旧插新，派生可重建、幂等）/`chunks_for_version`（按 provision char_start 稳定升序 join 读回）；真实 MySQL 全栈验证 seed 两 version→replace→读回 1 行内容/哈希/parser_version 正确→重复 replace 幂等仍 1 行→另一 version 无泄漏；作为后续 OpenSearch/Embedding 索引的原料层。
+- 阶段 1 增补“语料 OpenSearch 检索客户端”非模型切片已完成（2026-09-10 计划）：后端零检索代码——新增 `domain/legal_search.py`（LegalSearchHit 稳定值对象）与 `infrastructure/search/opensearch.py`（`OpenSearchRestClient` 基于既有 httpx，零新依赖；ensure_index PUT mapping、replace_documents = `_delete_by_query`(按 parser_version 删旧)+`_bulk` 重建（幂等）、search_bm25 = bool match(content)+可选 term filter version_id+size，错误非 2xx 映射稳定 `OpenSearchError`；纯映射 `chunk_document`/`parse_search_hit`）；真实 OpenSearch 联调、Dense Vector/RRF/Rerank、Embedding 接入仍为后续切片（测试用 httpx MockTransport 离线验证请求/响应，不依赖 OS 容器）。
+- 阶段 1 增补“语料 OpenSearch 端到端”非模型切片已完成（2026-09-10 计划）：真实 OpenSearch 容器 + MySQL 全栈——seed 两 version（2020/2024 条文）→ ensure_index（时间戳唯一测试索引）→ derive_chunks → replace_documents → `_refresh` → BM25「百分之五」命中 2024 版、version 过滤 2020 版 0 命中 → 重复 replace 幂等文档数不变 → 清理测试索引与临时库（OS 不可达则按可用性模式 skip，不伪造通过）；OpenSearchRestClient 增 `delete_index`；Dense Vector/Embedding/RRF/Rerank 仍为后续。
+- 阶段 1 增补“OpenSearch Dense/k-NN 与 RRF 融合”非模型切片已完成（2026-09-10 计划）：`ensure_index` 增可选 `vector_dimension`（mapping 加 `content_vector` = knn_vector/dimension）、新增 `search_knn`（`query: {knn: {field/content_vector, query_vector, k}}` + 可选 version term filter，非法/非有限向量拒绝、命中复用 parse_search_hit）；`application/retrieval_fusion.py` 纯函数 `reciprocal_rank_fusion`（RRF，k 默认 60，两表按 rank 累加、同 chunk 去重、id 决胜稳定排序、空集安全）；MockTransport 单测断言 mapping/查询请求体与命中解析、503 映射；真实 Dense 检索与 Embedding 接入仍为后续。
+- 阶段 1 增补“语料向量索引编排”非模型切片已完成（2026-09-10 计划）：`application/legal_vector_indexing.py` `LegalVectorIndexingService.index_version(version_id, index_name, model_ref, dimension, batch_size)` 把 chunk 原料层接上 ModelGateway——分批 embed（gateway 校验维度并记录调用）→ `ensure_index(vector_dimension)` → `replace_documents`（标识符+content+content_vector，幂等重建），provider 可注入、完全离线单测；真实 OS k-NN 联调用确定性合成向量验证全链路（ensure_index 修正为 `settings.index.knn=true`+method=hnsw/lucene/l2、search_knn 改为字段键 `knn: {content_vector: {vector/k/filter}}` 形态后容器 200），与 BM25 端到端同容器 2/2 green；真实 embedding 模型/权重仍为后续 provider 适配器切片。
+- 阶段 1 增补“本地 Embedding Provider 适配器”切片已完成（2026-09-10 计划）：`infrastructure/providers/embedding.py` `LocalSentenceTransformerEmbeddingProvider` 在 `ModelProviderPort` 之后实现 embed——sentence-transformers 经动态 import 惰性加载（encode 可注入以便离线单测；依赖/权重缺失映射 `ModelProviderUnavailable`，绝不伪造结果），rerank/chat 未配置时明确报不可用；7 项离线单测 green（维度/文本数、空文本、编码异常、行数不匹配、rerank/chat 不可用、空模型名、依赖缺失路径）；venv 本机已 `uv pip install sentence-transformers`（exit 0，未提交依赖/未下载权重）；真实模型权重下载与 GPU 推理仍为后续运行切片。
+- 阶段 1 增补“真实 Embedding 端到端（CPU 本地模型→OS k-NN）”切片已完成（2026-09-10 计划）：真实本地模型 `BAAI/bge-small-zh-v1.5`（hf-mirror 下载、CPU 推理、512 维）经 `LocalSentenceTransformerEmbeddingProvider`→ModelGateway→`LegalVectorIndexingService`→OS k-NN 索引→`search_knn` 语义近邻——两段语义相近/无关条文入索引，查询「逾期支付租金应当支付违约金」首命中「承租人逾期支付租金…违约金」条文（version 过滤生效），清理索引；测试在模型不可下载或 OS 不可达时 skip（不伪造通过）；真实运行 54.8s green；spec 3.1 大模型选型仍以法律评测集为准（后续切片）。
+- 阶段 1 增补“法规混合检索服务（BM25+Dense→RRF）”非模型切片已完成（2026-09-10 计划）：`application/legal_hybrid_search.py` `LegalHybridSearchService.search(query, model_ref, dimension, index_name, version_id, limit, bm25_size, knn_size)` 编排 query→gateway.embed→search_bm25+search_knn（同 version 过滤）→RRF(k=60)→截断 limit；可选 chunks 端口先验 version 已索引（未索引返回空）；输入校验（空 query、非正 size/limit、空白 index_name）；5 项离线单测 green（双请求/RRF 排序、空结果、截断、坏输入、版本未索引短路）；对调用方隐藏 embed+双后端+融合细节；证据门禁/条文恢复/问答仍为后续。
+- 阶段 1 增补“检索命中→条文证据组装”非模型切片已完成（2026-09-10 计划）：`application/legal_evidence_assembly.py` `LegalEvidenceAssemblyService.assemble(hits)` 把混合检索命中恢复到权威条文证据——按 version 分组经 `SqlAlchemyLegalCorpusRepository.version_with_instrument`（新增 join instruments 只读方法，返回 `(LegalVersion, LegalInstrument)|None`）与 `provisions_for_version` 读权威元数据/全文，按命中顺序生成 `EvidenceItem`（evidence_id=provision.id、instrument_title/版本元数据/provision_no/provision_text/source_ref/dataset_version 均取权威库，authorized 由可选 `EvidenceAccessPort` 判定、缺省公共语料全授权），同 version 多条 chunk 命中同条文按 provision 去重保序，组 `EvidenceBundle`；空 hits 返回 None（无证据由上层拒答），命中引用不存在的 version/provision、版本缺 source_ref/dataset_version（来源不可追溯）一律抛稳定 `LegalEvidenceAssemblyError` 拒组、绝不静默丢弃或伪造；`LegalSearchHit` 三个 id 字段类型收紧为 `UUID`（require_uuid7 本就强制）；真实 MySQL 全栈 seed 两版本（current/repealed 同条文号）→组装读回字段/去重/权威来源→CitationGate target_date 放行与废止/未生效拒答闭环→空 hits None→不存在的 provision 拒组；9 项离线单测 + 1 项 MySQL 集成 green；法律 QA 链/租户私有证据授权仍为后续。
+- 阶段 1 增补“受控法规版本导入落库”非模型切片已完成（2026-09-10 计划）：此前 `legal_instruments/legal_versions/legal_provisions` 仅 Schema+读取、生产无任何写入路径（集成测试全裸 SQL seed）——新增 `application/legal_corpus_import.py` `LegalCorpusImportService.import_version(command)`（`LegalImportCommand` 显式元数据：instrument 身份 title/issuing_authority/jurisdiction/region + version 日期/状态/文号/source_ref/dataset_version/parser_version + 有序 `LegalProvisionDraft` 条文；校验条文非空/条号去重/字段非空，按顺序生成连续 char_start/char_end 与 sha256，version content_hash=条文正文拼接哈希可复算）；instrument 按 `(title, jurisdiction)` 精确匹配——命中同机关复用、异机关抛 `instrument_conflict`（相似法规不自动合并）、未命中新建；version 同 `(instrument_id, version_label)` 已存在且内容哈希与全部元数据一致 → 幂等 replay（replayed=True 不重复写）、内容或元数据任一不同 → `version_conflict`；原子写 instrument+version+provisions；错误族 `LegalCorpusImportError/Conflict` 稳定 message）；新增 `SqlAlchemyLegalCorpusImportRepository`（find_instrument_by_identity/create_instrument/find_version/create_version/create_provisions，flush 不隐式提交）；真实 MySQL 全栈：导入 2020 版→`version_at`/`provisions_for_version` 读回字段与顺序→相同命令 replay 同 version id 无重复写→同 label 异内容冲突回滚→同 instrument 第二版本独立并可 as_of 区分→清理；7 项离线单测 + 1 项 MySQL 集成 green；DOCX→命令自动映射已完成（见下条），导入端点/候选关系仍为后续。
+- 阶段 1 增补“解析产物→导入命令自动映射”非模型切片已完成（2026-09-10 计划）：受控导入要求手写 `LegalProvisionDraft`、parser 产 `ParsedInstrument/ParsedArticle`，两者无自动桥接——新增 `application/legal_corpus_import_mapping.py`（应用层纯映射，不反向依赖 infrastructure）：`LegalImportMetadata` 冻结值对象（与命令一一对应的显式元数据，绝不从文本猜测）、`ParsedArticleView` Protocol（provision_no/structure_path/text，parser 的 `ParsedArticle` 结构上满足）、`map_parsed_articles(metadata, articles) -> LegalImportCommand`——articles 非空、每条视图字段齐全（缺失稳定拒绝，绝不静默丢弃/伪造）、条号去重、按序映射为 `LegalProvisionDraft(level=ARTICLE, structure_path 透传, title=None, full_text=article.text)`（parser 不抽条题，heading 并入全文不猜测拆分），元数据逐字段透传；导入命令校验提升为公共 `validate_import_command`（服务与映射共用同一规则）；9 项离线单测（真实 ParsedArticle 顺序/条号/路径/全文/level/title=None/元数据透传、空列表、缺字段视图、空全文/空条号、重复条号、非强类型元数据、与 `LegalStructureParser` 组合验证 heading 并入全文与父级结构路径）+ 1 项真实 MySQL 集成（合成 docx bytes→`ZipDocxLoader`→`LegalStructureParser`→显式元数据→映射→真实 import 仓储→`version_at`/`provisions_for_version` 读回与 parser 产物一致含多段条文拼接→同源 replay 幂等同 version id→同 label 异内容冲突零写入→第二 label 独立版本 as_of 区分→清理）green；导入 HTTP 端点/候选 LegalInstrument 关系仍为后续。
+- 阶段 1 增补“法规版本条文级差异”非模型切片已完成（2026-09-10 计划，落实 2026-09-04 计划 Task A2「版本间差异查询」缺口）：此前只有导入与单版本读取、无同一法规两版本的条文级 diff——新增 `application/legal_corpus_diff.py` `LegalVersionDiffService.diff(from_version_id, to_version_id)`（只读 `LegalVersionDiffQueryPort`：version_with_instrument + provisions_for_version）与纯函数 `version_diff(old_provisions, new_provisions, *, instrument_id, from_version_id, to_version_id)`：先校验两版本存在且同一 `instrument_id`（跨法规一律抛 `LegalVersionDiffError`，绝不把不同法规误当版本关系），再按 `provision_no` 键 + 全文比较分组 added（仅新版）/ removed（仅旧版）/ modified（同号异文，携带 previous+current 全文）/ unchanged（两版一致），各按 `(char_start, provision_no)` 稳定排序，返回 `LegalVersionDiff`（instrument_id/两版本 id + 四组值）；diff 只读比较、不写库、不生成候选合并（spec 6.6 半自动更新的条文级差异首步）；真实 MySQL 全栈 seed 同 instrument 两版本（旧独有/新独有/同号同文/同号异文四条）→ diff 四组断言、异 instrument 两版本抛错、清理；6 项离线单测 + 1 项 MySQL 集成 green；文件级 diff 已完成（见下条），候选 LegalInstrument 关系/dataset_v2 生成仍为后续。
+- 阶段 1 增补“法规文件级差异（解析产物间纯比较）”非模型切片已完成（2026-09-10 计划，spec 6.6「更新前计算文件与条文级差异」的文件面缺口）：条文级 diff 只能比较已入库两版本，新来源文件未导入前无 DB 可对——新增 `application/legal_source_diff.py` `diff_source_articles(old_articles, new_articles) -> LegalSourceDiff`（`SourceDiffEntry` provision_no/structure_path/full_text、`ModifiedSourceEntry` 双全文、`LegalSourceDiff` changed 标志+added/removed/unchanged/modified 四组）：按 `provision_no` 键+全文比较分组（与 `legal_corpus_diff.version_diff` 同规则），**输入顺序即稳定顺序**（文件未落库无 char_start，不猜测排序），identical → changed=False、空输入安全、同号重复/空条号/空全文一律抛稳定 `LegalSourceDiffError`（绝不静默吞并）；`ParsedSourceArticle` Protocol 复用 parser 产物形状（应用不反向依赖 infrastructure）；不改 DB/导入/diff 契约；7 项离线单测（真实 `ParsedArticle` 增删改未变分组+顺序、identical changed=False、空输入、重复条号稳定拒绝、空白条号/全文拒绝、structure_path 不影响匹配）+ 1 项真实 MySQL 集成（两份合成 docx→loader→parser→文件级 diff 四组断言→各自经导入命令映射+受控导入成 DB 两版本→既有 `LegalVersionDiffService` 条文级 diff，断言文件级与条文级分组完全一致→清理）green；候选 LegalInstrument 关系/dataset_v2 自动生成/文件级 diff HTTP 仍为后续。
+- 阶段 1 增补“法规版本按 id 只读 GET”非模型切片已完成（2026-09-10 计划）：语料只读端点此前只能经 as_of/历史/diff/条文间接取得版本，缺按 version_id 直读单版本元数据——新增 `GET /api/v1/legal/versions/{version_id}` 返回 `LegalVersionSummary`（与 as_of/历史响应同构，白名单字段 `extra="forbid"`，登录账号可读、公共语料）；应用 `LegalCorpusQueryService.version(version_id)`（复用既有 `version_with_instrument` 判存在，缺失 → 复用 `LegalCorpusVersionNotFound` 404 `legal_corpus_version_not_found`；application `LegalCorpusQueryPort` 补 `version_with_instrument` 协议方法）；真实 MySQL+Redis 全栈验证 按 id 读回单版本元数据（label/status/dataset_version/instrument_id）、未知 version 404、未认证 401（扩展既有语料全栈）；契约单测沿用；纯只读不改 Schema；后续检索/QA 端点仍为后续。
+- 阶段 1 增补“模型 claims 输出解析器（受控单次修复）”非模型切片已完成（2026-09-10 计划，spec 7.6「结构化输出失败最多进行一次受控修复，仍失败则安全终止」）：Claim 门禁已就绪但缺把模型返回文本解析成受校验 `LegalClaim` 的解析器——新增 `application/legal_claim_parse.py` `parse_claims_text(text, *, max_claims=20, max_text_chars=2000, max_evidence_per_claim=20) -> tuple[LegalClaim,...]`：顶层必须 JSON 对象含 `claims` 数组，claim 仅允许 `text`（非空 ≤上限）与 `evidence_ids`（≥1 ≤上限、UUIDv7、无重复）、未知键拒绝；首次解析失败 → **一次受控修复**（剥 markdown 围栏 / 截取 `{…}` 段再试一次），仍失败抛稳定 `LegalClaimsParseError` 安全终止（绝不静默丢字段或多轮盲猜）；claims 总数 ≤max_claims；错误信息**不回显整段原文**（模型输出为不可信内容）；18 项离线单测（plain/fence/前缀损坏一次修复、坏 JSON、缺 claims/claims 非数组/缺 text/空 text/未知键/缺或空 evidence/非 uuid/重复 evidence/超上限、与 ClaimGate 冒烟组合、错误不回显原文）green；claims 供应商 JSON 适配与完整 QA 链仍为后续。
+- 阶段 1 增补“结构化 Claim 发布前门禁服务”非模型切片已完成（2026-09-10 计划，spec 6.5「模型输出使用结构化 claims[]；后端验证 Evidence ID 存在/有权/日期不冲突/可完整展示，引用不支持结论即拒答」的服务化）：CitationGate 只逐条校验 (claim_index, evidence_id)，缺对整组结构化 claims 的发布前裁决——新增 `application/legal_claim_gate.py`：`LegalClaim(text, evidence_ids)`（text 非空、evidence_ids 至少一个且 uuid7 唯一、非法抛 `LegalClaimGateError`）；`LegalClaimGate(bundle, gate)` `verify(claims, target_date) -> LegalClaimGateResult(allowed/refused/reason/verdicts)`——逐 claim 逐引用复用 CitationGate（in-bundle/authorized/生效日期/废止/状态未知规则不变），claim 级全部引用 allowed 才 allowed（任一失败取首个 reason），整体 claims 非空且全部 allowed 才 allowed，否则 refused（`no_claims` / `claim_not_supported:<code>`），verdicts 只携带 claim_index/reason/evidence_id、**绝不携带 claim 正文**（模型输出为不可信内容）；10 项离线单测（单 claim 多引用 allowed、多 claim allowed、out-of-bundle/未授权/生效前/已废止/状态未知拒答、混合任一失败整体 refused、空 claims `no_claims`、非法 claim 抛错、verdicts 不含正文）green；claims 的 LLM JSON 解析/修复与 QA 链仍为后续。
+- 阶段 1 增补“法规数据集检索证据编排（数据集别名→检索→EvidenceBundle）”非模型切片已完成（2026-09-10 计划）：数据集检索与证据组装两服务就绪但无单一入口——新增 `application/legal_dataset_evidence.py` `LegalDatasetEvidenceService(dataset_search, evidence_assembly)` `search_evidence(alias, query, model_ref, dimension, version_id=None, limit=20, bm25_size=100, knn_size=100) -> EvidenceBundle | None`：先 `LegalDatasetSearchService.search_dataset` 检索当前数据集（未发布 `LegalDatasetNotPublished` 上抛不吞），命中空 → 返回 None（无证据由上层拒答/降级），命中 → `LegalEvidenceAssemblyService.assemble` 恢复权威条文并组装 EvidenceBundle；只读编排、不改两服务契约、不加依赖；5 项离线单测（委托检索+组装返回 Bundle 且命中透传、空命中 None 不调组装、未发布上抛、组装 None→None、输入校验）+ 真实 MySQL 集成（seed 一版本 source_ref/dataset_version 齐全 + 条文 → fake dataset search 返回命中 → Bundle 含 EvidenceItem 字段正确 → 空命中 None）green；检索问答 HTTP/QA claims+CitationGate 仍为后续。
+- 阶段 1 增补“法规数据集检索服务（数据集别名→混合检索）”非模型切片已完成（2026-09-10 计划，spec 6.6「检索走稳定别名」的调用方封装）：混合检索要求显式物理索引名、别名服务只做解析，缺数据集级入口——新增 `application/legal_dataset_search.py` `LegalDatasetSearchService(hybrid, alias)` `search_dataset(alias, query, model_ref, dimension, version_id=None, limit=20, bm25_size=100, knn_size=100) -> tuple[LegalSearchHit,...]`：先 `alias.active_dataset_index` 解析当前索引（非法名上抛），未发布（别名无目标）→ 抛 `LegalDatasetNotPublished`（绝不把「数据集未发布」伪装成空结果），解析成功后委托 `LegalHybridSearchService.search`（输入校验/embed/BM25+kNN/RRF/截断全沿用，调用方无感知）；不改 hybrid/alias 契约；5 项离线单测（解析委托/参数透传、无 version、未发布拒绝、别名错误上抛、空命中透传）+ 真实 MySQL+真实 OS e2e（seed 一版本条文→chunk→确定性 fake gateway 建索引并发布 dataset 别名→未发布先拒→发布后按别名混合检索命中且 version 正确→drop 别名+删索引清理，OS 不可达 skip）green；检索 HTTP 化/证据组装门禁/QA 链路仍为后续。
+- 阶段 1 增补“法规数据集索引发布编排（建索引→原子切别名）”非模型切片已完成（2026-09-10 计划，spec 6.6「建新索引后原子切换数据集与索引别名」的组装层）：onboarding/vector-indexing/alias 三服务各自就绪但无发布编排——新增 `application/legal_index_publish.py` `LegalDatasetIndexPublishService(indexer, alias)` `publish_version(version_id, index_name, alias, model_ref, dimension, batch_size)`：白名单校验 index_name/alias/dimension/batch_size/model_ref → `LegalVectorIndexingService.index_version` 批量 embed 重建索引（幂等）→ `indexed_documents==0` 抛 `LegalDatasetPublishError`（拒绝把空数据集发布到别名）→ `LegalDatasetAliasService.publish_dataset` 原子指向新索引 → 返回 `DatasetPublishResult(index_name, indexed_documents, previous_target)`（旧索引保留供历史/回滚）；6 项离线单测（顺序/透传/0 文档拒发不切别名/首发布 None/名字校验/重复发布安全）+ 真实 MySQL+真实 OS 容器 e2e（seed 两版本条文→real chunk repo ensure→确定性 fake provider gateway 建索引→发布 dataset 别名→resolve 指向新索引→原子切 B 返回 A→旧索引 A 仍保留可删→drop 别名+删两索引清理，OS 不可达 skip）green；发布快照登记已完成（见下条），质量门禁写面已补（见「受质量门禁保护的索引发布组合」条）、检索走别名仍为后续。
+- 阶段 1 增补“受质量门禁保护的索引发布组合”非模型切片已完成（2026-09-10 计划，spec 6.6「通过自动质量检查…后形成新数据集版本」的发布前门禁写面）：索引发布只校验 indexed>0、不查 DB 条文质量，空/断裂版本仍可被推上别名——新增 `application/legal_dataset_gated_publish.py` `LegalDatasetGatePublishService(gate, corpus, publish)`（`LegalVersionReadPort`：version_with_instrument+provisions_for_version，`SqlAlchemyLegalCorpusRepository` 结构满足；复用 `LegalCorpusQualityGate` 与 `LegalDatasetPublishError`）：先读版本（缺失 → 稳定错不发布），`QualityGate.evaluate(article_count=条文数, article_numbers=按序条文号, required=(), parse_failures=0)` 不达标（no_articles/条号断裂等）→ `LegalDatasetPublishError`（message 前缀 quality issue 可诊断），**绝不动 indexer/别名/快照**；达标才委托底层 `LegalDatasetIndexPublishService.publish_version`（参数透传，0 文档拒发与 snapshot 登记仍在底层执行）；纯组合、零 schema 改动；6 项离线单测（达标委托一次且参数透传、空版本拒发零调用、条号断裂拒发、版本缺失拒发、非数字条号不误拒、typed gate 校验）+ 1 项真实 MySQL 集成（真实 import 仓储导入连续条文版本→组合服务真 QualityGate+真读仓储+fake publish 被调一次；同 instrument 第二 label 断裂版「一、三」→拒绝零调用；未知版本拒绝零调用→清理）green；检索走别名、candidate 关系/dataset_v2 自动生成仍为后续。
+- 阶段 1 增补“索引发布联动 dataset snapshot 落库”非模型切片已完成（2026-09-10 计划）：索引发布此前只切 OS 别名、不留 MySQL 记录，快照读面只能看到批次发布产生的行——`LegalDatasetIndexPublishService` 增**可选** `snapshot: DatasetSnapshotWritePort`（find_dataset/upsert_dataset，`SqlAlchemyLegalCorpusInventoryRepository` 结构满足；缺省构造完全向后兼容）与可注入 clock：`publish_version` 别名切换成功后、仅当 `indexed_documents>0` 时登记快照（dataset_name=alias、state=PUBLISHED、parser_version 显式（默认 docx-zip-v1）、manifest 白名单 index_name/alias/version_id/model_ref/dimension/indexed_documents、quality_metrics={indexed_documents,dimension}、released_at=now、已有行复用 id 幂等 upsert 只留最新）；`indexed==0`/名字校验失败/别名失败一律不写；`_METRIC_ALLOWLIST` 增 indexed_documents/dimension 使登记指标可经快照读 HTTP 读回；6 项离线单测（成功登记字段/复用行幂等/无 port 不写/0 文档不写/校验失败不写/新行 uuid7）+ 1 项真实 MySQL 集成（fake indexer/alias + 真 inventory 仓储：发布 dataset_v2→行读回字段→同别名重发新 index 同 id 单行更新→0 文档拒绝不覆盖→清理）+ 读面全栈断言 indexed_documents 透出 green；质量门禁联动写面（发布前 gate）、检索走别名仍为后续。
+- 阶段 1 增补“法规导入编排（导入即自动分块落库）”非模型切片已完成（2026-09-10 计划）：受控导入只写 version/provisions，生产从无导入后自动生成 chunk 原料行（既有 e2e 全手工 seed→derive→replace）——新增 `application/legal_corpus_onboarding.py` `LegalCorpusOnboardingService(import_version, provisions, chunks)`（三个可调用端口注入）`onboard_version(command) -> OnboardingResult(instrument_id, version_id, chunk_count)`：复用 `LegalCorpusImportService.import_version`（命令校验/身份归属/幂等 replay/冲突语义原样保留）→ `provisions_for_version` 读回权威条文 → `derive_chunks(parser_version=command.parser_version)` 派生 PROVISION chunk → `replace_chunks_for_version` 原子删旧插新幂等落库（重复导入同命令不积累重复行），provisions 为空则 chunk_count=0 不写；错误族 `LegalCorpusImportError/Conflict` 原样上抛；5 项离线单测（两条文→replace 两 chunk 字段/parser、replay 重建同集合、空条文不写、冲突上抛、derive 匹配命令 parser）+ 真实 MySQL 集成（同一 session 组合真实 import+corpus+chunk 仓储：版本 A 两条文→chunks 2 行内容/哈希/parser_version 正确→replay 仍 2 行幂等→版本 B 一条文独立 1 行无串）green；OS 索引/别名联动消费本编排产物仍为后续。
+- 阶段 1 增补“OpenSearch 数据集索引别名（原子切换）”非模型切片已完成（2026-09-10 计划，spec 6.6 半自动更新「新索引构建完成后原子切换别名，旧数据集继续用于历史问答和快速回滚」前置）：OS 客户端原只有 index 级操作、测试全用一次性临时索引名、无稳定数据集别名——`infrastructure/search/opensearch.py` 增 `index_exists`（HEAD）、`resolve_alias`（GET /_alias 解析唯一目标，404→None、多目标抛稳定 `OpenSearchError`）、`point_alias`（同目标幂等 no-op；否则单次 `POST /_aliases` 原子 remove 旧目标+add 新目标并返回切换前目标）、`drop_alias`（按目标 DELETE /_alias，404 幂等），全经 httpx 无 SDK；新增 `application/legal_index_alias.py` `LegalDatasetAliasService`（别名/索引名白名单 `[a-z0-9_.-]` 1–255 校验、publish_dataset 先验 index 存在再原子指向返回前目标、active_dataset_index 供检索编排读取），只做指向管理不搬数据；11 项离线 MockTransport 单测（resolve 404/单目标/多目标、point 首次切换请求体 remove+add/同目标不发切换/首加无 remove、drop 幂等、名字校验、缺索引拒绝、publish/active）+ 真实 OS 容器 e2e（两索引→指向 A→原子切 B→同目标 no-op→历史索引仍可删→drop 后 resolve None→清理）green；dataset_v1/v2 发布流程联动别名、检索走别名改造仍为后续。
+- 阶段 1 增补“法规身份只读 HTTP API”非模型切片已完成（2026-09-10 计划）：语料只读端点此前只回 `instrument_id`、无法规身份本体——新增 `GET /api/v1/legal/instruments/{instrument_id}` 返回 `LegalInstrumentSummary`（id/title/issuing_authority/jurisdiction/region_code，`extra="forbid"`，登录账号可读、公共语料非租户私有）；仓储只读方法 `instrument_by_id`（复用 `_to_instrument`；公共事实数据按 id 显式读取，非私有资源任意 get）+ 应用 `LegalCorpusQueryService.instrument`：不存在 → 复用 `LegalCorpusInstrumentNotFound`（404 `legal_corpus_instrument_not_found`）；真实 MySQL+Redis 全栈 seed 两法规→按 id 读回身份字段→未知 instrument 404→未认证 401（与既有语料全栈共用 seed）；契约单测（`LegalInstrumentSummary` 往返/错误码/装配）+ 全栈扩展 green；法规清单/搜索已补（见下条）、内联版本仍为延后。
+- 阶段 1 增补“法规清单/搜索只读 HTTP API”非模型切片已完成（2026-09-10 计划）：语料只读端点只能按已知 id 逐个读、盘点/法规目录无浏览入口——新增 `GET /api/v1/legal/instruments?limit=&before_id=&title=&issuing_authority=&jurisdiction=&region_code=` 返回 `LegalInstrumentPage`（`items: [LegalInstrumentSummary]` + `next_before_id`，响应 `extra="forbid"`，登录账号可读、公共语料非租户私有）；仓储 `list_instruments`（title/issuing_authority 子串 contains、jurisdiction/region_code 精确过滤，按 `(created_at,id)` 倒序 keyset 分页 limit 1–100，before_id 锚点查 created_at、缺失抛 `LegalCorpusInstrumentListCursorInvalid`）+ 应用 `LegalCorpusQueryService.instruments`（limit 1–100 校验、before_id uuid7 校验、空白/超长过滤 422 `legal_corpus_invalid_request`、游标缺失映射 404 `legal_corpus_instrument_cursor_invalid`）；错误族继承带 status/code/title 的 `LegalCorpusQueryError`、映射沿用 `_map_error`；4 项离线服务单测（透传净化过滤、空白/超长 422、limit/游标非法、游标缺失映射）+ 契约单测（Page 往返/两错误码）+ 真实 MySQL+Redis 全栈扩展 seed 三法规→national 列表含三行→契税法 title 子串→authority+jurisdiction+region 组合→limit=1 三页不重不漏 newest-first→未知游标 404→空白 title 422→未认证 401→清理 green；法规目录分页浏览闭环，dataset snapshot 读面已补（见下条）、全文搜索/内联版本仍为后续。
+- 阶段 1 增补“盘点批次只读 HTTP API”非模型切片已完成（2026-09-10 计划）：盘点目录/发布记录有读面，但 LoadBatch（盘点批次）无任何公开读端点——新增 `GET /api/v1/legal/load-batches?limit=&before_id=`（keyset newest-first `(created_at,id)`，limit 1–100）与 `GET /api/v1/legal/load-batches/{batch_id}` 返回白名单 `LoadBatchSummary`（id/batch_no/source_ref/parser_version/status/item_counts/started_at/completed_at/error_message，`extra="forbid"`）；仓储只读方法 `load_batches`/`load_batch_by_id`（映射复用 inventory 语义，时间补 UTC、游标缺失抛 `LegalCorpusLoadBatchCursorInvalid`）+ 应用 `LegalCorpusQueryService.load_batches/load_batch`（limit/游标/id 校验 422 `legal_corpus_invalid_request`；游标缺失映射 404 `legal_corpus_load_batch_cursor_invalid`；缺失 → 新 `LegalCorpusLoadBatchNotFound` 404 `legal_corpus_load_batch_not_found`）；契约单测（summary/page 往返+错误码）+ 6 项服务单测 + 真实 MySQL+Redis 全栈扩展 seed 三批（completed/inventoried/failed 各异 created_at）→ limit=2 两页不重不漏 newest-first→按 id 读回字段含 item_counts→未知 batch 404→非法游标 404→未认证 401→清理 green；批次质量明细（QualityIssue 行）读面已补（见下条）。
+- 阶段 1 增补“质量门禁失败项落库与批次质量明细读 HTTP”非模型切片已完成（2026-09-10 计划）：`legal_quality_issues` 表/域模型自建起无任何写路径与读端点，门禁失败只进 REJECTED snapshot 的 metrics 摘要——`LegalCorpusPublishPort` 增 `replace_quality_issues(batch_id, file_sha256, issues)`（幂等重建：先 DELETE batch 旧行再逐条 INSERT，issue_type=`issue.split(":")[0]`≤64、message 完整≤2048）；`LegalCorpusPublishService.publish` 失败且 batch_id 有对应 batch 时调用（成功路径零写）；`SqlAlchemyLegalCorpusInventoryRepository` 实现写 + `SqlAlchemyLegalCorpusRepository` 只读 `quality_issues_for_batch`（created_at/id 升序）；`LegalCorpusQueryService.quality_issues(batch_id)` 复用 load_batch 存在性语义（缺失 404 `legal_corpus_load_batch_not_found`）+ `GET /api/v1/legal/load-batches/{batch_id}/quality-issues` 返回白名单 `QualityIssueSummary`（issue_type/message，`extra="forbid"`）；契约单测（summary 往返）+ 3 项服务单测 + publish 单测（失败写/成功零写/无 batch 不写）+ 真实 MySQL 集成（真仓储：inventory→publish 失败（条号断裂+缺必需字段）→issue 行读回（type 拆分、batch/sha 正确）→同批再失败 replace 幂等同集合→清理含 quality/load/snapshot 表）+ 真实 MySQL+Redis 全栈（seed batch+两条 issue→GET 白名单→未知 batch 404→未认证 401→清理）green；逐文件级质量归属仍为后续。
+- 阶段 1 增补“数据集快照只读 HTTP API”非模型切片已完成（2026-09-10 计划）：盘点管理读面此前覆盖 instrument/version/provision，但 dataset snapshot（dataset_v1/v2 发布记录/质量指标/发布时间）没有任何公开读端点——新增 `GET /api/v1/legal/datasets`（全量，released_at 非空在前→倒序、id 决胜稳定排序，MySQL `is_not(None).desc()` 写法）与 `GET /api/v1/legal/datasets/{dataset_name}`（按名读单条）返回 `DatasetSnapshotSummary` 白名单投影（dataset_name/parser_version/state/released_at + 质量指标仅 article_count/coverage/parse_failures 白名单标量，`extra="forbid"`，**不暴露 manifest 原文**——内含来源清单路径非读面所需）；仓储只读方法 `dataset_snapshots`/`dataset_snapshot_by_name`（映射 released_at 补 UTC）+ 应用 `LegalCorpusQueryService.datasets/dataset`（name 空白/非法字符/超长 422 `legal_corpus_invalid_request`，缺失 → 新 `LegalCorpusDatasetSnapshotNotFound` 404 `legal_dataset_snapshot_not_found`，均继承错误族、映射沿用 `_map_error`）；契约单测（summary 往返/错误码）+ 4 项服务单测 + 真实 MySQL+Redis 全栈扩展 seed published（dated）+pending（NULL）两条→列表 dated 在前、字段/指标白名单→按名读回→未知名 404→非法名 422→未认证 401→清理 green；dataset 写面发布编排仍为后续。
+- 阶段 1 增补“法规版本 diff 只读 HTTP API”非模型切片已完成（2026-09-10 计划）：diff 应用层已有、无公开端点——新增 `GET /api/v1/legal/version-diff?from_version_id=&to_version_id=` 返回两版本条文 diff（added/removed/modified/unchanged 四组白名单投影，modified 携带 previous/current 全文）；diff 错误族加稳定码（`LegalVersionDiffVersionNotFound` 404 `legal_corpus_version_not_found`、`LegalVersionDiffCrossInstrument` 409 `legal_version_diff_cross_instrument`，继承带 status/code/title 的 `LegalVersionDiffError`）；新增 `LegalVersionDiffReadService`（UoW 单会话编排，diff 全程同一只读会话）+ dependencies `legal_version_diff_http` 惰性装配；真实 MySQL+Redis 全栈 seed 同法规两版本（新增/删除/同号异文/未变）+ 异法规版本→ diff 四组断言、同号异文 previous/current 全文、跨法规 409、未知版本 404、未认证 401；契约单测（错误码/服务装配）+ 全栈 green；HTTP 文件级 diff / candidate LegalInstrument 关系 / dataset_v2 仍为后续。
+- 阶段 1 增补“法规版本历史只读 HTTP API”非模型切片已完成（2026-09-10 计划）：只读 API 原有 `version?as_of=` 单点与 `versions/{id}/provisions`，缺公开**版本清单**——新增 `GET /api/v1/legal/instruments/{instrument_id}/versions` 列出某法规全部版本元数据（复用 `LegalVersionSummary`，与 `version?as_of` 响应同构；按 published_on 有值在前→日期倒序、effective_on 倒序、id 决胜稳定排序，MySQL 可移植无 NULLS LAST）；仓储只读方法 `instrument_exists` + `versions_for_instrument`（含内部/应用层 `LegalCorpusQueryPort` 协议扩展），应用 `LegalCorpusQueryService.versions_for_instrument`：instrument 不存在 → 新 `LegalCorpusInstrumentNotFound`（404 `legal_corpus_instrument_not_found`，与 version_not_found 同族）、存在但无版本 → 空列表；公共语料登录账号可读（非租户私有），错误映射沿用 Problem Details；真实 MySQL+Redis 全栈验证 两版本（current/historical）按公布日倒序读回全部字段、未知 instrument 404、未认证 401；契约单测 + 既有全栈扩展 green；HTTP 暴露版本 diff/文件级 diff 端点仍为后续。
+- 阶段 1 增补“法规语料只读 HTTP API”非模型切片已完成（2026-09-05 计划）：`GET /api/v1/legal/instruments/{id}/version?as_of=` 时点取现行版本元数据（published/effective/repealed、law_number、dataset_version、source_ref；无生效版本 404）、`GET /api/v1/legal/versions/{id}/provisions` 按序返回条文全文；平台公共语料、登录账号可读、非租户私有；真实 MySQL 全栈验证 as_of 三态（早于生效 404 / 区间取旧版 / 之后取新版）、非法日期 422、条文全文、未认证 401；全文检索/Embedding/问答仍延后。
+- 阶段 1 增补“Model Gateway 核心”非供应商切片已完成（2026-09-10 计划，用户已授权运行 embedding 后启动）：按 spec 7.2 先建供应商无关网关核心——`domain/model_gateway.py` 纯值对象（EmbeddingVector 定维校验、RankedDocument、ChatMessage、TokenUsage、CallLimits、指数退避有界重试纯函数、ModelCallRecord）与 `application/model_gateway.py`（ModelProviderPort 自有接口 + ModelGateway 门面：输入校验、计时、失败映射为稳定错误码、无备用 Provider 时不伪造 fallback、每次调用经 ModelCallRecorderPort 记录成功/失败）；真实 Embedding/Rerank/DeepSeek Provider、OpenSearch 索引与混合检索、SSE、问答链仍为后续切片（需在自有接口之后接入，本机 HF 权重/venv 依赖待后续工程）。
+- 阶段 2 非模型先行切片已完成（2026-09-05 计划）：租户 Matter、Document 版本、对象引用白名单、上传会话/校验（NEEDS_REVIEW 不绕过）、Review 状态骨架与跨租户反向测试；条款/风险 AI、RAG、Drafting/导出、MinIO 预签名直传仍为延后项。
+- 阶段 2 增补“Rule Pack 与确定性合同风险检查”非模型切片已完成（2026-09-05 计划）：版本化 Rule Pack/规则/RiskIssue 三表与迁移、租户范围仓储与跨租户反向测试、正则白名单 RuleEngine、OPEN→ACCEPTED/REJECTED/MODIFIED 人工处置状态机、DOCX→引擎→处置→重跑真实 MySQL 集成流；规则命中固定 `evidence_level=rule_based`，高风险/时限一律人工确认，条款识别 AI、法规 RAG、正式结论输出仍为延后项。
+- 阶段 2 增补“Rule Check DOCX 报告导出”非模型切片已完成（2026-09-05 计划）：stdlib 只写 DOCX（XML 转义、拒控制字符/超长、无 DOCTYPE/ENTITY/外部关系）、报告组装服务只消费已入库文档元数据与 RiskIssue/处置记录、免责声明与「待人工核验/无命中≠无风险」措辞、DOCX 写→读回闭环与真实 MySQL seed→检查→处置→导出流、跨租户导出反向测试；PDF、正式 LegalReport 发布/审批/版本化、模板引擎、派生版本落库与下载 API 仍为延后项。
+- 阶段 2 增补“Rule Check 租户 HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/...` 下运行检查/读取/处置 RiskIssue/下载 DOCX 报告四个端点（Pydantic 严格模型、path tenant 强校验、每请求显式 TenantContext UoW、run 幂等、处置条件更新防并发）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 run→list→dispose→409→report 读回，以及 path 与资源两层跨租户反向；permission code 化、上传预签名链、条款 AI/RAG 仍为延后项。
+- 阶段 2 增补“租户 Matter/Document HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/...` 下创建/读取 Matter、登记 Document 原件版本（docx→ACCEPTED、非白名单 MIME→NEEDS_REVIEW）、按 Matter 列出版本（含新增 DocumentHeader 领域类型与仓储 headers_for_matter）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 create→get→register→list 与租户 B 的路径/资源两层跨租户反向；为 Rule Check HTTP API 提供上游闭环；上传预签名 MinIO、其余端点幂等化仍为延后项。
+- 阶段 2 增补“Matter 创建 Idempotency-Key”非模型切片已完成（2026-09-05 计划）：`POST /tenants/{tenant_id}/matters` 接入既有幂等框架（membership scope + title/kind/description 指纹 + reserve→execute→complete→replay）；真实 MySQL+Redis 全栈验证同 key 同体 replay 返回同一 matter id（仅一行）、同 key 异 body → 409 `idempotency_conflict`、异 key 创建独立资源；其余写端点幂等化为后续。
+- 阶段 2 增补“Document 登记 Idempotency-Key”非模型切片已完成（2026-09-05 计划）：`POST /tenants/{tenant_id}/matters/{matter_id}/documents` 接入幂等框架，指纹 = file_name/mime_type/payload SHA-256（payload 不入库），replay 返回原 document 版本投影；真实 MySQL+Redis 全栈验证同 key 同 payload replay 同 document_id（仅 1 个 header）、同 key 异 payload → 409 `idempotency_conflict`、异 key 新建文档；其余写端点幂等化仍延后。
+- 阶段 2 增补“Document Review 状态机 HTTP API”非模型切片已完成（2026-09-05 计划）：`POST /api/v1/tenants/{tenant_id}/documents/{document_id}/versions/{version_no}/review` 提交/批准/驳回/要求修改人工复核（迁移 20260905_10 增加 `review_reason` 列并往返+`alembic check`；域状态机纯函数拒绝非法转换与空理由；仓储按唯一键原子更新并仅放行 accepted/ready 版本）；真实 MySQL+Redis 全栈 HTTP 测试覆盖 submit→request_changes→resubmit→approve→终态 409 与跨租户双层 404；自动发布/结论引用门槛仍为延后项。
+- 阶段 2 增补“Document 版本只读 GET”非模型切片已完成（2026-09-10 计划）：`GET /api/v1/tenants/{tenant_id}/documents/{document_id}/versions/{version_no}` 读回单版本 upload/review 状态（白名单投影 document_id/version_no/kind/file_name/upload_status/review_status/review_reason，不含 object_key/sha256/mime/size，响应 `extra="forbid"`）；服务复用 UoW `find_version`，不存在/跨租户 404 `document_review_not_found`、非法 version_no 422；真实 MySQL+Redis 全栈验证 登记后 GET（accepted/未提交）→submit→GET pending_review→request_changes+reason 读回→resubmit→approve（reason 清空）→不存在版本 404→租户 B path 层 404/资源层 404；自动发布/结论引用门槛仍为延后项。
+- 阶段 2 增补“Document Review Idempotency-Key”非模型切片已完成（2026-09-06 计划）：`POST /api/v1/tenants/{tenant_id}/documents/{document_id}/versions/{version_no}/review` 接入幂等框架（membership scope；指纹 = document_id/version_no/decision/reason；result_type=`document_version`、result_id=version.id）；同 key 同体 replay 返回原版本投影且不再触发第二次状态转移、同 key 异体 → 409 `idempotency_conflict`、异 key 继续受状态机约束（终态 409 `document_review_conflict`）、无 key 路径完全向后兼容；真实 MySQL+Redis 全栈验证 replay 在版本推进至终态后仍返回 200 与原结果；启停/激活/处置幂等化仍为延后项。
+- 阶段 2 增补“Rule Pack 创建 Idempotency-Key”非模型切片已完成（2026-09-05 计划）：`POST /tenants/{tenant_id}/rule-packs` 与 `POST .../rule-packs/{pack_id}/rules` 接入幂等框架（建包指纹 = name；加规则指纹 = trigger/label/pattern/risk/suggestion），replay 返回原 pack/rule id；真实 MySQL+Redis 全栈验证同 key 同指纹 replay 同 id（仅一行）、同 key 异指纹 → 409 `idempotency_conflict`、异 key 独立资源；Review/启停/激活幂等化仍有状态保护未接。
+- 阶段 2 增补“RiskIssue 处置 Idempotency-Key”非模型切片已完成（2026-09-06 计划）：`POST /tenants/{tenant_id}/risk-issues/{issue_id}/disposition` 接入幂等框架（membership scope；指纹 = issue_id/status/reason；result_type=`risk_issue`、result_id=issue_id）；同 key 同体 replay 返回原 issue 投影且不重复处置、同 key 异体 → 409 `idempotency_conflict`、异 key 仍受状态机约束（非 open 409 `rule_check_conflict`）、无 key 路径向后兼容；`SqlAlchemyRuleCheckUnitOfWork` 补 idempotency 仓储并注入共享 IdempotencyService；真实 MySQL+Redis 全栈验证 replay/conflict/状态机/无 key 行为；启停/激活幂等化仍为延后项。
+- 阶段 2 增补“Rule Pack 启停/激活 Idempotency-Key”非模型切片已完成（2026-09-06 计划）：`PATCH .../rule-packs/{pack_id}/rules/{rule_id}`（启停，指纹 = pack_id/rule_id/enabled，result_type=`rule_pack.rule`/result_id=rule_id）与 `POST .../rule-packs/{pack_id}/activate`（激活，指纹 = pack_id，result_type=`rule_pack.pack`/result_id=pack_id）接入幂等框架；同 key 同体 replay 返回原投影/204 且不重复状态写入、同 key 异体 → 409 `idempotency_conflict`、不存在资源带 key → 404 不 complete（可重试）、无 key 路径向后兼容；真实 MySQL+Redis 全栈验证 activate replay 仅一个 active pack、toggle replay 仅一次写入、冲突/404/无 key 行为；模板规则库、permission code 化仍为延后项。
+- 阶段 2 增补“Rule Pack 管理 HTTP API”非模型切片已完成（2026-09-05 计划）：`/api/v1/tenants/{tenant_id}/rule-packs` 下创建（同名版本自动 +1、inactive）/列表/向 Pack 添加规则（正则白名单、枚举校验）/启停规则/激活唯一 active（事务清理其它）；管理纯函数与租户范围仓储写方法，MySQL 集成覆盖版本推进与唯一激活，全栈 HTTP 覆盖 建包→加规则→坏正则 422→v2→激活→联动 Rule Check 命中→停用后 409 拒绝空跑→跨租户双层 404；模板规则库、permission code 化仍为延后项。
+- 阶段 2 增补“Rule Pack 规则只读回读”非模型切片已完成（2026-09-10 计划）：`GET /api/v1/tenants/{tenant_id}/rule-packs/{pack_id}/rules` 读回某 pack 的**全部**规则（含 disabled，按 created_at/id 稳定升序，响应投影与加规则一致 `RuleSummary`）；仓储新增 `list_pack_rules`（引擎侧 `rules_for_pack` 仍只读 enabled，不动）；服务先 `_find_pack_by_id` 校验归属（不存在/跨租户 → 404 `rule_pack_admin_not_found`）；真实 MySQL+Redis 全栈验证 空 pack `[]`→加 2 规则（high/low）按序读回→停用后仍可见 disabled→不存在 pack 404→租户 B path 层 404/资源层 404→B 自己 pack 规则与 A 无交集；模板规则库、permission code 化仍为延后项。
+- 阶段 2 增补“租户人工写动作审计”非模型切片已完成（2026-09-05 计划）：`risk_issue.dispose`/`document.review`/`rule_pack.activate` 三个最高影响人工动作在成功路径登记 TENANT_USER 结构化审计（action/result/reason_code/trace_id/target_type/target_id，仅标识符不泄漏正文）；`_TENANT_USER_PREFIXES` 白名单扩展与三个 UoW 暴露 audit 仓储；真实 MySQL+Redis 全栈验证三类动作各产生正确审计行。
+- 阶段 2 增补“拒绝路径审计”非模型切片已完成（2026-09-05 计划）：被拒处置/复核/激活尝试也留痕——409 状态冲突与 404 目标不存在（含跨租户资源层尝试）写 `result=denied`、422 非法请求写 `result=failure`，reason_code 复用稳定 Problem Details 错误码，target 记录尝试引用的资源；审计追加在业务 UoW 回滚后经独立短事务提交（失败尝试不吞事件也不误提交半成品）；路径层 404（租户不匹配、未进入服务）不产生审计噪音；真实 MySQL+Redis 全栈验证同一资源二次处置/复核、空理由、不存在 version/pack/issue、跨租户资源层尝试均产生正确 denied/failure 行且成功行不受影响。
+- 阶段 2 增补“租户审计查询 HTTP API”非模型切片已完成（2026-09-05 计划）：`GET /api/v1/tenants/{tenant_id}/audit` 只读列出本租户审计（action 前缀白名单/target_type/trace_id 过滤、limit≤100、before_id 游标稳定翻页；响应仅安全字段白名单，不含 IP/UA hash 与 metadata）；仓储按 `(tenant_id, occurred_at)` 倒序查询；真实 MySQL+Redis 全栈验证三类事件可见、`action=risk_issue.` 过滤、非法前缀 422、limit=1 翻页不重不漏、租户 B 永看不到 A 的动作行；跨租户管理/导出、IP-UA 展示、保留策略仍为延后项。
+- 阶段 2 增补“Matter 参与方 HTTP API”非模型切片已完成（2026-09-05 计划）：`POST/GET /api/v1/tenants/{tenant_id}/matters/{matter_id}/parties` 添加/列出参与方（display_name/kind 必填非空、长度上限；仓储 list_parties 按 created_at 升序、add 前校验 matter 归属）；真实 MySQL+Redis 全栈覆盖 add 2→list 顺序、422 空白拒绝、租户 B 双层 404；团队/角色、冲突检查仍为延后项。
+- 阶段 2 增补“Matter 参与方更新/删除 HTTP API”非模型切片已完成（2026-09-06 计划）：`PATCH/DELETE /api/v1/tenants/{tenant_id}/matters/{matter_id}/parties/{party_id}` 更新（display_name/kind 至少一项、strip、version 乐观递增）与物理删除；仓储 update/remove 均按 `(tenant_id, matter_id, party_id)` 归属校验，无 FK 依赖；真实 MySQL+Redis 全栈覆盖 改名称保 kind→改 kind 保名称→version 递增→空/空白 body 422→DELETE→list 剩 1→对不存在 party PATCH/DELETE 404→租户 B path/资源双层 404；团队/角色、冲突检查仍为延后项。
+- 阶段 2 增补“Matter 参与方写动作审计”非模型切片已完成（2026-09-07 计划）：`add/update/remove` 三个人工写动作在成功路径登记 TENANT_USER 结构化审计（action=`matter.party.add|update|remove`、reason_code=`added|updated|removed`、target_type=`matter_party`、target_id=party.id，`matter.` 前缀白名单已含）；审计与业务同 UoW 提交，仅标识符不泄漏正文；真实 MySQL+Redis 全栈验证 add 2→update 2→remove 1 对应审计行、按 `action=matter.` 过滤可见、租户 B 路径层 404/资源层无 matter.party 行；团队/角色、冲突检查仍为延后项。
+- 阶段 2 增补“Matter 参与方拒绝路径审计”非模型切片已完成（2026-09-07 计划）：add/update/remove 的失败尝试也留痕——目标不存在（含跨租户资源层尝试）写 `result=denied`/reason_code=`matter_document_not_found`、422 非法请求写 `result=failure`，target 按可确定粒度记录（matter 或 party 引用）；审计在业务 UoW 回滚后经独立短事务提交；路径层 404（租户不匹配、未进入服务）不产生噪音；真实 MySQL+Redis 全栈验证 A 对已删 party 的 PATCH/DELETE 404 产生 denied 行且成功行计数不变、B 资源层尝试只进 B 租户（全为 denied `matter_document_not_found`）且 A 成功行永不到 B；团队/角色、冲突检查、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 参与方 Idempotency-Key”非模型切片已完成（2026-09-08 计划）：`POST .../parties`（add，指纹 = matter_id/display_name/kind）、`PATCH .../parties/{party_id}`（update，指纹含 party_id 与各字段）、`DELETE .../parties/{party_id}`（remove，指纹 = matter_id/party_id）接入幂等框架（membership scope；result_type=`matter_party`）；同 key 同体 replay 返回原 party 投影/204 且不重复插入/版本递增/删除、同 key 异体 → 409 `idempotency_conflict`、404/422 不 complete（修复后同 key 可重试）、无 key 路径向后兼容；真实 MySQL+Redis 全栈验证 add replay 同 id 仅 1 行、update replay 版本不重复递增、remove replay 204 仅删一次、异 key 对已删 party 404；团队/角色、冲突检查、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 列表（keyset 分页）”非模型切片已完成（2026-09-08 计划）：`GET /api/v1/tenants/{tenant_id}/matters?limit=&before_id=` 只读列出本租户 Matter（`created_at,id` keyset 稳定分页、limit 1–100、越权/未知游标 404、响应 `{items, next_before_id}`）；仓储 `list_matters` 租户范围 keyset 查询、服务编排校验；真实 MySQL+Redis 全栈验证 3 案件 limit=2 两页不重不漏、非法 limit 422、未知游标 404、租户 B path 层 404 且 B 列表永不含 A id；搜索过滤、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 列表搜索/过滤”非模型切片已完成（2026-09-10 计划）：`GET /api/v1/tenants/{tenant_id}/matters?limit=&before_id=&title=&status=&kind=` 增加只读过滤参数（title trim 后非空白子串≤512、status=open|active|closed|archived、kind 五类枚举；非法/空白/超长 422 `matter_document_invalid_request`）；服务校验并透传、仓储在租户范围 WHERE 之上追加过滤后仍按 `(created_at,id)` keyset 排序分页；真实 MySQL+Redis 全栈验证 title 子串/空白折行、status、kind、组合、过滤+分页不重不漏、非法值 422、租户 B path 层 404 且 B 过滤列表永不含 A id；permission code 化仍为延后项。
+- 阶段 2 增补“Matter 状态迁移 HTTP API”非模型切片已完成（2026-09-09 计划）：`POST /api/v1/tenants/{tenant_id}/matters/{matter_id}/status`（body `{status}`、可选 If-Match 强 ETag）按领域纯函数白名单推进 `open→active/closed、active→closed、closed→archived`（archived 终态；回退/跳级 409 `matter_document_conflict`）；仓储先锁读再 `status+version` 条件 CAS、版本递增并返回新 ETag；成功登记 `matter.status` TENANT_USER 审计（reason=`changed`）；真实 MySQL+Redis 全栈验证 推进三连 version 1→4、过期 If-Match 409、终态冻结 409、跳级 409、不存在 matter 404、租户 B path/资源双层 404、审计三行；title/description 编辑、团队/角色、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 元数据编辑 HTTP API”非模型切片已完成（2026-09-09 计划）：`PATCH /api/v1/tenants/{tenant_id}/matters/{matter_id}`（body 可选 title/description 至少一项、可选 If-Match 强 ETag；title 非空白≤512、description≤4000 可置空）仅编辑文本元数据（kind/status/归属不变）；领域校验 `validate_matter_metadata`、仓储锁读+`version` CAS UPDATE 返回新 ETag；成功登记 `matter.update` 审计（reason=`changed`）；真实 MySQL+Redis 全栈验证 title+description 同改、description-only 保留 title、显式空 description 清空、过期 ETag 409、空白/超长/空 body 422、不存在 404、租户 B path/资源双层 404、审计三行；owner/团队/角色、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 只读投影补 description”非模型切片已完成（2026-09-10 计划）：此前元数据编辑仅写库不读回——`MatterSummary` 增可空 `description` 并由 `_matter_summary` 填充，create/get/list/status/owner 等所有返回 Matter 的响应均带出描述；真实 MySQL+Redis 全栈验证 创建带描述读回、PATCH title+description 读回新值、description-only 保 title、显式空描述读回 null、列表带 description、owner 指派后保留、租户 B path 层 404 且 B 列表永不含 A id；owner/团队角色 ABAC、permission code 化仍为延后项。
+- 阶段 2 增补“Matter 参与方利益冲突只读检查”非模型切片已完成（2026-09-08 计划）：`POST /api/v1/tenants/{tenant_id}/matter-party-conflict-checks`（display_name 必填、kind 可选、exclude_matter_id 可选）只回答该当事方在**其它 Matter** 出现情况 `{conflict, other_matter_count}`（租户内 display_name/kind 精确匹配的 distinct matter 计数），响应永不含其它 Matter 的 ID/名称/内容（spec 8.4 最小信息）；仓储 `count_other_party_matters` 租户范围 COUNT、领域投影 `PartyConflictCheck` 校验 conflict 与计数一致；真实 MySQL+Redis 全栈验证 同名跨两 matter→count=2、kind 精确过滤、exclude 后计数变化、单 matter 排除后 clear、空 display_name/kind 422、响应无其它 matter 标识、租户 B 路径层 404；处置状态/Conflict Register/强制门槛仍为延后项。
+- 阶段 2 增补“Matter owner 指派”非模型切片已完成（2026-09-10 计划）：`PUT /api/v1/tenants/{tenant_id}/matters/{matter_id}/owner`（body `{owner_membership_id}`、可选 If-Match 强 ETag）把同租户 active 的本所成员（member_type owner/internal，spec 8.4「自己的律师或法务」）指派为 Matter 负责人；领域纯函数 `matter_owner_assignable` 只放行该成员集（external_client/student 与 inactive 一律拒）；仓储锁读后 `version` CAS UPDATE 写 `owner_membership_id` 并返回新 ETag，foreign/不存在/挂起/客户端成员统一 422 防探测；`MatterSummary` 增可空 `owner_membership_id` 只读投影；成功登记 `matter.owner` 审计（reason=`assigned`）；真实 MySQL+Redis 全栈验证 指派→换人（If-Match）→过期 ETag 409→挂起/客户端/异租户/不存在 422→不存在 matter 404→租户 B path/资源双层 404→B 引用 A 成员 422→审计两行且 B 不可见；解锁指派、owner 详情/团队角色 ABAC、permission code 化仍为延后项。
+- 阶段 2 增补“Matter owner 解锁指派”非模型切片已完成（2026-09-10 计划）：`DELETE /api/v1/tenants/{tenant_id}/matters/{matter_id}/owner`（可选 If-Match 强 ETag）解除 Matter 负责人——仓储锁读后 `version` CAS UPDATE 置 `owner_membership_id = NULL` 并版本递增，与 assign 的「每次写即版本+1」语义对称；无 owner 时重复 DELETE 仍成功（无错位）；成功登记 `matter.owner` 审计（reason=`unassigned`）；真实 MySQL+Redis 全栈验证 指派→DELETE 200（owner null/version+1/新 ETag）→GET 读回 null→过期 If-Match 409→不存在 matter 404→租户 B path/资源双层 404→审计两行（assigned+unassigned）且 B 不可见；owner 详情/团队角色 ABAC、permission code 化仍为延后项。
+- 当前增量遵循最新一份用户已批准的实施计划。项目进入后续阶段时，只更新本节的简短阶段说明，不得把临时任务进度复制到本文件。

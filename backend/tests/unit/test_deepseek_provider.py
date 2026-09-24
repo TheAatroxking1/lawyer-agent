@@ -16,6 +16,7 @@ from lawyer_agent.application.model_gateway import (
 )
 from lawyer_agent.domain.model_gateway import (
     CallLimits,
+    ChatImage,
     ChatMessage,
     ModelCallRecord,
     ModelOperation,
@@ -27,6 +28,24 @@ from lawyer_agent.infrastructure.providers.deepseek import (
 _API_KEY = "sk-deepseek-test-key-not-a-real-key-000"
 _MODEL = "deepseek-chat"
 _BASE = "https://api.deepseek.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_unsupported_image_is_rejected_before_network(stream: bool) -> None:
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("unsupported images must never reach the provider")
+
+    provider = _provider(forbidden)
+    messages = (ChatMessage(role="user", content="Read image", images=(
+        ChatImage(data=b"\xff\xd8\xffsynthetic", media_type="image/jpeg"),
+    )),)
+    with pytest.raises(ModelInputInvalid, match="images are not supported"):
+        if stream:
+            async for _ in provider.chat_stream(messages=messages, timeout_seconds=1.0):
+                pass
+        else:
+            await provider.chat(messages=messages, timeout_seconds=1.0)
 
 
 class _MemoryRecorder:
@@ -384,4 +403,3 @@ def test_gateway_chat_stream_failure_records_error() -> None:
     assert len(recorder.records) == 1
     assert recorder.records[0].operation is ModelOperation.CHAT_STREAM
     assert recorder.records[0].status == "error"
-

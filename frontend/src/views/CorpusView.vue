@@ -4,6 +4,7 @@ import { onMounted, ref } from 'vue'
 import { ApiError, apiClient, listInstruments } from '../api'
 import type { InstrumentSummary } from '../api'
 import ErrorNote from '../components/ErrorNote.vue'
+import { legalCategoryLabel } from '../lib/format'
 
 const PAGE_SIZE = 20
 
@@ -79,6 +80,7 @@ onMounted(() => {
         <RouterLink class="row" :to="`/corpus/${item.id}`">
           <div class="title-line">
             <strong>{{ item.title }}</strong>
+            <span class="category">{{ legalCategoryLabel(item.category) }}</span>
             <span class="jurisdiction">{{ item.jurisdiction }}</span>
           </div>
           <div class="meta">
@@ -153,6 +155,7 @@ onMounted(() => {
   gap: 0.6rem;
   flex-wrap: wrap;
 }
+.category,
 .jurisdiction {
   color: var(--color-accent);
   font-size: 0.8rem;

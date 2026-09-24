@@ -10,10 +10,13 @@ from lawyer_agent.application.legal_index_publish import (
     LegalDatasetIndexPublishService,
     LegalDatasetPublishError,
 )
+from lawyer_agent.application.legal_navigation_index import NavigationBuildResult
 from lawyer_agent.domain.legal_corpus import (
     DatasetSnapshot,
     DatasetState,
 )
+from lawyer_agent.domain.legal_navigation import navigation_index_name
+from lawyer_agent.infrastructure.search.opensearch import OpenSearchError
 
 VERSION = UUID("01a06ae2-6200-7000-8000-0000000000c3")
 _FIXED_NOW = datetime(2026, 9, 10, 4, 0, tzinfo=UTC)
@@ -41,12 +44,32 @@ class _Recorder:
     def __init__(self) -> None:
         self.index_calls: list[dict[str, object]] = []
         self.publish_calls: list[tuple[str, str]] = []
+        self.events: list[str] = []
+        self.navigation_calls: list[tuple[tuple[UUID, ...], str, str]] = []
+
+
+class _Navigation:
+    def __init__(self, recorder: _Recorder, *, fail: bool = False) -> None:
+        self.recorder = recorder
+        self.fail = fail
+
+    async def build(
+        self, *, version_ids: tuple[UUID, ...], main_index_name: str, parser_version: str
+    ) -> NavigationBuildResult:
+        self.recorder.events.append("navigation")
+        self.recorder.navigation_calls.append((version_ids, main_index_name, parser_version))
+        if self.fail:
+            raise OpenSearchError("navigation verification failed")
+        return NavigationBuildResult(navigation_index_name(main_index_name), 2)
 
 
 class _Indexer:
-    def __init__(self, recorder: _Recorder, indexed: int = 3) -> None:
+    def __init__(
+        self, recorder: _Recorder, indexed: int = 3, *, fail_write: bool = False
+    ) -> None:
         self._recorder = recorder
         self._indexed = indexed
+        self._fail_write = fail_write
 
     async def index_version(
         self,
@@ -57,6 +80,7 @@ class _Indexer:
         dimension: int,
         batch_size: int,
     ) -> int:
+        self._recorder.events.append("main")
         self._recorder.index_calls.append(
             {
                 "version_id": version_id,
@@ -66,6 +90,8 @@ class _Indexer:
                 "batch_size": batch_size,
             }
         )
+        if self._fail_write:
+            raise OpenSearchError("OpenSearch bulk write was not fully acknowledged")
         return self._indexed
 
 
@@ -77,12 +103,14 @@ class _Alias:
     async def publish_dataset(
         self, alias: str, index_name: str
     ) -> str | None:
+        self._recorder.events.append("alias")
         self._recorder.publish_calls.append((alias, index_name))
         return self._previous
 
 
 def _service(recorder: _Recorder, *, indexed: int = 3) -> LegalDatasetIndexPublishService:
     return LegalDatasetIndexPublishService(
+        navigation=_Navigation(recorder),
         indexer=_Indexer(recorder, indexed=indexed),
         alias=_Alias(recorder),
     )
@@ -140,6 +168,7 @@ async def test_publish_first_time_returns_none_previous() -> None:
     recorder = _Recorder()
     alias = _Alias(recorder, previous=None)
     service = LegalDatasetIndexPublishService(
+        navigation=_Navigation(recorder),
         indexer=_Indexer(recorder), alias=alias
     )
     result = await service.publish_version(
@@ -217,6 +246,7 @@ def _service_with_snapshot(
     previous: str | None = "idx_2020",
 ) -> LegalDatasetIndexPublishService:
     return LegalDatasetIndexPublishService(
+        navigation=_Navigation(recorder),
         indexer=_Indexer(recorder),
         alias=_Alias(recorder, previous=previous),
         snapshot=snapshot,
@@ -249,8 +279,13 @@ async def test_publish_records_published_snapshot_when_snapshot_port_given() -> 
         "model_ref": "bge-small-zh",
         "dimension": 512,
         "indexed_documents": 3,
+        "navigation_index": navigation_index_name("legal_idx_v2"),
+        "navigation_schema_version": 1,
+        "navigation_documents": 2,
     }
-    assert recorded.quality_metrics == {"indexed_documents": 3, "dimension": 512}
+    assert recorded.quality_metrics == {
+        "indexed_documents": 3, "dimension": 512, "navigation_documents": 2
+    }
 
 
 async def test_publish_reuses_existing_snapshot_row_on_repeat() -> None:
@@ -297,6 +332,7 @@ async def test_publish_zero_indexed_never_writes_snapshot() -> None:
     recorder = _Recorder()
     snapshot = _SnapshotRecorder()
     service = LegalDatasetIndexPublishService(
+        navigation=_Navigation(recorder),
         indexer=_Indexer(recorder, indexed=0),
         alias=_Alias(recorder),
         snapshot=snapshot,
@@ -352,3 +388,58 @@ async def test_snapshot_row_uses_new_uuid7_when_none_stored() -> None:
     assert recorded.id != VERSION
     # uuid7 carries a version nibble of 7 in the third group.
     assert recorded.id.version == 7
+
+
+async def test_publish_write_failure_never_switches_alias_or_records_snapshot() -> None:
+    recorder = _Recorder()
+    snapshot = _SnapshotRecorder()
+    service = LegalDatasetIndexPublishService(
+        navigation=_Navigation(recorder),
+        indexer=_Indexer(recorder, fail_write=True),
+        alias=_Alias(recorder),
+        snapshot=snapshot,
+    )
+    with pytest.raises(OpenSearchError, match="not fully acknowledged"):
+        await service.publish_version(
+            version_id=VERSION,
+            index_name="legal_idx_failed",
+            alias="dataset_v1",
+            model_ref="m",
+            dimension=8,
+        )
+    assert recorder.publish_calls == []
+    assert snapshot.writes == []
+
+
+async def test_navigation_failure_blocks_alias_and_snapshot() -> None:
+    recorder = _Recorder()
+    snapshot = _SnapshotRecorder()
+    service = LegalDatasetIndexPublishService(
+        _Indexer(recorder), _Alias(recorder), snapshot,
+        navigation=_Navigation(recorder, fail=True),
+    )
+    with pytest.raises(OpenSearchError, match="navigation verification"):
+        await service.publish_version(
+            version_id=VERSION, index_name="legal_idx_v2", alias="dataset_v1",
+            model_ref="m", dimension=8,
+        )
+    assert recorder.events == ["main", "navigation"]
+    assert recorder.publish_calls == []
+    assert snapshot.writes == []
+
+
+async def test_navigation_precedes_alias_and_snapshot_with_exact_build_scope() -> None:
+    recorder = _Recorder()
+
+    class Snapshot(_SnapshotRecorder):
+        async def upsert_dataset(self, snapshot: DatasetSnapshot) -> None:
+            recorder.events.append("snapshot")
+            await super().upsert_dataset(snapshot)
+
+    service = _service_with_snapshot(recorder, Snapshot())
+    await service.publish_version(
+        version_id=VERSION, index_name="legal_idx_v2", alias="dataset_v1",
+        model_ref="m", dimension=8,
+    )
+    assert recorder.events == ["main", "navigation", "alias", "snapshot"]
+    assert recorder.navigation_calls == [((VERSION,), "legal_idx_v2", "docx-zip-v1")]

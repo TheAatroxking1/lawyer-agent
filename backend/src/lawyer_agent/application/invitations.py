@@ -804,12 +804,15 @@ class InvitationService:
             session is None
             or session.id != principal.session_id
             or session.user_id != principal.user_id
-            or session.tenant_id != principal.tenant_id
-            or session.membership_id != principal.membership_id
+            or (session.tenant_id, session.membership_id, session.authz_version_at_issue)
+            not in {
+                (None, None, None),
+                (principal.tenant_id, principal.membership_id,
+                 snapshot.actor_membership.authz_version),
+            }
             or session.revoked_at is not None
             or session.expires_at <= now
             or session.auth_version_at_issue != snapshot.user_auth_version
-            or session.authz_version_at_issue != snapshot.actor_membership.authz_version
             or principal.auth_version != snapshot.user_auth_version
             or principal.session_auth_version != snapshot.user_auth_version
             or actor.context.authz_version != snapshot.actor_membership.authz_version

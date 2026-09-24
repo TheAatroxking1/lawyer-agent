@@ -38,6 +38,8 @@ function openLogin(): void {
 
 function on401(): void {
   session.clearToken()
+  session.clearTenantToken()
+  session.clearActiveTenant()
   refreshAuth()
   openLogin()
 }

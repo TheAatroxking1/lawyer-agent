@@ -1,0 +1,11 @@
+# Optional local public-corpus embedding cache
+
+Approved scope: persist completed embedding results for retrying a fresh physical-index build; source/quality checks, alias protocol and durable publication remain unchanged.
+
+- LocalEmbeddingCacheProvider wraps the existing async provider. Constructor binds absolute cache_directory, complete logical model_ref, fixed local snapshot identity and L2. Mutable remote refs and unprofiled refs reject. Values are exact little-endian float64, because postprocessing uses Python float64; float32 would change results.
+- Key hashes format version/full logical ref/snapshot ID/dimension/L2/exact UTF8 text SHA256 and byte length. File contains only magic, binary key, vector values, SHA256 integrity trailer. No text or credentials.
+- Prefix-sharded files; bounded reads verify expected byte size, key/checksum, dimension, finite and L2. Damaged entries are misses; invalid fresh provider responses never persist/return. Same-batch repeated misses are encoded once.
+- Atomic same-directory exclusive temporary write+flush+fsync+replace; cleanup temporary files. Absolute paths required, existing symlinks/Windows reparse ancestors and entries rejected. CLI permits only current repository artifacts/legal-corpus/vectors subtree, so external read-only sources cannot become a cache target.
+- Cache disabled by default. --embedding-cache-directory and optional check_and_build argument create no cache/provider during --check. Bounded synchronous local cache IO stays in this offline CLI adapter; it is not a total-request deadline guarantee. No new executor/model thread.
+- Separate counters for hit/miss rows, underlying provider call attempts/submitted rows and validated completions, corrupt reads and failed writes. Gateway request records can include cache hits; cache counters distinguish hits from delegate submissions/completions. Timeout/cancellation does not prove the underlying model stopped or finished.
+- TDD covers restart hits, byte-exact values, key isolation, duplicates/order, corrupt/truncated/nonfinite/nonunit entries, invalid fresh results, atomic writes/failure cleanup, fixed identity/absolute/reparse path constraints, default-off/check lifecycle, cancellation/close forwarding. Independent review before real full build.

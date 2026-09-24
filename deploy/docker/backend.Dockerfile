@@ -4,14 +4,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_NO_CACHE=1
 
-RUN pip install --no-cache-dir uv==0.8.15 \
+RUN pip install --no-cache-dir uv==0.12.7 \
     && useradd --create-home --uid 10001 app
 
 WORKDIR /app
 COPY backend/pyproject.toml backend/uv.lock ./
 COPY backend/src ./src
 COPY backend/README.md ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra embedding-cpu
 
 USER 10001
 EXPOSE 8000

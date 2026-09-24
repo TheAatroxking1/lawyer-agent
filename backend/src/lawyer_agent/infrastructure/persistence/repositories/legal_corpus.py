@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lawyer_agent.domain.common import require_uuid7
@@ -14,6 +14,7 @@ from lawyer_agent.domain.legal_corpus import (
     ChunkType,
     DatasetSnapshot,
     DatasetState,
+    LegalCategory,
     LegalChunk,
     LegalInstrument,
     LegalVersion,
@@ -56,6 +57,8 @@ _VERSION_STATUS_MAP = {
     "draft": LegalVersionStatus.DRAFT,
 }
 
+_CATEGORY_MAP = {category.value: category for category in LegalCategory}
+
 _LEVEL_MAP = {
     "part": ProvisionLevel.PART,
     "chapter": ProvisionLevel.CHAPTER,
@@ -68,6 +71,8 @@ _LEVEL_MAP = {
 
 _CHUNK_TYPE_MAP = {
     "provision": ChunkType.PROVISION,
+    "paragraph": ChunkType.PARAGRAPH,
+    "item": ChunkType.ITEM,
     "sub_item": ChunkType.SUB_ITEM,
     "table": ChunkType.TABLE,
     "attachment": ChunkType.ATTACHMENT,
@@ -202,6 +207,7 @@ def _to_instrument(model: LegalInstrumentModel) -> LegalInstrument:
         issuing_authority=model.issuing_authority,
         jurisdiction=model.jurisdiction,
         region_code=model.region_code,
+        category=_CATEGORY_MAP[model.category],
     )
 
 
@@ -248,6 +254,8 @@ def _to_chunk(model: LegalChunkModel) -> LegalChunk:
         content_hash=bytes(model.content_hash),
         parent_chunk_id=model.parent_chunk_id,
         parser_version=model.parser_version,
+        parent_relative_char_start=model.parent_relative_char_start,
+        parent_relative_char_end=model.parent_relative_char_end,
     )
 
 
@@ -484,14 +492,45 @@ class SqlAlchemyLegalCorpusChunkRepository:
     async def replace_chunks_for_version(
         self, version_id: UUID, chunks: tuple[LegalChunk, ...]
     ) -> None:
-        await self._session.execute(
-            delete(LegalChunkModel).where(LegalChunkModel.version_id == version_id)
+        require_uuid7(version_id, field="chunk target version id")
+        version_exists = await self._session.scalar(
+            select(LegalVersionModel.id)
+            .where(LegalVersionModel.id == version_id)
+            .with_for_update()
         )
-        for chunk in chunks:
-            if chunk.version_id != version_id:
-                raise ValueError("chunk does not belong to the target version")
-            self._session.add(_chunk_model(chunk))
-        await self._session.flush()
+        if version_exists is None:
+            raise ValueError("chunk target version does not exist")
+
+        layers = _validate_and_layer_chunks(version_id, chunks)
+        provision_ids = {chunk.provision_id for chunk in chunks}
+        if provision_ids:
+            owned_provisions = set(
+                await self._session.scalars(
+                    select(LegalProvisionModel.id).where(
+                        LegalProvisionModel.version_id == version_id,
+                        LegalProvisionModel.id.in_(provision_ids),
+                    )
+                )
+            )
+            if owned_provisions != provision_ids:
+                raise ValueError(
+                    "chunk provision does not belong to the target version"
+                )
+
+        async with self._session.begin_nested():
+            await self._session.execute(
+                update(LegalChunkModel)
+                .where(LegalChunkModel.version_id == version_id)
+                .values(parent_chunk_id=None)
+            )
+            await self._session.execute(
+                delete(LegalChunkModel).where(
+                    LegalChunkModel.version_id == version_id
+                )
+            )
+            for layer in layers:
+                self._session.add_all([_chunk_model(chunk) for chunk in layer])
+                await self._session.flush()
 
     async def chunks_for_version(
         self, version_id: UUID
@@ -521,7 +560,53 @@ def _chunk_model(chunk: LegalChunk) -> LegalChunkModel:
         content=chunk.content,
         content_hash=chunk.content_hash,
         parser_version=chunk.parser_version,
+        parent_relative_char_start=chunk.parent_relative_char_start,
+        parent_relative_char_end=chunk.parent_relative_char_end,
     )
+
+
+def _validate_and_layer_chunks(
+    version_id: UUID, chunks: tuple[LegalChunk, ...]
+) -> tuple[tuple[LegalChunk, ...], ...]:
+    by_id: dict[UUID, LegalChunk] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, LegalChunk):
+            raise ValueError("chunks must be strongly typed")
+        if chunk.version_id != version_id:
+            raise ValueError("chunk does not belong to the target version")
+        if chunk.id in by_id:
+            raise ValueError("duplicate chunk id")
+        by_id[chunk.id] = chunk
+
+    for chunk in chunks:
+        if chunk.parent_chunk_id is None:
+            continue
+        parent = by_id.get(chunk.parent_chunk_id)
+        if parent is None:
+            raise ValueError("chunk parent must belong to the replacement graph")
+        if parent.provision_id != chunk.provision_id:
+            raise ValueError("chunk parent must belong to the same provision")
+
+    pending = dict(by_id)
+    inserted: set[UUID] = set()
+    layers: list[tuple[LegalChunk, ...]] = []
+    while pending:
+        layer = tuple(
+            chunk
+            for chunk in chunks
+            if chunk.id in pending
+            and (
+                chunk.parent_chunk_id is None
+                or chunk.parent_chunk_id in inserted
+            )
+        )
+        if not layer:
+            raise ValueError("chunk parent graph contains a cycle")
+        layers.append(layer)
+        for chunk in layer:
+            inserted.add(chunk.id)
+            del pending[chunk.id]
+    return tuple(layers)
 
 
 def _instrument_model(instrument: LegalInstrument) -> LegalInstrumentModel:
@@ -531,6 +616,7 @@ def _instrument_model(instrument: LegalInstrument) -> LegalInstrumentModel:
         issuing_authority=instrument.issuing_authority,
         jurisdiction=instrument.jurisdiction,
         region_code=instrument.region_code,
+        category=instrument.category.value,
     )
 
 

@@ -1,0 +1,17 @@
+# The root context is exclusively for deploy/docker/backend.Dockerfile.
+# Keep source/config allowlisted so local corpora, credentials and environments
+# never enter a Docker build context. The web uses its own frontend/ context.
+**
+!backend/
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/README.md
+!backend/src/
+!backend/src/**
+!deploy/
+!deploy/docker/
+!deploy/docker/backend.Dockerfile
+**/__pycache__/**
+**/*.pyc
+**/.env
+**/.env.*

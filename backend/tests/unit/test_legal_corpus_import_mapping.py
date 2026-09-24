@@ -12,7 +12,7 @@ from lawyer_agent.application.legal_corpus_import_mapping import (
     LegalImportMetadata,
     map_parsed_articles,
 )
-from lawyer_agent.domain.legal_corpus import LegalVersionStatus, ProvisionLevel
+from lawyer_agent.domain.legal_corpus import LegalCategory, LegalVersionStatus, ProvisionLevel
 from lawyer_agent.infrastructure.documents.loader import ParsedDocument, ParsedParagraph
 from lawyer_agent.infrastructure.documents.parsers import (
     LegalStructureParser,
@@ -39,6 +39,7 @@ def _metadata(**overrides: object) -> LegalImportMetadata:
         "source_ref": "object://corpus/civil-code.docx",
         "dataset_version": "dataset_v1",
         "parser_version": "docx-v1",
+        "category": LegalCategory.LAW,
     }
     values.update(overrides)
     return LegalImportMetadata(**values)
@@ -85,6 +86,7 @@ def test_map_parsed_articles_builds_import_command() -> None:
     assert command.source_ref == "object://corpus/civil-code.docx"
     assert command.dataset_version == "dataset_v1"
     assert command.parser_version == "docx-v1"
+    assert command.category is LegalCategory.LAW
     assert len(command.provisions) == 2
 
     first, second = command.provisions

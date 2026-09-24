@@ -27,6 +27,16 @@ class LegalVersionStatus(StrEnum):
     DRAFT = "draft"
 
 
+class LegalCategory(StrEnum):
+    CONSTITUTION = "constitution"
+    LAW = "law"
+    ADMINISTRATIVE_REGULATION = "administrative_regulation"
+    JUDICIAL_INTERPRETATION = "judicial_interpretation"
+    LOCAL_REGULATION = "local_regulation"
+    SUPERVISORY_REGULATION = "supervisory_regulation"
+    UNKNOWN = "unknown"
+
+
 class ProvisionLevel(StrEnum):
     PART = "part"  # 编
     CHAPTER = "chapter"  # 章
@@ -95,12 +105,15 @@ class LegalInstrument:
     issuing_authority: str
     jurisdiction: str
     region_code: str | None = None
+    category: LegalCategory = LegalCategory.UNKNOWN
 
     def __post_init__(self) -> None:
         require_uuid7(self.id, field="instrument id")
         _require_nonempty(self.title, "instrument title")
         _require_nonempty(self.issuing_authority, "issuing authority")
         _require_nonempty(self.jurisdiction, "jurisdiction")
+        if not isinstance(self.category, LegalCategory):
+            raise ValueError("instrument category must be strongly typed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +192,8 @@ class LegalChunk:
     content_hash: bytes
     parent_chunk_id: UUID | None = None
     parser_version: str | None = None
+    parent_relative_char_start: int | None = None
+    parent_relative_char_end: int | None = None
 
     def __post_init__(self) -> None:
         require_uuid7(self.id, field="chunk id")
@@ -192,6 +207,11 @@ class LegalChunk:
             raise ValueError("chunk quality must be strongly typed")
         if self.content_hash != content_sha256(self.content):
             raise ValueError("chunk content hash mismatch")
+        start, end = self.parent_relative_char_start, self.parent_relative_char_end
+        if (start is None) != (end is None) or (start is not None and (
+            type(start) is not int or type(end) is not int or start < 0 or end <= start
+        )):
+            raise ValueError("chunk position invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -221,9 +221,9 @@ async def _seed_corpus_read_tools(mysql_url: URL) -> tuple[UUID, UUID, UUID]:
             await session.execute(
                 text(
                     "INSERT INTO legal_instruments "
-                    "(id,title,issuing_authority,jurisdiction,version) "
+                    "(id,title,issuing_authority,jurisdiction,category,version) "
                     "VALUES (:id,'中华人民共和国示例法','全国人民代表大会常务委员会',"
-                    "'mainland_china',1)"
+                    "'mainland_china','judicial_interpretation',1)"
                 ),
                 {"id": instrument_id.bytes},
             )
@@ -326,12 +326,17 @@ def test_agent_gateway_corpus_read_tools_over_real_mysql(
         assert hit["output"]["found"] is True
         assert hit["output"]["instrument"]["id"] == str(instrument_id)
         assert hit["output"]["instrument"]["title"] == "中华人民共和国示例法"
+        assert (
+            hit["output"]["instrument"]["category"]
+            == "judicial_interpretation"
+        )
         assert set(hit["output"]["instrument"]) == {
             "id",
             "title",
             "issuing_authority",
             "jurisdiction",
             "region_code",
+            "category",
         }
 
         # instrument_get: unknown uuid7 -> structured miss, not a tool failure.

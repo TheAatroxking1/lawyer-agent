@@ -7,7 +7,7 @@
 // like the JSON endpoints.
 
 import { ApiError } from './client'
-import { session } from '../auth/session'
+import { authenticatedFetch } from '../auth/transport'
 import { parseSseBlock } from '../lib/sse'
 import type { ApiProblemBody, ChatMessageInput, RetrievalQuestionInput } from './types'
 
@@ -49,15 +49,14 @@ async function readErrorBody(response: Response): Promise<ApiError> {
  * Opens one SSE POST and yields its frames until the transport closes.
  * Throws ApiError before yielding when the response is not 2xx.
  */
-async function postEventStream(
+export async function postEventStream(
   path: string,
   payload: unknown,
   signal?: AbortSignal,
+  scope: 'account' | 'tenant' = 'account',
 ): Promise<AsyncIterable<AskStreamEvent>> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = session.readToken()
-  if (token) headers.Authorization = `Bearer ${token}`
-  const response = await fetch(`${apiBase}${path}`, {
+  const response = await authenticatedFetch(scope, `${apiBase}${path}`, {
     method: 'POST',
     headers,
     body: JSON.stringify(payload),
@@ -101,6 +100,10 @@ async function postEventStream(
     }
   }
   return events()
+}
+
+export function tenantEventStream(path: string, payload: unknown, signal?: AbortSignal): Promise<AsyncIterable<AskStreamEvent>> {
+  return postEventStream(path, payload, signal, 'tenant')
 }
 
 export function askQuestionStream(

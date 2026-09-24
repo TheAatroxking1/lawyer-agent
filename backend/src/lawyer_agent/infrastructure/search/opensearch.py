@@ -13,7 +13,8 @@ from uuid import UUID
 
 import httpx
 
-from lawyer_agent.domain.legal_search import LegalSearchHit
+from lawyer_agent.domain.legal_search import LegalSearchHit, validate_version_scope
+from lawyer_agent.infrastructure.search.bounded_bulk import BoundedBulkError, bounded_bulk_payloads
 
 DEFAULT_OPENSEARCH_URL = "http://127.0.0.1:9200"
 _BULK_HEADER = "application/x-ndjson"
@@ -109,7 +110,16 @@ class OpenSearchRestClient:
         async with self._client() as client:
             response = await client.put(f"/{index_name}", json=body)
             if response.status_code not in (200, 201):
-                await self._raise(response)
+                raise OpenSearchError(
+                    f"OpenSearch index creation failed with HTTP {response.status_code}"
+                )
+            acknowledgement = _response_object(response, "index creation")
+            if (
+                acknowledgement.get("acknowledged") is not True
+                or acknowledgement.get("errors", False) is not False
+                or "error" in acknowledgement
+            ):
+                raise OpenSearchError("OpenSearch index creation was not acknowledged")
 
     async def delete_index(self, index_name: str) -> None:
         """Remove a test/derived index; 404 is treated as already-absent."""
@@ -136,8 +146,21 @@ class OpenSearchRestClient:
             if response.status_code == 404:
                 return None
             if response.status_code != 200:
-                await self._raise(response)
-        targets = {key for key in response.json() if isinstance(key, str)}
+                raise OpenSearchError(
+                    f"OpenSearch alias lookup failed with HTTP {response.status_code}"
+                )
+        body = _response_object(response, "alias lookup")
+        if not body:
+            raise OpenSearchError("OpenSearch alias lookup returned no target")
+        for target, value in body.items():
+            if (
+                not isinstance(target, str) or not target
+                or not isinstance(value, dict)
+                or not isinstance(value.get("aliases"), dict)
+                or not isinstance(value["aliases"].get(alias), dict)
+            ):
+                raise OpenSearchError("OpenSearch alias lookup is malformed")
+        targets = set(body)
         if len(targets) > 1:
             raise OpenSearchError(
                 f"alias {alias} points at multiple indices: {sorted(targets)}"
@@ -163,7 +186,16 @@ class OpenSearchRestClient:
         async with self._client() as client:
             response = await client.post("/_aliases", json={"actions": actions})
             if response.status_code != 200:
-                await self._raise(response)
+                raise OpenSearchError(
+                    f"OpenSearch alias switch failed with HTTP {response.status_code}"
+                )
+            body = _response_object(response, "alias switch")
+            if (
+                body.get("acknowledged") is not True
+                or body.get("errors", False) is not False
+                or "error" in body
+            ):
+                raise OpenSearchError("OpenSearch alias switch was not fully acknowledged")
         return previous
 
     async def drop_alias(self, alias: str) -> None:
@@ -188,8 +220,14 @@ class OpenSearchRestClient:
         Derived and idempotent: replacing a version rebuilds only its rows.
         """
         lines: list[str] = []
+        requested_ids: list[str] = []
         for document in documents:
-            chunk_id = document["chunk_id"]
+            chunk_id = document.get("chunk_id")
+            if not isinstance(chunk_id, str) or not chunk_id:
+                raise OpenSearchError("OpenSearch bulk document id is invalid")
+            if chunk_id in requested_ids:
+                raise OpenSearchError("OpenSearch bulk document ids must be unique")
+            requested_ids.append(chunk_id)
             action = {"index": {"_index": index_name, "_id": chunk_id}}
             lines.append(json.dumps(action, ensure_ascii=False))
             lines.append(json.dumps(document, ensure_ascii=False))
@@ -199,9 +237,10 @@ class OpenSearchRestClient:
             delete_body = {
                 "query": {"term": {"parser_version": parser_version}}
             }
-            await client.post(
+            delete_response = await client.post(
                 f"/{index_name}/_delete_by_query?refresh=true", json=delete_body
             )
+            _validate_delete_acknowledgement(delete_response)
             if not payload.strip():
                 return
             response = await client.post(
@@ -209,8 +248,59 @@ class OpenSearchRestClient:
                 content=payload,
                 headers=headers,
             )
-            if response.status_code not in (200, 201):
-                await self._raise(response)
+            _validate_bulk_acknowledgement(response, tuple(requested_ids))
+
+    async def append_documents(
+        self,
+        index_name: str,
+        documents: tuple[dict[str, Any], ...],
+        *,
+        parser_version: str,
+    ) -> None:
+        """Append at most 256 documents without deleting earlier build batches."""
+        if (not isinstance(documents, tuple)
+                or not isinstance(parser_version, str) or not parser_version.strip()
+                or any(
+                    not isinstance(document, dict)
+                    or document.get("parser_version") != parser_version
+                    for document in documents
+                )):
+            raise OpenSearchError("OpenSearch append batch parser is invalid")
+        try:
+            payloads = bounded_bulk_payloads(index_name, documents, id_field="chunk_id")
+            async with self._client() as client:
+                for payload in payloads:
+                    response = await client.post(
+                        f"/{index_name}/_bulk?refresh=true", content=payload.content,
+                        headers={"Content-Type": _BULK_HEADER},
+                    )
+                    _validate_bulk_acknowledgement(response, payload.document_ids)
+        except BoundedBulkError:
+            raise OpenSearchError(
+                "OpenSearch append batch is invalid or exceeds size limits"
+            ) from None
+
+    async def count_documents(self, index_name: str) -> int:
+        """Count a fully acknowledged index; partial shard counts cannot release a build."""
+        async with self._client() as client:
+            response = await client.get(f"/{index_name}/_count")
+        if response.status_code != 200:
+            raise OpenSearchError(f"OpenSearch count failed with HTTP {response.status_code}")
+        body = _response_object(response, "count")
+        count, shards = body.get("count"), body.get("_shards")
+        if (type(count) is not int or count < 0 or not isinstance(shards, dict)
+                or any(
+                    type(shards.get(key)) is not int for key in ("total", "successful", "failed")
+                )
+                or shards["total"] <= 0 or shards["successful"] != shards["total"]
+                or shards["failed"] != 0
+                or ("failures" in shards and shards["failures"] != [])
+                or body.get("timed_out", False) is not False
+                or body.get("terminated_early", False) is not False
+                or body.get("errors", False) is not False
+                or "error" in body):
+            raise OpenSearchError("OpenSearch count response is invalid or incomplete")
+        return count
 
     async def search_bm25(
         self,
@@ -219,7 +309,9 @@ class OpenSearchRestClient:
         query: str,
         limit: int,
         version_id: UUID | None = None,
+        version_ids: tuple[UUID, ...] | None = None,
     ) -> tuple[LegalSearchHit, ...]:
+        validate_version_scope(version_id, version_ids)
         body: dict[str, Any] = {
             "query": {
                 "bool": {
@@ -231,6 +323,10 @@ class OpenSearchRestClient:
         if version_id is not None:
             body["query"]["bool"]["filter"] = [
                 {"term": {"version_id": str(version_id)}}
+            ]
+        elif version_ids is not None:
+            body["query"]["bool"]["filter"] = [
+                {"terms": {"version_id": [str(value) for value in version_ids]}}
             ]
         async with self._client() as client:
             response = await client.post(f"/{index_name}/_search", json=body)
@@ -250,8 +346,10 @@ class OpenSearchRestClient:
         query_vector: tuple[float, ...],
         limit: int,
         version_id: UUID | None = None,
+        version_ids: tuple[UUID, ...] | None = None,
     ) -> tuple[LegalSearchHit, ...]:
         """k-NN search over the dense ``content_vector`` field."""
+        validate_version_scope(version_id, version_ids)
         if not isinstance(query_vector, tuple) or not query_vector:
             raise ValueError("knn query vector must be a non-empty tuple of floats")
         if any(
@@ -262,6 +360,10 @@ class OpenSearchRestClient:
         knn_query: dict[str, Any] = {"vector": list(query_vector), "k": limit}
         if version_id is not None:
             knn_query["filter"] = {"term": {"version_id": str(version_id)}}
+        elif version_ids is not None:
+            knn_query["filter"] = {
+                "terms": {"version_id": [str(value) for value in version_ids]}
+            }
         body: dict[str, Any] = {
             "query": {"knn": {"content_vector": knn_query}},
             "size": limit,
@@ -284,3 +386,67 @@ class OpenSearchRestClient:
 
 def _finite(value: float) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _response_object(response: httpx.Response, operation: str) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise OpenSearchError(
+            f"OpenSearch {operation} acknowledgement is malformed"
+        ) from exc
+    if not isinstance(body, dict):
+        raise OpenSearchError(
+            f"OpenSearch {operation} acknowledgement is malformed"
+        )
+    return body
+
+
+def _validate_delete_acknowledgement(response: httpx.Response) -> None:
+    if response.status_code != 200:
+        raise OpenSearchError(
+            f"OpenSearch delete-by-query failed with HTTP {response.status_code}"
+        )
+    body = _response_object(response, "delete-by-query")
+    timed_out = body.get("timed_out")
+    version_conflicts = body.get("version_conflicts")
+    failures = body.get("failures")
+    if (
+        timed_out is not False
+        or isinstance(version_conflicts, bool)
+        or not isinstance(version_conflicts, int)
+        or version_conflicts != 0
+        or not isinstance(failures, list)
+        or bool(failures)
+    ):
+        raise OpenSearchError("OpenSearch delete-by-query was not fully acknowledged")
+
+
+def _validate_bulk_acknowledgement(
+    response: httpx.Response, requested_ids: tuple[str, ...]
+) -> None:
+    if response.status_code != 200:
+        raise OpenSearchError(
+            f"OpenSearch bulk write failed with HTTP {response.status_code}"
+        )
+    body = _response_object(response, "bulk write")
+    if body.get("errors") is not False:
+        raise OpenSearchError("OpenSearch bulk write was not fully acknowledged")
+    items = body.get("items")
+    if not isinstance(items, list) or len(items) != len(requested_ids):
+        raise OpenSearchError("OpenSearch bulk acknowledgement count mismatch")
+    for expected_id, item in zip(requested_ids, items, strict=True):
+        if not isinstance(item, dict) or set(item) != {"index"}:
+            raise OpenSearchError("OpenSearch bulk item acknowledgement is malformed")
+        result = item["index"]
+        if not isinstance(result, dict):
+            raise OpenSearchError("OpenSearch bulk item acknowledgement is malformed")
+        status = result.get("status")
+        if (
+            result.get("_id") != expected_id
+            or isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 200 <= status < 300
+            or "error" in result
+        ):
+            raise OpenSearchError("OpenSearch bulk item was not acknowledged")

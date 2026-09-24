@@ -108,9 +108,9 @@ async def _seed_corpus(mysql_url: URL) -> tuple[UUID, UUID, UUID]:
             await session.execute(
                 text(
                     "INSERT INTO legal_instruments "
-                    "(id,title,issuing_authority,jurisdiction,version) "
+                    "(id,title,issuing_authority,jurisdiction,category,version) "
                     "VALUES (:id,'中华人民共和国示例法','全国人民代表大会常务委员会',"
-                    "'mainland_china',1)"
+                    "'mainland_china','law',1)"
                 ),
                 {"id": instrument_id.bytes},
             )
@@ -221,6 +221,7 @@ def test_legal_corpus_read_http_over_real_mysql(migrated_mysql_url: URL) -> None
         assert identity.json()["id"] == str(instrument_id)
         assert identity.json()["title"] == "中华人民共和国示例法"
         assert identity.json()["issuing_authority"] == "全国人民代表大会常务委员会"
+        assert identity.json()["category"] == "law"
         unknown_identity = client.get(
             f"{base}/instruments/{new_uuid7()}", headers=headers
         )

@@ -93,6 +93,11 @@ class _Sessions:
         assert command.session_id == self.session_id
         return _Result(session_id=self.session_id, refresh_token="W" * 43)
 
+    async def tenant_access(self, command: object, *, audit_context: object) -> str:
+        del audit_context
+        assert command.session_id == self.session_id
+        return "synthetic-tenant-token"
+
 
 class _RateLimiter:
     deny = False
@@ -242,6 +247,21 @@ def _csrf(client: TestClient) -> dict[str, str]:
     return {"Origin": ORIGIN, "X-CSRF-Token": token}
 
 
+def test_tenant_access_keeps_account_cookies_and_returns_only_access_token() -> None:
+    client, sessions = _client()
+    with client:
+        client.post("/api/v1/auth/register", json=REGISTER, headers={"Origin": ORIGIN})
+        cookies = dict(client.cookies)
+        response = client.post("/api/v1/auth/tenant-access", json={
+            "tenant_id": str(new_uuid7()), "membership_id": str(new_uuid7()),
+        }, headers={"Origin": ORIGIN, "Authorization": "Bearer account-token"})
+        assert response.status_code == 200
+        assert response.json() == {"access_token": "synthetic-tenant-token"}
+        assert not response.headers.get_list("set-cookie")
+        assert dict(client.cookies) == cookies
+        assert sessions.revoked is False
+
+
 def test_register_login_refresh_logout_contract() -> None:
     client, sessions = _client()
     with client:
@@ -264,6 +284,7 @@ def test_register_login_refresh_logout_contract() -> None:
         )
         assert all("Secure" in value and "Path=/" in value for value in set_cookie)
         assert all("Domain=" not in value for value in set_cookie)
+        assert all("Max-Age=31536000" in value for value in set_cookie)
 
         refreshed = client.post("/api/v1/auth/refresh", headers=_csrf(client))
         assert refreshed.status_code == 200

@@ -22,16 +22,15 @@ from typing import Protocol
 from uuid import UUID
 
 from lawyer_agent.domain.common import new_uuid7
+from lawyer_agent.domain.legal_article_heading import ARTICLE_HEADING
 from lawyer_agent.domain.legal_corpus import (
     ChunkQuality,
     ChunkType,
     LegalChunk,
     content_sha256,
 )
+from lawyer_agent.domain.legal_parser_profiles import EXACT_TEXT_CHUNK_PARSER_VERSIONS
 
-_ARTICLE_PREFIX = re.compile(
-    r"^\s*第[一二三四五六七八九十百千0-9０-９]+条[\s　]*"
-)
 _ITEM_PAREN = re.compile(r"^[（(]\s*[一二三四五六七八九十百]+[)）]")
 _ITEM_CN = re.compile(r"^[一二三四五六七八九十百]+、")
 _SUB_NUMBER = re.compile(r"^[0-9０-９]+[\.．、]")
@@ -43,21 +42,40 @@ _DEFAULT_OVERLAP_CHARS = 60
 
 
 class _ProvisionSource(Protocol):
-    id: UUID
-    full_text: str
-    char_start: int
+    @property
+    def id(self) -> UUID: ...
+
+    @property
+    def full_text(self) -> str: ...
+
+    @property
+    def char_start(self) -> int: ...
 
 
 class _ArticleSource(Protocol):
-    provision_no: str
-    structure_path: tuple[str, ...]
-    paragraphs: tuple[str, ...]
+    @property
+    def provision_no(self) -> str: ...
+
+    @property
+    def structure_path(self) -> tuple[str, ...]: ...
+
+    @property
+    def paragraphs(self) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
 class _Unit:
     kind: ChunkType
     text: str
+    parent_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class LocatedLegalChunk:
+    """A derived chunk plus its exact half-open span in the parent article."""
+
+    chunk: LegalChunk
+    parent_relative_char_span: tuple[int, int]
 
 
 class LegalChunkStructureError(ValueError):
@@ -80,6 +98,31 @@ def derive_hierarchical_chunks(
     through ``parent_chunk_id`` so downstream indexing can treat the children as
     searchable leaves and restore the whole article from MySQL.
     """
+    return tuple(
+        located.chunk
+        for located in derive_hierarchical_chunks_with_locations(
+            version_id=version_id,
+            provisions=provisions,
+            articles=articles,
+            parser_version=parser_version,
+            max_leaf_chars=max_leaf_chars,
+            window_chars=window_chars,
+            overlap_chars=overlap_chars,
+        )
+    )
+
+
+def derive_hierarchical_chunks_with_locations(
+    *,
+    version_id: UUID,
+    provisions: tuple[_ProvisionSource, ...],
+    articles: tuple[_ArticleSource, ...],
+    parser_version: str,
+    max_leaf_chars: int = _DEFAULT_MAX_LEAF_CHARS,
+    window_chars: int = _DEFAULT_WINDOW_CHARS,
+    overlap_chars: int = _DEFAULT_OVERLAP_CHARS,
+) -> tuple[LocatedLegalChunk, ...]:
+    """Build chunks and retain exact offsets relative to each parent article."""
     _validate_settings(
         max_leaf_chars=max_leaf_chars,
         window_chars=window_chars,
@@ -104,7 +147,9 @@ def derive_hierarchical_chunks(
         zip(provisions, articles, strict=True),
         key=lambda pair: (pair[0].char_start, pair[0].full_text),
     )
-    result: list[LegalChunk] = []
+    result: list[LocatedLegalChunk] = []
+    exact_positions = parser_version.endswith("/hierarchical-v2")
+    exact_text = parser_version in EXACT_TEXT_CHUNK_PARSER_VERSIONS
     for provision, article in paired:
         parent = LegalChunk(
             id=new_uuid7(),
@@ -116,18 +161,31 @@ def derive_hierarchical_chunks(
             content_hash=content_sha256(provision.full_text),
             parent_chunk_id=None,
             parser_version=parser_version.strip(),
+            parent_relative_char_start=0 if exact_positions else None,
+            parent_relative_char_end=len(provision.full_text) if exact_positions else None,
         )
-        result.append(parent)
-        units = _units_for_article(provision, article)
+        result.append(LocatedLegalChunk(parent, (0, len(provision.full_text))))
+        units = _units_for_article(
+            provision,
+            article,
+            max_leaf_chars=max_leaf_chars,
+            preserve_heading=exact_positions,
+            exact_text=exact_text,
+        )
+        if exact_text and len(provision.full_text) > max_leaf_chars and not units:
+            raise LegalChunkStructureError(
+                "exact paragraph units must concatenate to the full provision text"
+            )
         for unit in units:
-            for piece in _window_pieces(
+            for piece, unit_start, unit_end in _window_pieces_with_offsets(
                 unit.text,
                 max_leaf_chars=max_leaf_chars,
                 window_chars=window_chars,
                 overlap_chars=overlap_chars,
             ):
                 result.append(
-                    LegalChunk(
+                    LocatedLegalChunk(
+                        chunk=LegalChunk(
                         id=new_uuid7(),
                         version_id=version_id,
                         provision_id=provision.id,
@@ -137,6 +195,17 @@ def derive_hierarchical_chunks(
                         content_hash=content_sha256(piece),
                         parent_chunk_id=parent.id,
                         parser_version=parser_version.strip(),
+                        parent_relative_char_start=(
+                            unit.parent_start + unit_start if exact_positions else None
+                        ),
+                        parent_relative_char_end=(
+                            unit.parent_start + unit_end if exact_positions else None
+                        ),
+                    ),
+                        parent_relative_char_span=(
+                            unit.parent_start + unit_start,
+                            unit.parent_start + unit_end,
+                        ),
                     )
                 )
     return tuple(result)
@@ -166,19 +235,65 @@ def _validate_settings(
 
 
 def _units_for_article(
-    provision: _ProvisionSource, article: _ArticleSource
+    provision: _ProvisionSource,
+    article: _ArticleSource,
+    *,
+    max_leaf_chars: int,
+    preserve_heading: bool = False,
+    exact_text: bool = False,
 ) -> tuple[_Unit, ...]:
+    if len(provision.full_text) <= max_leaf_chars:
+        return ()
     paragraphs = article.paragraphs or ()
-    if not paragraphs:
-        body = _strip_article_prefix(provision.full_text)
-        return (_Unit(kind=ChunkType.PARAGRAPH, text=body),)
+    if exact_text:
+        if not paragraphs or "".join(paragraphs) != provision.full_text:
+            return ()
+        exact_units: list[_Unit] = []
+        parent_cursor = 0
+        for paragraph_text in paragraphs:
+            if not paragraph_text:
+                continue
+            classification_text = paragraph_text.lstrip()
+            if _SUB_NUMBER.match(classification_text):
+                kind = ChunkType.SUB_ITEM
+            elif _ITEM_PAREN.match(classification_text) or _ITEM_CN.match(
+                classification_text
+            ):
+                kind = ChunkType.ITEM
+            else:
+                kind = ChunkType.PARAGRAPH
+            exact_units.append(
+                _Unit(
+                    kind=kind,
+                    text=paragraph_text,
+                    parent_start=parent_cursor,
+                )
+            )
+            parent_cursor += len(paragraph_text)
+        return tuple(exact_units)
+    stripped_paragraphs = tuple(paragraph.strip() for paragraph in paragraphs)
+    if (
+        not stripped_paragraphs
+        or any(not paragraph for paragraph in stripped_paragraphs)
+        or "".join(stripped_paragraphs) != provision.full_text.strip()
+    ):
+        return ()
     units: list[_Unit] = []
-    for index, paragraph in enumerate(paragraphs):
-        text = paragraph.strip()
-        if not text:
-            continue
-        if index == 0:
-            text = _strip_article_prefix(text)
+    parent_cursor = 0
+    for index, paragraph_text in enumerate(stripped_paragraphs):
+        paragraph_start = provision.full_text.find(paragraph_text, parent_cursor)
+        if paragraph_start < 0:
+            return ()
+        parent_cursor = paragraph_start + len(paragraph_text)
+        text = paragraph_text
+        unit_start = paragraph_start
+        if index == 0 and not preserve_heading:
+            heading = ARTICLE_HEADING.match(paragraph_text)
+            if heading is not None:
+                remainder = paragraph_text[heading.end():]
+                leading_space = len(remainder) - len(remainder.lstrip())
+                unit_start = paragraph_start + heading.end() + leading_space
+                text = remainder.lstrip()
         if not text:
             continue
         if _SUB_NUMBER.match(text):
@@ -187,12 +302,8 @@ def _units_for_article(
             kind = ChunkType.ITEM
         else:
             kind = ChunkType.PARAGRAPH
-        units.append(_Unit(kind=kind, text=text))
+        units.append(_Unit(kind=kind, text=text, parent_start=unit_start))
     return tuple(units)
-
-
-def _strip_article_prefix(text: str) -> str:
-    return _ARTICLE_PREFIX.sub("", text, count=1).strip()
 
 
 def _window_pieces(
@@ -207,9 +318,27 @@ def _window_pieces(
     Windows never cross units by construction (they are applied per unit);
     boundaries prefer the last sentence end inside the overlap region.
     """
+    return tuple(
+        piece
+        for piece, _, _ in _window_pieces_with_offsets(
+            text,
+            max_leaf_chars=max_leaf_chars,
+            window_chars=window_chars,
+            overlap_chars=overlap_chars,
+        )
+    )
+
+
+def _window_pieces_with_offsets(
+    text: str,
+    *,
+    max_leaf_chars: int,
+    window_chars: int,
+    overlap_chars: int,
+) -> tuple[tuple[str, int, int], ...]:
     if len(text) <= max_leaf_chars:
-        return (text,)
-    pieces: list[str] = []
+        return ((text, 0, len(text)),)
+    pieces: list[tuple[str, int, int]] = []
     start = 0
     length = len(text)
     step = window_chars - overlap_chars
@@ -223,7 +352,7 @@ def _window_pieces(
             )
             if boundary >= low:
                 end = boundary + 1
-        pieces.append(text[start:end])
+        pieces.append((text[start:end], start, end))
         if end >= length:
             break
         start = max(start + step, end - overlap_chars)

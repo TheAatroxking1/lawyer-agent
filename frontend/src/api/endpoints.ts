@@ -110,14 +110,14 @@ export async function askQuestion(
 export async function myTenants(
   client: ApiClient,
 ): Promise<AccountTenantList> {
-  return client.request<AccountTenantList>('/accounts/me/tenants')
+  return client.request<AccountTenantList>('/me/tenants')
 }
 
 export async function switchTenant(
   client: ApiClient,
   input: SwitchTenantInput,
 ): Promise<AccessTokenResponse> {
-  return client.request<AccessTokenResponse>('/auth/switch-tenant', {
+  return client.request<AccessTokenResponse>('/auth/tenant-access', {
     method: 'POST',
     body: input,
   })

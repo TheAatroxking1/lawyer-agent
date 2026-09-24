@@ -1,5 +1,7 @@
 # 律师 Agent · Web 前端（Vue 3）
 
+统一配置与维护入口见[项目首页](../README.md)。
+
 仓库前端工程（`frontend/`）。Vue 3 + TypeScript + Vite + Vue Router，无 UI
 框架依赖；开发期以 Vite dev server 代理 `/api` 到本地 FastAPI（127.0.0.1:8000）。
 

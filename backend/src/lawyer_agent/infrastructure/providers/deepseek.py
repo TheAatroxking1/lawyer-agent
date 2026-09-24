@@ -71,6 +71,8 @@ class DeepSeekChatProvider(ModelProviderPort):
             raise ModelInputInvalid("chat messages must be a non-empty sequence")
         if any(not isinstance(message, ChatMessage) for message in messages):
             raise ModelInputInvalid("chat messages must be strongly typed")
+        if any(message.images for message in messages):
+            raise ModelInputInvalid("images are not supported by this provider")
         payload = {
             "model": self._model_name,
             "messages": [
@@ -113,6 +115,8 @@ class DeepSeekChatProvider(ModelProviderPort):
             raise ModelInputInvalid("chat messages must be a non-empty sequence")
         if any(not isinstance(message, ChatMessage) for message in messages):
             raise ModelInputInvalid("chat messages must be strongly typed")
+        if any(message.images for message in messages):
+            raise ModelInputInvalid("images are not supported by this provider")
         payload = {
             "model": self._model_name,
             "messages": [

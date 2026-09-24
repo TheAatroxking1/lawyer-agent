@@ -48,7 +48,7 @@ def _naive_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-async def _insert_graph(session: AsyncSession) -> JobGraph:
+async def _insert_graph(session: AsyncSession, *, device_session: bool = False) -> JobGraph:
     now = _naive_now()
     user_id = new_uuid7()
     tenant_id = new_uuid7()
@@ -91,11 +91,11 @@ async def _insert_graph(session: AsyncSession) -> JobGraph:
         AuthSessionModel(
             id=session_id,
             user_id=user_id,
-            tenant_id=tenant_id,
-            membership_id=membership_id,
+            tenant_id=None if device_session else tenant_id,
+            membership_id=None if device_session else membership_id,
             current_family_id=new_uuid7(),
             auth_version_at_issue=1,
-            authz_version_at_issue=1,
+            authz_version_at_issue=None if device_session else 1,
             revoked_at=None,
             revocation_reason=None,
             last_seen_at=now,

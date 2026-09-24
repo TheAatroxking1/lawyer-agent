@@ -185,8 +185,7 @@ async def test_gate_refuses_missing_version() -> None:
     assert publisher.calls == []
 
 
-async def test_gate_allows_non_numeric_provision_labels_as_unknown() -> None:
-    # A provision number that the article regex cannot parse is skipped, not fatal.
+async def test_gate_refuses_non_numeric_provision_labels_without_publishing() -> None:
     corpus = _FakeCorpus(
         (
             _provision("第一条", 0),
@@ -194,14 +193,26 @@ async def test_gate_allows_non_numeric_provision_labels_as_unknown() -> None:
         )
     )
     publisher = _FakePublisher()
-    result = await _service(corpus, publisher).publish_version(
-        version_id=VERSION,
-        index_name="legal_idx_v1",
-        alias="dataset_v1",
-        model_ref="m",
-        dimension=8,
+    with pytest.raises(LegalDatasetPublishError, match="article_sequence_break:附则"):
+        await _service(corpus, publisher).publish_version(
+            version_id=VERSION,
+            index_name="legal_idx_v1",
+            alias="dataset_v1",
+            model_ref="m",
+            dimension=8,
+        )
+    assert publisher.calls == []
+
+
+async def test_gate_delegates_contiguous_supplementary_articles() -> None:
+    corpus = _FakeCorpus(tuple(_provision(number, index) for index, number in enumerate(
+        ("第一条", "第一条之一", "第一条之二", "第二条")
+    )))
+    publisher = _FakePublisher()
+    await _service(corpus, publisher).publish_version(
+        version_id=VERSION, index_name="legal_idx_v1", alias="dataset_v1",
+        model_ref="m", dimension=8,
     )
-    assert result.indexed_documents == 2
     assert len(publisher.calls) == 1
 
 

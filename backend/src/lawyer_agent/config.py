@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     secret_key_file: Path | None = Field(default=None, repr=False, exclude=True)
     api_prefix: str = "/api/v1"
     log_level: str = "INFO"
+    contract_review_config_file: Path | None = Field(default=None, repr=False, exclude=True)
     database_url: str = Field(default=DEVELOPMENT_DATABASE_URL, repr=False, exclude=True)
     redis_url: str = Field(default=DEVELOPMENT_REDIS_URL, repr=False, exclude=True)
     redis_key_prefix: str = Field(default="lawyer:", pattern=r"^[a-z0-9][a-z0-9:-]{0,62}:$")
@@ -114,6 +115,10 @@ class Settings(BaseSettings):
     embedding_dimension: int = Field(
         default=1792,
         description="embedding 输出维度（与模型及已发布索引一致）",
+    )
+    embedding_device: str = Field(default="cpu", description="Embedding 本地执行设备")
+    embedding_local_files_only: bool = Field(
+        default=True, description="仅加载已准备的本地权重，默认不从 Hub 下载",
     )
     database_pool_size: int = Field(default=10, gt=0)
     database_max_overflow: int = Field(default=20, ge=0)
@@ -416,6 +421,13 @@ class Settings(BaseSettings):
     def validate_embedding_dimension(cls, value: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError("embedding_dimension must be a positive integer")
+        return value
+
+    @field_validator("embedding_device")
+    @classmethod
+    def validate_embedding_device(cls, value: str) -> str:
+        if re.fullmatch(r"cpu|cuda(?::[0-9]+)?|mps", value) is None:
+            raise ValueError("embedding_device must be cpu, cuda, cuda:N or mps")
         return value
 
     @model_validator(mode="after")

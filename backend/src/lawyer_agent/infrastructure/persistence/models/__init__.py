@@ -26,6 +26,7 @@ from lawyer_agent.infrastructure.persistence.models.authorization import (
     TenantRoleModel,
     TenantRolePermissionModel,
 )
+from lawyer_agent.infrastructure.persistence.models.contract_review import ContractReviewRunModel
 from lawyer_agent.infrastructure.persistence.models.identity import (
     AuthIdentityModel,
     IdentityVerificationChallengeModel,
@@ -40,6 +41,12 @@ from lawyer_agent.infrastructure.persistence.models.legal_corpus import (
     LegalProvisionModel,
     LegalQualityIssueModel,
     LegalVersionModel,
+)
+from lawyer_agent.infrastructure.persistence.models.legal_dataset_publication import (
+    LegalDatasetPublicationModel,
+)
+from lawyer_agent.infrastructure.persistence.models.legal_source_proof import (
+    LegalVersionSourceProofModel,
 )
 from lawyer_agent.infrastructure.persistence.models.matter_documents import (
     TenantDocumentModel,
@@ -67,6 +74,11 @@ from lawyer_agent.infrastructure.persistence.models.tenancy import (
 )
 
 __all__ = [
+    "ConversationModel",
+    "ConversationMessageModel",
+    "ContractReviewRunModel",
+    "LegalDatasetPublicationModel",
+    "LegalVersionSourceProofModel",
     "AIJobAccessGrantModel",
     "AIJobAttemptModel",
     "AIJobExecutionGrantModel",
@@ -115,3 +127,7 @@ __all__ = [
     "TenantRulePackModel",
     "TenantRulePackRuleModel",
 ]
+from lawyer_agent.infrastructure.persistence.models.conversations import (
+    ConversationMessageModel,
+    ConversationModel,
+)

@@ -169,6 +169,67 @@ def service_factory(
     return build
 
 
+async def test_account_refresh_rolls_device_session_and_cookie_token_expiry_together(
+    principal, session_database, service_factory, token_service,
+) -> None:
+    user_id, tenant_id, membership_id = principal
+    _, factory = session_database
+    service = service_factory()
+    account = await service.start(user_id=user_id, audit_context=AUDIT)
+    later = NOW + timedelta(days=300)
+    service._clock = lambda: later
+    refreshed = await service.refresh(account.refresh_token, audit_context=AUDIT)
+    claims = token_service.verify(refreshed.access_token, audience=Audience.ACCOUNT, now=later)
+    assert claims.expires_at == later + timedelta(minutes=10)
+    async with factory() as session:
+        stored = await session.get(AuthSessionModel, account.session_id)
+        token = (await session.scalars(select(RefreshTokenRecordModel).where(
+            RefreshTokenRecordModel.session_id == account.session_id,
+            RefreshTokenRecordModel.used_at.is_(None),
+        ))).one()
+        assert stored.expires_at == token.expires_at == (later + timedelta(days=365)).replace(
+            tzinfo=None,
+        )
+        assert token.idle_expires_at == token.expires_at
+    encoded = await service.tenant_access(
+        SwitchTenantCommand(account.session_id, tenant_id, membership_id), audit_context=AUDIT,
+    )
+    assert (await service.validate_access(encoded, audience=Audience.TENANT)).tenant_id == tenant_id
+    await service.revoke(account.session_id, reason=RevocationReason.LOGOUT, audit_context=AUDIT)
+    with pytest.raises(InvalidSession):
+        await service.validate_access(encoded, audience=Audience.TENANT)
+
+
+async def test_tenant_write_locks_device_refresh_and_session_before_user_rows(
+    principal, session_database, service_factory,
+) -> None:
+    from lawyer_agent.application.security_locks import TenantSecurityWriteLockRequest
+    from lawyer_agent.infrastructure.persistence.repositories.security_locks import (
+        SecurityWriteLockRepository,
+    )
+
+    user_id, tenant_id, membership_id = principal
+    _, factory = session_database
+    account = await service_factory().start(user_id=user_id, audit_context=AUDIT)
+    request = TenantSecurityWriteLockRequest(tenant_id, user_id, account.session_id, membership_id)
+    for model, column in (
+        (RefreshTokenRecordModel, RefreshTokenRecordModel.session_id),
+        (AuthSessionModel, AuthSessionModel.id),
+    ):
+        async with factory() as first, factory() as second:
+            assert await SecurityWriteLockRepository(first).acquire_tenant_write(request)
+            waiter = asyncio.create_task(second.execute(
+                select(model).where(column == account.session_id).with_for_update(),
+            ))
+            try:
+                await asyncio.sleep(0.15)
+                assert not waiter.done(), "device credential row was not locked before User"
+            finally:
+                await first.rollback()
+                await asyncio.wait_for(waiter, timeout=3)
+                await second.rollback()
+
+
 @pytest.mark.asyncio
 async def test_start_refresh_and_authoritative_account_session_validation(
     principal: tuple[UUID, UUID, UUID],
@@ -744,11 +805,15 @@ async def test_refresh_signing_failure_rolls_back_rotation_and_audit(
     signer = _FailOnSecondAccountIssueTokenService(token_service)
     service = service_factory(token_override=signer)
     started = await service.start(user_id=user_id, audit_context=AUDIT)
+    service._clock = lambda: NOW + timedelta(days=1)
 
     with pytest.raises(RuntimeError, match="replacement signer outage"):
         await service.refresh(started.refresh_token, audit_context=AUDIT)
 
     async with factory() as session:
+        unchanged_session = await session.get(AuthSessionModel, started.session_id)
+        assert unchanged_session is not None
+        assert unchanged_session.expires_at == (NOW + timedelta(days=365)).replace(tzinfo=None)
         records = (
             await session.scalars(
                 select(RefreshTokenRecordModel).where(

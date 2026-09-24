@@ -185,3 +185,48 @@ async def test_service_resolves_active_index() -> None:
     )
     service = LegalDatasetAliasService(client)
     assert await service.active_dataset_index("dataset_v1") == "legal_idx_2024"
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"acknowledged": False}, {"acknowledged": 1}, {"acknowledged": "true"},
+    {"acknowledged": True, "errors": True}, {"acknowledged": True, "errors": 0},
+    {"acknowledged": True, "error": "private response body"}, [], None,
+])
+async def test_alias_switch_requires_explicit_complete_acknowledgement(body: object) -> None:
+    client, transport = _client([
+        httpx.Response(404), httpx.Response(200, json=body),
+    ])
+    with pytest.raises(OpenSearchError, match="alias") as caught:
+        await client.point_alias("dataset_v1", "legal_idx_2024")
+    assert "private response body" not in str(caught.value)
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize("body", [
+    {}, [], None, {"legal_idx_2024": {}},
+    {"legal_idx_2024": {"aliases": {"another_alias": {}}}},
+    {"legal_idx_2024": {"aliases": {"dataset_v1": None}}},
+])
+async def test_alias_lookup_rejects_malformed_success_instead_of_assuming_absence(
+    body: object,
+) -> None:
+    client, transport = _client([httpx.Response(200, json=body)])
+    with pytest.raises(OpenSearchError, match="alias"):
+        await client.point_alias("dataset_v1", "legal_idx_2024")
+    assert len(transport.requests) == 1
+
+
+async def test_alias_switch_http_failure_does_not_echo_response_body() -> None:
+    client, _ = _client([
+        httpx.Response(404), httpx.Response(503, text="private response body"),
+    ])
+    with pytest.raises(OpenSearchError) as caught:
+        await client.point_alias("dataset_v1", "legal_idx_2024")
+    assert "private response body" not in str(caught.value)
+
+
+async def test_alias_lookup_http_failure_does_not_echo_response_body() -> None:
+    client, _ = _client([httpx.Response(503, text="private response body")])
+    with pytest.raises(OpenSearchError) as caught:
+        await client.resolve_alias("dataset_v1")
+    assert "private response body" not in str(caught.value)

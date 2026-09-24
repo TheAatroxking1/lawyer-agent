@@ -1,0 +1,29 @@
+[project]
+name = "lawyer-milvus-query"
+version = "0.1.0"
+description = "独立的本地 Milvus 法律语料查询工具"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "pymilvus==3.0.1",
+    "uvicorn>=0.32,<1",
+]
+
+[tool.uv]
+package = false
+
+[project.optional-dependencies]
+window = [
+    "llama-index-core==0.14.24",
+    "httpx>=0.27,<1",
+]
+evaluation = [
+    "langchain-community==0.3.31",
+    "openai>=1,<3",
+    "ragas>=0.4,<0.5",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27,<1",
+]

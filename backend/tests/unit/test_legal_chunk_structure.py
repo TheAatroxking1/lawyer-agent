@@ -8,9 +8,10 @@ import pytest
 from lawyer_agent.application.legal_chunk_structure import (
     LegalChunkStructureError,
     derive_hierarchical_chunks,
+    derive_hierarchical_chunks_with_locations,
 )
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.legal_corpus import ChunkType, LegalChunk
+from lawyer_agent.domain.legal_corpus import ChunkType, LegalChunk, content_sha256
 
 VERSION = new_uuid7()
 
@@ -48,7 +49,7 @@ def _collect(chunks: tuple[LegalChunk, ...]) -> dict[str, list[str]]:
     return by_type
 
 
-def test_every_article_gets_a_parent_and_short_article_keeps_one_child() -> None:
+def test_short_article_keeps_only_the_authoritative_parent() -> None:
     article = _article("第一条", ["第一条 出租人应交付租赁物。"])
     provision = _prov("第一条", "第一条 出租人应交付租赁物。", 0)
     chunks = derive_hierarchical_chunks(
@@ -57,15 +58,12 @@ def test_every_article_gets_a_parent_and_short_article_keeps_one_child() -> None
         articles=(article,),
         parser_version="docx-v2",
     )
-    assert len(chunks) == 2
-    parent, child = chunks
+    assert len(chunks) == 1
+    parent = chunks[0]
     assert parent.chunk_type is ChunkType.PROVISION
     assert parent.parent_chunk_id is None
     assert parent.content == "第一条 出租人应交付租赁物。"
-    assert child.chunk_type is ChunkType.PARAGRAPH
-    assert child.parent_chunk_id == parent.id
-    assert child.provision_id == parent.provision_id
-    assert child.content == "出租人应交付租赁物。"
+    assert parent.content_hash == content_sha256(provision.full_text)
 
 
 def test_long_article_splits_paragraphs_items_and_sub_items() -> None:
@@ -90,6 +88,9 @@ def test_long_article_splits_paragraphs_items_and_sub_items() -> None:
         provisions=(provision,),
         articles=(article,),
         parser_version="docx-v2",
+        max_leaf_chars=50,
+        window_chars=40,
+        overlap_chars=10,
     )
     parent = chunks[0]
     children = chunks[1:]
@@ -124,15 +125,10 @@ def test_articles_are_never_merged_and_short_articles_not_joined() -> None:
     )
     assert [chunk.chunk_type for chunk in chunks] == [
         ChunkType.PROVISION,
-        ChunkType.PARAGRAPH,
         ChunkType.PROVISION,
-        ChunkType.PARAGRAPH,
     ]
-    # Each 条 parent maps to its own provision id and owns its own children.
-    first_parent, first_child, second_parent, second_child = chunks
+    first_parent, second_parent = chunks
     assert first_parent.provision_id != second_parent.provision_id
-    assert first_child.parent_chunk_id == first_parent.id
-    assert second_child.parent_chunk_id == second_parent.id
 
 
 def test_overlong_leaf_falls_back_to_sliding_windows_never_crossing_unit() -> None:
@@ -160,11 +156,49 @@ def test_overlong_leaf_falls_back_to_sliding_windows_never_crossing_unit() -> No
     assert children[-1].content.endswith(body[-8:])
 
 
-def test_without_paragraph_data_falls_back_to_stripped_whole_article() -> None:
+def test_sliding_windows_cover_every_character_in_one_trusted_unit() -> None:
+    body = "".join(chr(0x4E00 + index) for index in range(100))
+    paragraph = "第一条 " + body
+    chunks = derive_hierarchical_chunks(
+        version_id=VERSION,
+        provisions=(_prov("第一条", paragraph, 0),),
+        articles=(_article("第一条", [paragraph]),),
+        parser_version="docx-v2",
+        max_leaf_chars=50,
+        window_chars=30,
+        overlap_chars=5,
+    )
+    pieces = [chunk.content for chunk in chunks[1:]]
+    assert len(pieces) > 1
+    assert all(any(character in piece for piece in pieces) for character in body)
+
+
+def test_article_at_threshold_keeps_only_parent() -> None:
+    full_text = "第一条 " + ("甲" * 13)
+    assert len(full_text) == 17
+    chunks = derive_hierarchical_chunks(
+        version_id=VERSION,
+        provisions=(_prov("第一条", full_text, 0),),
+        articles=(_article("第一条", [full_text]),),
+        parser_version="docx-v2",
+        max_leaf_chars=17,
+        window_chars=10,
+        overlap_chars=2,
+    )
+    assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "paragraphs",
+    [(), ("",), ("第一条 权威全文被错误截断。",)],
+)
+def test_untrusted_paragraph_data_falls_back_to_whole_parent_only(
+    paragraphs: tuple[str, ...],
+) -> None:
     article = _Art(
         provision_no="第一条",
         structure_path=(),
-        paragraphs=(),
+        paragraphs=paragraphs,
     )
     provision = _prov("第一条", "第一条 仅有全文，无段落明细。", 0)
     chunks = derive_hierarchical_chunks(
@@ -172,9 +206,12 @@ def test_without_paragraph_data_falls_back_to_stripped_whole_article() -> None:
         provisions=(provision,),
         articles=(article,),
         parser_version="docx-v2",
+        max_leaf_chars=10,
+        window_chars=8,
+        overlap_chars=2,
     )
-    assert len(chunks) == 2
-    assert chunks[1].content == "仅有全文，无段落明细。"
+    assert len(chunks) == 1
+    assert chunks[0].content == "第一条 仅有全文，无段落明细。"
 
 
 def test_invalid_inputs_are_rejected_stably() -> None:
@@ -203,3 +240,81 @@ def test_invalid_inputs_are_rejected_stably() -> None:
             window_chars=100,
             overlap_chars=200,
         )
+
+
+@pytest.mark.parametrize("number", ["第一条之一", "第12条之2", "第１２条之２"])
+def test_long_supplement_strips_full_marker_only_from_first_child(number: str) -> None:
+    body = "承租人应当按照约定使用租赁物。"
+    reference = "第一条之一规定的情形，适用本款。"
+    paragraphs = [f"{number}\u3000{body}", reference]
+    full_text = "".join(paragraphs)
+    chunks = derive_hierarchical_chunks(
+        version_id=VERSION,
+        provisions=(_prov(number, full_text, 7),),
+        articles=(_article(number, paragraphs),),
+        parser_version="docx-supplement-test",
+        max_leaf_chars=30,
+        window_chars=25,
+        overlap_chars=5,
+    )
+    parent, first, second = chunks
+    assert parent.content == full_text
+    assert parent.content_hash == content_sha256(full_text)
+    assert first.content == body
+    assert second.content == reference
+    assert first.parent_chunk_id == second.parent_chunk_id == parent.id
+
+
+def test_located_windows_report_actual_offsets_for_repeated_text() -> None:
+    paragraph = "第一条 " + "甲" * 1200
+    located = derive_hierarchical_chunks_with_locations(
+        version_id=VERSION,
+        provisions=(_prov("第一条", paragraph, 0),),
+        articles=(_article("第一条", [paragraph]),),
+        parser_version="location-test",
+        max_leaf_chars=600,
+        window_chars=400,
+        overlap_chars=60,
+    )
+
+    assert [item.parent_relative_char_span for item in located] == [
+        (0, 1204), (4, 404), (344, 744), (684, 1084), (1024, 1204)
+    ]
+    assert [item.chunk.content for item in located[1:]] == [
+        paragraph[start:end] for start, end in [
+            (4, 404), (344, 744), (684, 1084), (1024, 1204)
+        ]
+    ]
+
+
+def test_located_identical_paragraphs_keep_distinct_parent_offsets() -> None:
+    lines = ["第一条 " + "甲" * 40, "甲" * 40]
+    located = derive_hierarchical_chunks_with_locations(
+        version_id=VERSION,
+        provisions=(_prov("第一条", "".join(lines), 0),),
+        articles=(_article("第一条", lines),),
+        parser_version="location-test",
+        max_leaf_chars=30,
+        window_chars=20,
+        overlap_chars=5,
+    )
+    child_spans = [item.parent_relative_char_span for item in located[1:]]
+    assert child_spans[:3] == [(4, 24), (19, 39), (34, 44)]
+    assert child_spans[3:] == [(44, 64), (59, 79), (74, 84)]
+
+
+def test_located_first_unit_starts_after_heading_when_body_repeats_heading() -> None:
+    lines = ("第一条 第一条", "甲" * 601)
+    located = derive_hierarchical_chunks_with_locations(
+        version_id=VERSION,
+        provisions=(_prov("第一条", "".join(lines), 0),),
+        articles=(_article("第一条", list(lines)),),
+        parser_version="location-test",
+        max_leaf_chars=600,
+        window_chars=400,
+        overlap_chars=60,
+    )
+
+    first_child = located[1]
+    assert first_child.chunk.content == "第一条"
+    assert first_child.parent_relative_char_span == (4, 7)

@@ -32,6 +32,7 @@ from lawyer_agent.application.legal_retrieval_qa import (
 )
 from lawyer_agent.application.model_gateway import (
     ModelGatewayError,
+    ModelProviderBusy,
     ModelProviderTimeout,
     ModelProviderUnavailable,
 )
@@ -119,6 +120,8 @@ def _map_error(exc: Exception) -> ApiProblem:
         return ApiProblem(503, "legal_dataset_not_published", "Legal dataset is not published")
     if isinstance(exc, ModelProviderTimeout):
         return ApiProblem(504, "model_provider_timeout", "Model provider timed out")
+    if isinstance(exc, ModelProviderBusy):
+        return ApiProblem(503, "model_provider_busy", "Model provider is busy")
     if isinstance(exc, ModelProviderUnavailable):
         return ApiProblem(503, "model_provider_unavailable", "Model provider is unavailable")
     if isinstance(exc, ModelGatewayError):

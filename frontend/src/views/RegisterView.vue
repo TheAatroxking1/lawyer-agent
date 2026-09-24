@@ -3,8 +3,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { ApiError, apiClient, registerAccount } from '../api'
-import { refreshAuth } from '../auth/state'
-import { session } from '../auth/session'
+import { acceptLogin } from '../auth/transport'
 import ErrorNote from '../components/ErrorNote.vue'
 
 const router = useRouter()
@@ -37,8 +36,7 @@ async function submit(): Promise<void> {
       display_name: displayName.value.trim(),
       password: password.value,
     })
-    session.saveToken(result.access_token)
-    refreshAuth()
+    acceptLogin(result.access_token)
     await router.replace('/chat')
   } catch (cause) {
     error.value =

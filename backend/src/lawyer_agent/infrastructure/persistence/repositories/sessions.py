@@ -269,11 +269,14 @@ class SessionRepository:
         record.replaced_by_id = replacement_id
         record.updated_at = _naive(now)
 
-    async def touch_session(self, session_id: UUID, now: datetime) -> None:
+    async def touch_session(
+        self, session_id: UUID, now: datetime, *, expires_at: datetime,
+    ) -> None:
         auth_session = await self._session.get(AuthSessionModel, session_id)
         if auth_session is None:
             raise RuntimeError("auth session disappeared during refresh")
         auth_session.last_seen_at = _naive(now)
+        auth_session.expires_at = _naive(expires_at)
         auth_session.version += 1
         auth_session.updated_at = _naive(now)
 

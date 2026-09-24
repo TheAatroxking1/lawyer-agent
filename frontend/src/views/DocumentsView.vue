@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 
-import { ApiError, apiClient, myTenants, switchTenant } from '../api'
+import { ApiError, apiClient, myTenants } from '../api'
 import type {
   AccountTenant,
   DocumentHeaderSummary,
@@ -13,6 +13,8 @@ import { createMatter, downloadReport, listDocuments, listMatters, listRiskIssue
 import type { RiskIssueSummary } from '../api'
 import ErrorNote from '../components/ErrorNote.vue'
 import { session } from '../auth/session'
+import { selectTenant } from '../auth/transport'
+import { refreshAuth } from '../auth/state'
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
@@ -96,11 +98,11 @@ async function enterTenant(tenant: AccountTenant): Promise<void> {
   switchError.value = null
   switchingId.value = tenant.tenant_id
   try {
-    const result = await switchTenant(apiClient, {
+    await selectTenant({
       tenant_id: tenant.tenant_id,
       membership_id: tenant.membership_id,
+      name: tenant.name,
     })
-    session.saveTenantToken(result.access_token)
     activeTenant.value = tenant
     expandedMatterId.value = null
     documents.value = {}
@@ -117,6 +119,8 @@ async function enterTenant(tenant: AccountTenant): Promise<void> {
 
 function leaveTenant(): void {
   session.clearTenantToken()
+  session.clearActiveTenant()
+  refreshAuth()
   activeTenant.value = null
   matters.value = []
   documents.value = {}

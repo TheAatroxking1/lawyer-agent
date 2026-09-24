@@ -1,8 +1,15 @@
 .superpowers/
 .worktrees/
+.sdd/
 deploy/.env
 deploy/secrets/
 deploy/deepseek.config.json
+artifacts/legal-corpus/
+artifacts/model-cache/
+artifacts/embedding-runtime/
+.sdd/embedding/embedding.py
+LlamaIndex/starter.ipynb
+LlamaIndex/test.ipynb
 .env
 .venv/
 __pycache__/

@@ -12,6 +12,7 @@ here or in the domain module.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Protocol
@@ -41,12 +42,24 @@ class ModelProviderUnavailable(ModelGatewayError):
     code = "model_provider_unavailable"
 
 
+class ModelProviderBusy(ModelProviderUnavailable):
+    code = "model_provider_busy"
+
+
 class ModelProviderTimeout(ModelGatewayError):
     code = "model_provider_timeout"
 
 
 class ModelProviderInvalidResponse(ModelGatewayError):
     code = "model_provider_invalid_response"
+
+
+class ModelProviderJsonGenerationError(ModelProviderInvalidResponse):
+    code = "model_json_generation_failed"
+
+
+class ModelProviderOutputTruncated(ModelProviderInvalidResponse):
+    code = "model_output_truncated"
 
 
 class ModelInputInvalid(ModelGatewayError):
@@ -110,7 +123,10 @@ class ModelGateway:
         dimension: int,
     ) -> tuple[EmbeddingVector, ...]:
         _require_model_ref(model_ref)
-        if not isinstance(texts, Sequence) or not texts:
+        if (
+            isinstance(texts, (str, bytes, bytearray))
+            or not isinstance(texts, Sequence) or not texts
+        ):
             raise ModelInputInvalid("embed texts must be a non-empty sequence")
         if any(not isinstance(text, str) or not text for text in texts):
             raise ModelInputInvalid("embed texts must be non-empty strings")
@@ -127,6 +143,11 @@ class ModelGateway:
                 dimension=dimension,
                 timeout_seconds=self._limits.timeout_seconds,
             )
+        except asyncio.CancelledError as cancelled:
+            try:
+                await self._record_failure(model_ref, ModelOperation.EMBED, started)
+            finally:
+                raise cancelled
         except ModelGatewayError:
             await self._record_failure(model_ref, ModelOperation.EMBED, started)
             raise

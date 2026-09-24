@@ -10,12 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from lawyer_agent.infrastructure.documents.word_article_numbering import NumberingProvenance
+
 
 @dataclass(frozen=True, slots=True)
 class ParsedParagraph:
     text: str
     style: str | None = None
     ordinal: int = 0
+    numbering_provenance: NumberingProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)

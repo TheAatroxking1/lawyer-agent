@@ -23,7 +23,11 @@ from lawyer_agent.application.legal_corpus_import import (
     LegalProvisionDraft,
     validate_import_command,
 )
-from lawyer_agent.domain.legal_corpus import LegalVersionStatus, ProvisionLevel
+from lawyer_agent.domain.legal_corpus import (
+    LegalCategory,
+    LegalVersionStatus,
+    ProvisionLevel,
+)
 
 _ARTICLE_FIELDS = ("provision_no", "structure_path", "text")
 
@@ -45,6 +49,7 @@ class LegalImportMetadata:
     source_ref: str
     dataset_version: str
     parser_version: str
+    category: LegalCategory = LegalCategory.UNKNOWN
 
 
 class ParsedArticleView(Protocol):
@@ -90,6 +95,7 @@ def map_parsed_articles(
         dataset_version=metadata.dataset_version,
         parser_version=metadata.parser_version,
         provisions=tuple(drafts),
+        category=metadata.category,
     )
     validate_import_command(command)
     return command

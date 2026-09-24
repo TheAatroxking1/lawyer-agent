@@ -23,12 +23,20 @@ from lawyer_agent.application.legal_index_alias import LegalDatasetAliasService
 from lawyer_agent.application.legal_index_publish import (
     LegalDatasetIndexPublishService,
 )
+from lawyer_agent.application.legal_navigation_index import LegalNavigationIndexService
+from lawyer_agent.application.legal_navigation_search import LegalNavigationSearchService
 from lawyer_agent.application.legal_vector_indexing import (
     LegalVectorIndexingService,
 )
 from lawyer_agent.application.model_gateway import ModelGateway
 from lawyer_agent.domain.common import new_uuid7
-from lawyer_agent.domain.legal_corpus import content_sha256
+from lawyer_agent.domain.legal_corpus import (
+    LegalInstrument,
+    LegalVersion,
+    Provision,
+    content_sha256,
+)
+from lawyer_agent.domain.legal_navigation import navigation_index_name
 from lawyer_agent.domain.model_gateway import (
     CallLimits,
     EmbeddingVector,
@@ -40,6 +48,7 @@ from lawyer_agent.infrastructure.persistence.repositories.legal_corpus import (
     SqlAlchemyLegalCorpusChunkRepository,
     SqlAlchemyLegalCorpusRepository,
 )
+from lawyer_agent.infrastructure.search.legal_navigation import OpenSearchNavigationClient
 from lawyer_agent.infrastructure.search.opensearch import OpenSearchRestClient
 
 pytestmark = [pytest.mark.integration, pytest.mark.mysql]
@@ -111,6 +120,33 @@ def _gateway() -> ModelGateway:
     )
 
 
+class _NavigationSource:
+    def __init__(self, mysql_url: URL) -> None:
+        self._mysql_url = mysql_url
+
+    async def version_with_instrument(
+        self, version_id: UUID
+    ) -> tuple[LegalVersion, LegalInstrument] | None:
+        engine = create_async_engine(self._mysql_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                return await SqlAlchemyLegalCorpusRepository(session).version_with_instrument(
+                    version_id
+                )
+        finally:
+            await engine.dispose()
+
+    async def provisions_for_version(self, version_id: UUID) -> tuple[Provision, ...]:
+        engine = create_async_engine(self._mysql_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                return await SqlAlchemyLegalCorpusRepository(session).provisions_for_version(
+                    version_id
+                )
+        finally:
+            await engine.dispose()
+
+
 async def _seed_corpus(mysql_url: URL) -> None:
     engine = create_async_engine(mysql_url)
     try:
@@ -177,18 +213,25 @@ async def _ensure_chunks(mysql_url: URL) -> None:
 
 async def _run_scenario(mysql_url: URL, alias: str, index_name: str) -> None:
     os_client = OpenSearchRestClient(base_url="http://127.0.0.1:9200")
+    nav_client = OpenSearchNavigationClient(base_url="http://127.0.0.1:9200")
+    navigation = LegalNavigationIndexService(_NavigationSource(mysql_url), nav_client)
     alias_service = LegalDatasetAliasService(os_client)
     indexer = LegalVectorIndexingService(
         chunks=_ChunkStore(mysql_url),
         gateway=_gateway(),
         search=os_client,
     )
-    publisher = LegalDatasetIndexPublishService(indexer=indexer, alias=alias_service)
+    publisher = LegalDatasetIndexPublishService(
+        indexer=indexer, alias=alias_service, navigation=navigation
+    )
     hybrid = LegalHybridSearchService(
         gateway=_gateway(),
         search=os_client,
     )
-    searcher = LegalDatasetSearchService(hybrid=hybrid, alias=alias_service)
+    searcher = LegalDatasetSearchService(
+        hybrid=hybrid, alias=alias_service,
+        navigation=LegalNavigationSearchService(nav_client),
+    )
     try:
         # No alias yet -> dataset is not published.
         try:
@@ -220,6 +263,9 @@ async def _run_scenario(mysql_url: URL, alias: str, index_name: str) -> None:
         assert hits
         assert all(hit.version_id == _VERSION for hit in hits)
     finally:
+        nav_index = navigation_index_name(index_name)
+        assert re.fullmatch(r"lawyer-nav-[a-f0-9]{32}", nav_index)
+        await os_client.delete_index(nav_index)
         await os_client.drop_alias(alias)
         await os_client.delete_index(index_name)
 
